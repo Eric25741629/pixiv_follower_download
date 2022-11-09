@@ -94,7 +94,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
                 self.Author_list = [line.rstrip() for line in file]
         self.ui.getpixiv_author.clicked.connect(lambda:self.get_pixiv_author(self.path))
         self.ui.getpixiv_author_imgID.clicked.connect(lambda:get_pixiv_author_imgID_Thread.run(self))
-        self.ui.get_url.clicked.connect(lambda:download_url.main(self))
+        self.ui.get_url.clicked.connect(lambda:download_url.main())
         self.ui.download_img.clicked.connect(lambda:download_url.main(self))
         #self.ui.getpixiv_author.clicked.connect(lambda:self.get_pixiv_author(self.path))
         #self.ui.label.setText('Happy World!')
