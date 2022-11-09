@@ -21,14 +21,16 @@ from queue import Queue
 from time import sleep
 from urllib import request
 
-import download_img
 from requests import exceptions
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from tqdm import tqdm, trange
+
+import download_img
 
 option = webdriver.ChromeOptions()
 from pathlib import Path
@@ -42,10 +44,69 @@ def logging(address,password):
     url = 'https://pixiv.net/'
     driver = webdriver.Chrome(options=option)
     driver.get(url)
-    driver.find_element_by_xpath('//*[@id="wrapper"]/div[3]/div[2]/a[2]').click()
-    driver.find_element_by_xpath('//*[@id="LoginComponent"]/form/div[1]/div[1]/input').send_keys(address)
-    driver.find_element_by_xpath('//*[@id="LoginComponent"]/form/div[1]/div[2]/input').send_keys(password)
-    driver.find_element_by_xpath('//*[@id="LoginComponent"]/form/button').click()
+    driver.find_element(By.XPATH,'//*[@id="wrapper"]/div[3]/div[2]/a[2]').click()
+    driver.find_element(By.XPATH,"//input[@autocomplete = 'username']").send_keys(address)
+    passwd=driver.find_element(By.XPATH,"//input[@autocomplete = 'current-password']")
+    passwd.send_keys(password)
+    passwd.send_keys(Keys.RETURN)
+
+#about_cookies
+def auto_get_cookie(address,password):
+    option = webdriver.ChromeOptions()
+    option.add_experimental_option("excludeSwitches", ['enable-automation', 'enable-logging'])
+    #option.add_argument("--headless")
+    option.add_argument("--disable-backgrounding-occluded-windows")
+    driver = webdriver.Chrome(options=option)
+    url = 'https://pixiv.net/'
+    driver.get(url)
+    driver.find_element(By.XPATH,'//*[@id="wrapper"]/div[3]/div[2]/a[2]').click()
+    driver.find_element(By.XPATH,"//input[@autocomplete = 'username']").send_keys(address)
+    passwd=driver.find_element(By.XPATH,"//input[@autocomplete = 'current-password']")
+    passwd.send_keys(password)
+    passwd.send_keys(Keys.RETURN)
+    sleep(2)
+    url='https://www.pixiv.net/artworks/96509143'
+    driver.get(url)
+    sleep(2)
+    def get_cookies():
+        cookies = ""
+        selenium_cookies = driver.get_cookies()
+        for cookie in selenium_cookies:
+            cookies+=str(cookie['name'])
+            cookies+="="
+            cookies+=str(cookie['value'])
+            cookies+=";"
+        return cookies
+    agent=driver.execute_script("return navigator.userAgent")
+    cookies=get_cookies()
+    return str(cookies),agent
+
+def Test_cookies(lists,agent):
+    cookies=[]
+    i=0
+    for list1 in lists:
+        try:
+            print(list1,agent)
+            pid='96509143'
+            headers = {
+                'User-Agent': agent,
+                'Cookie':list1
+                ,'Referer':('http://www.pixiv.net/'+str(pid)),        
+                    } 
+            url='https://www.pixiv.net/ajax/illust/'+pid+'/pages?lang=zh_tw'            
+
+            htmlfile = requests.get(url,headers=headers)
+            #print(htmlfile.text)
+            htmlfile.raise_for_status() 
+            #objSoup = bs4.BeautifulSoup(htmlfile.text, 'lxml')
+            #print(objSoup.text)
+            i=i+1
+            cookies.append(list1) 
+        except Exception as err:
+            print(err)
+            pass
+    return i,cookies
+
 def get_author_picture_ids(illust_ids,path,num,q,exist_pid):
     download_Pid=[]
     temp = 0
@@ -345,28 +406,7 @@ def pixiv_following_count(id,cookie,Agent):
 
     #objSoup = bs4.BeautifulSoup(res.content, 'lxml')
     #print(objSoup)
-def Test_cookies(lists):
-    cookies=[]
-    i=0
-    for list in lists:
-        try:
-            pid='96509143'
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50',
-                'Cookie':list
-                ,'Referer':('http://www.pixiv.net/'+str(pid)),        
-                    } 
-            url='https://www.pixiv.net/ajax/illust/'+pid+'/pages?lang=zh_tw'            
 
-            htmlfile = requests.get(url,headers=headers)
-            htmlfile.raise_for_status() 
-            objSoup = bs4.BeautifulSoup(htmlfile.text, 'lxml')
-            #print(objSoup.text)
-            i=i+1
-            cookies.append(list) 
-        except:
-            pass
-    return i,cookies
 def no_use_seleium_get_pid(author_pids,cookie,Agent,q,path,num,exist_pid):
     pids=[]
     for i in trange(0,len(author_pids)):
@@ -386,7 +426,7 @@ def no_use_seleium_get_pid(author_pids,cookie,Agent,q,path,num,exist_pid):
             f = open((path+"authorPids_err"+str(num)+".txt"), "a+")
             f.write(author_pids[i]+'\n')
             f.close() 
-    
+
        
 if __name__ == '__main__':
     '''all_pixiv_ids = illusts('21971914'
