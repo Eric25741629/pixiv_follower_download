@@ -272,7 +272,7 @@ def get_download_url(path,cookie,Agent,num,pid):    #回傳下載連結
             #print(url)
             j=1
             while(j):
-                tag,like,pagecount,img_url=Pixiv_info(url)
+                tag,like,pagecount,img_url=Pixiv_info(url,Agent=Agent)
                 j=j+1
                 if tag!=[] or like!=404:
                     break
@@ -345,10 +345,11 @@ def get_download_url(path,cookie,Agent,num,pid):    #回傳下載連結
         time.sleep(random())
     #print(download_url)
     return(download_url)
-def Pixiv_info(url):                                                 #回傳標籤
+def Pixiv_info(url,
+    Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50'):                                                 #回傳標籤
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50',
+            'User-Agent': Agent,
             'referer': 'https://www.pixiv.net/',        
         }
         id=url.rsplit('/',1)[1]
@@ -363,18 +364,11 @@ def Pixiv_info(url):                                                 #回傳標�
         #print(o)
         o=o.encode('UTF-8')
         o=json.loads(o)['illust'][id]
-        #print(json.dumps(json.loads(o),sort_keys=True,indent=4))
-        #print(json.dumps(o['illust'][id]['urls']['original'],sort_keys=True,indent=4,ensure_ascii=False))
         bookmarkCount = o['bookmarkCount']
         pageCount=o['userIllusts'][id]["pageCount"]
         resdicts =o['userIllusts'][id]["tags"]
         resdicts=tag_edit.Tag(resdicts)
-        #print(o['illust'][id]['userIllusts'][id]["url"])
         img_url=o['urls']['original'].replace("p0","p",1).replace("ugoira0","ugoira",1)  
-        #print(resdicts)
-        #print(resdicts)
-        #resdicts = str(json.loads(o)['illust'][str(id)]['tags']['tags'])
-        #print(bookmarkCount)
         return resdicts,int(bookmarkCount),int(pageCount),img_url
     except Exception as err:
         print(err)

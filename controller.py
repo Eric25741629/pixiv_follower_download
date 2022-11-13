@@ -19,12 +19,14 @@ import multiprocessing as MP
 from queue import Queue
 import os
 from functools import partial
+import json
 import tqdm
 import download_url
 global cookies
 global Agent
 global path
 import concurrent.futures
+import download_img
 class get_pixiv_author_imgID_Thread(QThread):
         def __init__(self):
             super(get_pixiv_author_imgID_Thread,self).__init__()
@@ -68,6 +70,9 @@ class MainWindow_controller(QtWidgets.QMainWindow):
     path='unknown'
     i=-1
     exist_pid='unknown'
+    download_path=None
+    start=0
+    stop=100
     def __init__(self):
         super().__init__() # in python3, super(Class, self).xxx = super().xxx
         self.ui = Ui_MainWindow()
@@ -77,66 +82,111 @@ class MainWindow_controller(QtWidgets.QMainWindow):
         # TODO
         #self.ui.actionfile.triggered.connect(self.open_folder) 
         #self.path=self.open_folder()
-        self.path=os.getenv('APPDATA')+r'/pixiv_download/'
-        if not os.path.exists(self.path):
-            os.mkdir(self.path)
-        if not os.path.exists(self.path+r"/existPID.txt"):
-            print("找不到existPID文件")
-        else:
-            with open((self.path+r"/existPID.txt")) as file:     #讀取寫入的文檔
-                self.exist_pid = [line.rstrip().replace("p0","") for line in file]
-                self.exist_pid = set(self.exist_pid)
-        #self.pixiv_pid(self.exist_pid)
-        if not os.path.exists(self.path+r"/following.txt"):
-            print("找不到following文件")
-        else:
-            with open((self.path+r"/following.txt")) as file:     #讀取寫入的文檔
-                self.Author_list = [line.rstrip() for line in file]
+        self.user_data()
+        self.set_cookies()
         self.ui.getpixiv_author.clicked.connect(lambda:self.get_pixiv_author(self.path))
         self.ui.getpixiv_author_imgID.clicked.connect(lambda:get_pixiv_author_imgID_Thread.run(self))
-        self.ui.get_url.clicked.connect(lambda:download_url.main())
-        self.ui.download_img.clicked.connect(lambda:download_url.main(self))
+        self.ui.get_url.clicked.connect(lambda:download_url.main(self.cookies,self.Agent))
+        self.ui.download_img.clicked.connect(lambda:download_img.download_img_main(self.download_path,self.start,self.stop,self.cookies,self.Agent))
+                                                                         
         #self.ui.getpixiv_author.clicked.connect(lambda:self.get_pixiv_author(self.path))
         #self.ui.label.setText('Happy World!')
-        self.set_cookies()
-    def write_cookies(self):
-        f = open((self.path+r"/cookies.txt"), "w")
-        f.write(str(self.Agent)+'\n')
-        print(self.cookies)
-        if self.cookies!=[]:
-            for i in self.cookies:
-                f.write(str(i)+'\n')
-        f.close()
+        
+    def user_data(self):
+        def load_data(self):
+            self.path=os.getenv('APPDATA')+r'/pixiv_download/'
+            if not os.path.exists(self.path):
+                os.mkdir(self.path)
+            if not os.path.exists(self.path+r"/existPID.txt"):
+                print("找不到existPID文件")
+            else:
+                with open((self.path+r"/existPID.txt")) as file:     #讀取寫入的文檔
+                    self.exist_pid = [line.rstrip().replace("p0","") for line in file]
+                    self.exist_pid = set(self.exist_pid)
+            #self.pixiv_pid(self.exist_pid)
+            if not os.path.exists(self.path+r"/following.txt"):
+                print("找不到following文件")
+            else:
+                with open((self.path+r"/following.txt")) as file:     #讀取寫入的文檔
+                    self.Author_list = [line.rstrip() for line in file]
+            if os.path.isfile(self.path+'data.json'):
+                try:
+                    with open(self.path+'data.json') as f:
+                        data = json.load(f)
+                        self.download_path=data['user_download_path']
+                except:
+                    print("加載user_data文件失敗\n重新選擇資料夾")
+                    self.download_path=self.open_folder()
+                    write_data(self)
+            else :
+                print("找不到user_data文件")
+                self.download_path=self.open_folder()
+                write_data(self)
+        def write_data(self):
+            jsonObject = {
+            "user_download_path": self.download_path,    
+            }
+            user_data=self.path
+            fileName = user_data+"data.json"
+            file = open(fileName, "w")
+            json.dump(jsonObject, file, indent = 4)
+            file.close()        
+        load_data(self)
+        def Userinfo():
+            try:
+                user_data=os.getenv('APPDATA')+r'\twiter_download/'
+                if os.path.isfile(user_data+'data.json'):
+                    with open(user_data+'data.json') as f:
+                        data = json.load(f)
+                    address=data['email']
+                    user_name=data['username']
+                    link=data['last_time_url']
+                    password=data['password']
+                    download_path=data['usr_path']
+            except:
+                pass
 
-    def read_cookies(self):
-        with open((self.path+r"/cookies.txt")) as file:     #讀取寫入的文檔
-            lines = [line.rstrip() for line in file]
-        print(len(lines))
-        try:
-            self.Agent=lines[0]
-            self.cookies=lines[1:]
-        except:
-            self.get_cookies()
+            
+    def set_cookies(self):          #設定cookies
+        def read_cookies(self):         #讀取寫入的cookies
+            with open((self.path+r"/cookies.txt")) as file:     #讀取寫入的文檔
+                lines = [line.rstrip() for line in file]
+            #print(len(lines))
+            try:
+                self.Agent=lines[0]
+                self.cookies=lines[1:]
+            except:
+                self.get_cookies()
+        
+        def write_cookies(self):        #寫入獲得的cookies
+            f = open((self.path+r"/cookies.txt"), "w")
+            f.write(str(self.Agent)+'\n')
+            #print(self.cookies)
+            if self.cookies!=[]:
+                for i in self.cookies:
+                    f.write(str(i)+'\n')
+            f.close()
 
-    def set_cookies(self):
+        def get_cookies(self):
+            with open((self.path+r"/password.txt")) as file:     #讀取寫入的文檔
+                texts = [line.rstrip() for line in file]
+            for i in range(0,len(texts),2):
+                cookie,agent=pixiv_api.auto_get_cookie(texts[i],texts[i+1])
+                self.cookies.append(cookie)
+                self.Agent=agent
+
         if not os.path.exists(self.path+r"/cookies.txt"):
             print("找不到cookies文件")
-            self.get_cookies()
-            self.write_cookies()
+            get_cookies(self)
+            write_cookies(self)
         else:
-            self.read_cookies()
+            read_cookies(self)
             i,self.coookies=pixiv_api.Test_cookies(self.cookies,self.Agent)
             if(i<3):
-                self.get_cookies()
-                self.write_cookies()
-        print(i)
-    def get_cookies(self):
-        with open((self.path+r"/password.txt")) as file:     #讀取寫入的文檔
-            texts = [line.rstrip() for line in file]
-        for i in range(0,len(texts),2):
-            cookie,agent=pixiv_api.auto_get_cookie(texts[i],texts[i+1])
-            self.cookies.append(cookie)
-            self.Agent=agent
+                get_cookies(self)
+                write_cookies(self)
+        
+    
     def open_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self,
                   "Open folder",
