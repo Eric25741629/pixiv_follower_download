@@ -116,11 +116,11 @@ class MainWindow_controller(QtWidgets.QMainWindow):
                         self.download_path=data['user_download_path']
                 except:
                     print("加載user_data文件失敗\n重新選擇資料夾")
-                    self.download_path=self.open_folder()
+                    self.download_path=self.open_folder()+'/'
                     write_data(self)
             else :
                 print("找不到user_data文件")
-                self.download_path=self.open_folder()
+                self.download_path=self.open_folder()+'/'
                 write_data(self)
         def write_data(self):
             jsonObject = {

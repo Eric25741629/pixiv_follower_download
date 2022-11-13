@@ -156,6 +156,7 @@ def get_filelist(path):
     return Filelist
 def splitID(Filelist):
     exist_pid=[]
+    print(len(Filelist))
     for file in  Filelist :
         if (('jpg' not in file ) and ('png' not in file) and ('gif' not in file)):
             continue
@@ -167,26 +168,34 @@ def splitID(Filelist):
             if len(id)<12 and len(id)>6:
                 #print(id)
                 exist_pid.append(id)     
-        except:
+        except Exception as err:
+            #print(err)
             try:
                 id=file.split('PID')[1].split(' ')[0]
-                if len(id)<12 and len(id)>6:
+                if len(id)<=13 and len(id)>6:
                         #print(id)
                         exist_pid.append(id)
-            except:
+                else:
+                    if(str.isdigit(id.split('p')[0])):
+                        print(id)
+                        exist_pid.append(id)
+            except Exception as err:
+                print(err)
                 try:                    
                     id=file.split('_')[1]
                     #print(id)
                     if len(id)<12 and len(id)>6:
                         #print(id)
                         exist_pid.append(id)
-                except:
+                except Exception as err:
+                    print(err)
                     try:      #illust_44773280_20220413_040534.jpg              
                         id=file.split('_')[1]
                         if len(id)<12 and len(id)>6:
                             #print(id)
                             exist_pid.append(id)
-                    except:
+                    except Exception as err:
+                        print(err)
                         pass
         #print(file)
     exist_pid=np.unique(exist_pid).tolist()
@@ -299,6 +308,10 @@ if __name__ == '__main__':
     '''for i in range(0,1):
         main(i) '''
     url='https://i.pximg.net/img-original/img/2022/07/30/00/10/43/100087317_ugoira0.jpg   ' 
+    download_path=r'D:\P站爬蟲\new/'
+    download_id=splitID(get_filelist(download_path))
+    print(len(get_filelist(download_path)))
+    print(len(download_id))
     #print(splitID(get_filelist(r'D:\P站爬蟲\35/')))      
     '''path=os.getenv('APPDATA')+r'/pixiv_download/'
     with open((path+r"/existPID.txt")) as file:     #讀取寫入的文檔
