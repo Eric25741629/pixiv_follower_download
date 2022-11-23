@@ -1,65 +1,58 @@
-from PyQt5 import QtWidgets, QtGui, QtCore
-from PyQt5.QtWidgets import QFileDialog
+import json
+import multiprocessing as MP
+import os
+import random
+import threading
+import time
+from functools import partial
+from multiprocessing import Pool
+from queue import Queue
+
+import numpy as np
+import requests
+import tqdm
+from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
-from tqdm import trange
-from ui import Ui_MainWindow
-import pixiv_api
-from queue import Queue
-import numpy as np
-import time,random
-import threading
-import os
-from multiprocessing import Pool
-import requests
+from PyQt5.QtWidgets import QFileDialog
 from tqdm import tqdm, trange
-from multiprocessing import Pool
-import multiprocessing as MP
-from queue import Queue
-import os
-from functools import partial
-import json
-import tqdm
 import download_url
+import pixiv_api
+from Ui2 import Ui_MainWindow
+
 global cookies
 global Agent
 global path
 import concurrent.futures
+import time
+
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtWidgets import QFileDialog
+
 import download_img
-class get_pixiv_author_imgID_Thread(QThread):
-        def __init__(self):
-            super(get_pixiv_author_imgID_Thread,self).__init__()
-        def run(self):
-            print(len(self.Author_list))
-            #Author_list = np.array_split(self.Author_list,700)   #將獲取的文檔分成100等分
-            #print(len(self.Author_list))
-            func=partial(pixiv_api.thread_no_use_seleium_get_pid,self.cookies[0],self.Agent,self.path,'1')
-            results = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:  
-                results = list(tqdm.tqdm(executor.map(func, self.Author_list), total=len(self.Author_list))) 
-            
-            results=([i for item in results for i in item]) 
-            print(len(results))
-            end=[]
-            for i in trange(0,len(results)):
-                if(results[i] not in self.exist_pid):
-                    #print(results[i])
-                    end.append(results[i])
-            
-            '''p=Pool(processes= 16)
-            
-            for result in tqdm.tqdm(p.imap_unordered(MainWindow_controller.in_the_pid, results), total=len(results)):
-                if(result!=0):
-                    end.append(result)
-            p.close()
-            p.join()'''
-            #results=[x for x in results if not MainWindow_controller.in_the_pid(x)]
-            print(len(end))
-            f = open((self.path+"/pictures_id.txt"), "w+")     #讀取寫入的文檔
-            for text in end:
-                f.write(str(text)+'\n')
-            f.close()
+from user_info import Userdata_controller
+import pixiv_thread
+
+
+class Runthread(QtCore.QThread):
+    #  通过类成员对象定义信号对象
+    _signal = pyqtSignal(str)
+
+    def __init__(self):
+        super(Runthread, self).__init__()
+
+    def __del__(self):
+        self.wait()
+
+    def run(self):
+        for i in range(100):
+            time.sleep(0.2)
+            self._signal.emit(int(i))  # 注意这里与_signal = pyqtSignal(str)中的类型相同
+
+
 class MainWindow_controller(QtWidgets.QMainWindow):
     path='none'
     exist_pid=''
@@ -77,76 +70,48 @@ class MainWindow_controller(QtWidgets.QMainWindow):
         super().__init__() # in python3, super(Class, self).xxx = super().xxx
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        self.thread = None  # 初始化线程
         self.setup_control()
+    def closeEvent(self,event):
+        self.Userdata_controller.write_data()
+        event.accept()
+        
     def setup_control(self):
         # TODO
+
         #self.ui.actionfile.triggered.connect(self.open_folder) 
         #self.path=self.open_folder()
-        self.user_data()
+        self.Userdata_controller=Userdata_controller(self.path,
+                                                    self.exist_pid,
+                                                    self.Author_list,
+                                                    self.download_path,
+                                                    self.start,
+                                                    self.stop,
+                                                    self.ui.user_path1
+                                                    )
+        self.path,self.download_path,self.exist_pid,self.user_path1,self.Author_list ,self.start,self.stop=self.Userdata_controller.load_data()
+
+        self.path=os.getenv('APPDATA')+r'/pixiv_download/'
         self.set_cookies()
-        self.ui.getpixiv_author.clicked.connect(lambda:self.get_pixiv_author(self.path))
-        self.ui.getpixiv_author_imgID.clicked.connect(lambda:get_pixiv_author_imgID_Thread.run(self))
+        for i in range(len(self.cookies)):
+            self.ui.output.setPlainText(self.cookies[i])
+            self.ui.output.moveCursor(QTextCursor.End)      
+        #self.ui.get_following.clicked.connect(lambda:self.get_pixiv_author(self.path))
+        self.ui.get_pid.clicked.connect(self.get_pidbutton)
         self.ui.get_url.clicked.connect(lambda:download_url.main(self.cookies,self.Agent))
-        self.ui.download_img.clicked.connect(lambda:download_img.download_img_main(self.download_path,self.start,self.stop,self.cookies,self.Agent))
-                                                                         
+        self.ui.download_url.clicked.connect(lambda:download_img.download_img_main(self.download_path,self.start,self.stop,self.cookies,self.Agent))
+        self.ui.change1.clicked.connect(lambda:self.Userdata_controller.set_downloaa_path())                                                                 
+        
+        self.ui.get_following.clicked.connect(self.buttonclick)
+        
         #self.ui.getpixiv_author.clicked.connect(lambda:self.get_pixiv_author(self.path))
         #self.ui.label.setText('Happy World!')
-        
-    def user_data(self):
-        def load_data(self):
-            self.path=os.getenv('APPDATA')+r'/pixiv_download/'
-            if not os.path.exists(self.path):
-                os.mkdir(self.path)
-            if not os.path.exists(self.path+r"/existPID.txt"):
-                print("找不到existPID文件")
-            else:
-                with open((self.path+r"/existPID.txt")) as file:     #讀取寫入的文檔
-                    self.exist_pid = [line.rstrip().replace("p0","") for line in file]
-                    self.exist_pid = set(self.exist_pid)
-            #self.pixiv_pid(self.exist_pid)
-            if not os.path.exists(self.path+r"/following.txt"):
-                print("找不到following文件")
-            else:
-                with open((self.path+r"/following.txt")) as file:     #讀取寫入的文檔
-                    self.Author_list = [line.rstrip() for line in file]
-            if os.path.isfile(self.path+'data.json'):
-                try:
-                    with open(self.path+'data.json') as f:
-                        data = json.load(f)
-                        self.download_path=data['user_download_path']
-                except:
-                    print("加載user_data文件失敗\n重新選擇資料夾")
-                    self.download_path=self.open_folder()+'/'
-                    write_data(self)
-            else :
-                print("找不到user_data文件")
-                self.download_path=self.open_folder()+'/'
-                write_data(self)
-        def write_data(self):
-            jsonObject = {
-            "user_download_path": self.download_path,    
-            }
-            user_data=self.path
-            fileName = user_data+"data.json"
-            file = open(fileName, "w")
-            json.dump(jsonObject, file, indent = 4)
-            file.close()        
-        load_data(self)
-        def Userinfo():
-            try:
-                user_data=os.getenv('APPDATA')+r'\twiter_download/'
-                if os.path.isfile(user_data+'data.json'):
-                    with open(user_data+'data.json') as f:
-                        data = json.load(f)
-                    address=data['email']
-                    user_name=data['username']
-                    link=data['last_time_url']
-                    password=data['password']
-                    download_path=data['usr_path']
-            except:
-                pass
-
-            
+        self.ui.begin_num.setValue(self.start)
+        self.ui.spinBox_6.setValue(self.stop)   
+        self.ui.begin_num.valueChanged.connect(self.showMsg)
+    def showMsg(self):  
+        self.start=(int(self.ui.begin_num.value()))
+        self.ui.output.moveCursor(QTextCursor.End)     
     def set_cookies(self):          #設定cookies
         def read_cookies(self):         #讀取寫入的cookies
             with open((self.path+r"/cookies.txt")) as file:     #讀取寫入的文檔
@@ -185,8 +150,26 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             if(i<3):
                 get_cookies(self)
                 write_cookies(self)
+    def get_pidbutton(self):
+        # 创建线程
         
-    
+        self.thread = pixiv_thread.get_pixiv_author_imgID_Thread(self.Author_list,self.Agent,self.path,self.cookies,self.exist_pid)
+        # 连接信号
+        self.thread._signal.connect(self.progress_changed)  # 进程连接回传到GUI的事件
+        # 开始线程
+        self.thread.start()    
+    def buttonclick(self):
+        # 创建线程
+        self.thread = Runthread()
+        # 连接信号
+        self.thread._signal.connect(self.progress_changed)  # 进程连接回传到GUI的事件
+        # 开始线程
+        self.thread.start()
+
+    def progress_changed(self, now,max): 
+        #value=now/max*100 
+        self.ui.progressBar.setRange(0, max)      
+        self.ui.progressBar.setValue(now)
     def open_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self,
                   "Open folder",

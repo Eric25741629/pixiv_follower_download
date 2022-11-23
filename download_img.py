@@ -140,8 +140,8 @@ def Download_Pixiv_url(path,lock,url):
         except Exception as err: 
             print(err)
             if '404' in str(err): #只有404會被回傳 因為該網址無法訪問了
-
                 return url+"   "+timetag
+
 global download_start_time
 #download_start_time=datetime.datetime(2022, 7, 19, 14, 20, 0)
 download_start_time=datetime.datetime.now()
@@ -177,10 +177,15 @@ def splitID(Filelist):
                         exist_pid.append(id)
                 else:
                     if(str.isdigit(id.split('p')[0])):
-                        print(id)
-                        exist_pid.append(id)
+                        
+                        try:
+                            exist_pid.append(id.split('.')[0])
+                            #print(id.split('.')[0])
+                        except:
+                            #print(id)
+                            exist_pid.append(id)
             except Exception as err:
-                print(err)
+                #print(err)
                 try:                    
                     id=file.split('_')[1]
                     #print(id)
@@ -188,7 +193,7 @@ def splitID(Filelist):
                         #print(id)
                         exist_pid.append(id)
                 except Exception as err:
-                    print(err)
+                    #print(err)
                     try:      #illust_44773280_20220413_040534.jpg              
                         id=file.split('_')[1]
                         if len(id)<12 and len(id)>6:
@@ -268,7 +273,7 @@ def download_img_main(download_path,start,stop,cookie=None,Agent=None):
         timetag=time.strftime('%Y%m%d_%H%M%S')
         lock = threading.Lock()
         func=partial(Download_Pixiv_url,download_path,lock)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:  
+        with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:  
             url = list(tqdm.tqdm(executor.map(func, pics), total=len(pics))) 
         url=([item for item in results if item!=1])
         if(url!=[]):
