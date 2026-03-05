@@ -4,6 +4,7 @@ import random
 import shutil
 import threading
 import time
+import copy
 from logging import exception
 from random import random
 
@@ -30,10 +31,13 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from tqdm import tqdm, trange
 
-import download_img
 
 option = webdriver.ChromeOptions()
 from pathlib import Path
+
+# 快取同一程序內已查過的作品資訊，避免重複打 Pixiv API
+_pixiv_info_cache = {}
+_pixiv_info_cache_lock = threading.Lock()
 
 # 防止打印一些无用的日志
 #option.add_experimental_option("excludeSwitches", ['enable-automation', 'enable-logging'])
@@ -51,23 +55,89 @@ def logging(address,password):
     passwd.send_keys(Keys.RETURN)
 
 #about_cookies
-def auto_get_cookie(address,password):
-    option = webdriver.ChromeOptions()
-    option.add_experimental_option("excludeSwitches", ['enable-automation', 'enable-logging'])
-    #option.add_argument("--headless")
-    option.add_argument("--disable-backgrounding-occluded-windows")
-    driver = webdriver.Chrome(options=option)
-    url = 'https://pixiv.net/'
-    driver.get(url)
-    driver.find_element(By.XPATH,'//*[@id="wrapper"]/div[3]/div[2]/a[2]').click()
-    driver.find_element(By.XPATH,"//input[@autocomplete = 'username']").send_keys(address)
-    passwd=driver.find_element(By.XPATH,"//input[@autocomplete = 'current-password']")
-    passwd.send_keys(password)
-    passwd.send_keys(Keys.RETURN)
-    sleep(2)
-    url='https://www.pixiv.net/artworks/96509143'
-    driver.get(url)
-    sleep(2)
+def auto_get_cookie(address,password,mode=0):
+    print(f"[pixiv_api] auto_get_cookie called with mode={mode}, address={address}")
+    def facebook_login(driver,email,password):
+        print("[pixiv_api] google_login: trying CSS selector button.btn-item.btn-gplus")
+        try:
+            btn = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn-item.btn-gplus"))
+            )
+            btn.click()
+        except Exception as e:
+            print(f"[pixiv_api] google_login: primary selector failed: {e}")
+        # 等待 email 輸入欄位出現，若沒有則嘗試其他頁面上的按鈕作為 fallback
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], #identifierId, input[autocomplete='username']"))
+            )
+        except Exception as e:
+            print(f"[pixiv_api] google_login: no email input after click: {e}")
+            try:
+                buttons = driver.find_elements(By.TAG_NAME, "button")
+                for b in buttons:
+                    dl = (b.get_attribute('data-label') or '').lower()
+                    txt = (b.text or '').lower()
+                    cls = (b.get_attribute('class') or '').lower()
+                    if 'google' in dl or 'google' in txt or 'gplus' in cls:
+                        try:
+                            print('[pixiv_api] google_login: trying alternative button with', dl, txt, cls)
+                            b.click()
+                            WebDriverWait(driver, 6).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], #identifierId, input[autocomplete='username']"))
+                            )
+                            break
+                        except Exception as e2:
+                            print('[pixiv_api] google_login: alternative click failed', e2)
+            except Exception as e3:
+                print('[pixiv_api] google_login: failed enumerating buttons', e3)
+        # 填寫帳號密碼（等待 email 欄位存在）
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], #identifierId, input[autocomplete='username']"))
+            ).send_keys(email)
+            passwd = driver.find_element(By.XPATH, "//input[@autocomplete = 'current-password']")
+            passwd.send_keys(password)
+            passwd.send_keys(Keys.RETURN)
+        except Exception as e:
+            print(f"[pixiv_api] google_login: failed to fill login form: {e}")
+        try:
+            driver.find_element(By.XPATH, '//*[@class="x1lliihq x6ikm8r x10wlt62 x1n2onr6 xlyipyv xuxw1ft x1j85h84"]').click()
+        except:
+            pass
+    def google_login(driver,email, password):
+        print("[pixiv_api] google_login: trying CSS selector button.btn-item.btn-gplus")
+        try:
+            btn = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn-item.btn-gplus"))
+            )
+            btn.click()
+        except Exception as e:
+            print(f"[pixiv_api] google_login: primary selector failed: {e}")
+            try:
+                buttons = driver.find_elements(By.TAG_NAME, "button")
+                infos = []
+                for b in buttons:
+                    infos.append({
+                        'text': b.text[:30],
+                        'class': b.get_attribute('class'),
+                        'data-label': b.get_attribute('data-label')
+                    })
+                print('[pixiv_api] google_login: found buttons:', infos)
+            except Exception:
+                pass
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.XPATH, "//input[@autocomplete='username']"))
+        ).send_keys(email)
+        passwd = driver.find_element(By.XPATH, "//input[@autocomplete = 'current-password']")
+        passwd.send_keys(password)
+        passwd.send_keys(Keys.RETURN)
+    def pixiv_login(driver,email,password):
+        driver.find_element(By.XPATH,'//*[@id="wrapper"]/div[3]/div[2]/a[2]').click()
+        driver.find_element(By.XPATH,"//input[@autocomplete = 'username']").send_keys(email)
+        passwd=driver.find_element(By.XPATH,"//input[@autocomplete = 'current-password']")
+        passwd.send_keys(password)
+        passwd.send_keys(Keys.RETURN)
     def get_cookies():
         cookies = ""
         selenium_cookies = driver.get_cookies()
@@ -76,10 +146,36 @@ def auto_get_cookie(address,password):
             cookies+="="
             cookies+=str(cookie['value'])
             cookies+=";"
+        print(cookies)
         return cookies
+    option = webdriver.ChromeOptions()
+    option.add_experimental_option("excludeSwitches", ['enable-automation', 'enable-logging'])
+    #option.add_argument("--headless")
+    option.add_argument("--disable-backgrounding-occluded-windows")
+    driver = webdriver.Chrome(options=option)
+    url = 'https://pixiv.net/'
+    driver.get(url)
+    print(f"[pixiv_api] selected login mode: {mode}")
+    if (mode == 0):
+        pixiv_login(driver, address, password)
+    elif (mode == 1):
+        # UI: mode 1 = Google
+        google_login(driver, address, password)
+    elif (mode == 2):
+        # UI: mode 2 = Facebook
+        facebook_login(driver, address, password)
+    sleep(2)
+    url = 'https://pixiv.net/'
+    driver.get(url)
+    sleep(5)
+    soup = bs4.BeautifulSoup(driver.page_source, 'lxml')
+    user_num=(str(soup.head).split('user_id')[1].split('_gaq.push')[0].split('"')[1])
+    url='https://www.pixiv.net/artworks/96509143'
+    driver.get(url)
+    sleep(5)    
     agent=driver.execute_script("return navigator.userAgent")
     cookies=get_cookies()
-    return str(cookies),agent
+    return str(user_num),str(cookies),str(agent)
 
 def Test_cookies(lists,agent):
     cookies=[]
@@ -94,7 +190,6 @@ def Test_cookies(lists,agent):
                 ,'Referer':('http://www.pixiv.net/'+str(pid)),        
                     } 
             url='https://www.pixiv.net/ajax/illust/'+pid+'/pages?lang=zh_tw'            
-
             htmlfile = requests.get(url,headers=headers)
             #print(htmlfile.text)
             htmlfile.raise_for_status() 
@@ -117,7 +212,6 @@ def get_author_picture_ids(illust_ids,path,num,q,exist_pid):
             print('\r' + '[線程%s]:[%s%s]%.2f%%' % (num,'█' * int(temp*20/total), ' ' * (20-int(temp*20/total)),float(temp/total*100)), end='')
             driver = webdriver.Chrome(options=option)
             time.sleep(5)
-            
             url = ('https://pixiv.net/ajax/user/' + illust_id + '/profile/all?lang=zh')				#畫師id 輸入後可得到畫師所有的作品
             driver.switch_to.window(driver.window_handles[num])
             driver.get(url)
@@ -139,19 +233,18 @@ def get_author_picture_ids(illust_ids,path,num,q,exist_pid):
         except Exception as err:
             print(Pid+'獲取失敗',err)
             f = open((path+"get_download_author_err"+str(num)+".txt"), "a")
-            f.write(id+'\n')
+            f.write(illust_id+'\n')
             f.close()
         time.sleep(random())
         #print(num)
     q.put(download_Pid)
-def get_follow_illust(times,headers,queue,state):
-    url = ('https://www.pixiv.net/ajax/user/27915696/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
+def get_follow_illust(id,headers,state,times):
+    '''獲得所有你關注的畫師 需輸入查詢的ID 第幾個 偽裝 公開/私人'''
+    url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
     
-    res = requests.get(url, headers=headers)
-    resdicts = res.json()['body']['users']
-    for resdict in resdicts:
-            #print(resdict.get('userId'))
-            queue.put(int(resdict.get('userId')))
+    res = requests.get(url.format(id), headers=headers)
+    resdicts = res.json()['body']['users'] 
+    return [int(_.get('userId')) for _ in resdicts]
 def illusts(id,cookie,Agent):				#輸入你的id得到你所有關注的P站畫師
     headers = {
         'User-Agent': Agent,
@@ -217,31 +310,29 @@ def thread_no_use_seleium_get_pid(cookie,Agent,path,num,author_pids):
     return pid
 
 def random_Agent():
-    USER_AGENTS=[
-                "Mozilla/5.0 (Linux; U; Android 4.0.4; en-gb; GT-I9300 Build/IMM76D) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30",
-                "Mozilla/5.0 (Linux; U; Android 8.0; en-gb; GT-P1000 Build/FROYO) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1",
-                "Mozilla/5.0 (Windows NT 6.2; WOW64; rv:21.0) Gecko/20100101 Firefox/21.0",
-                "Mozilla/5.0 (Android; Mobile; rv:14.0) Gecko/14.0 Firefox/14.0",
-                "Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/27.0.1453.94 Safari/537.36",
-                "Mozilla/5.0 (Linux; Android 4.0.4; Galaxy Nexus Build/IMM76B) AppleWebKit/535.19 (KHTML, like Gecko) Chrome/18.0.1025.133 Mobile Safari/535.19",            
-                "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; SV1; AcooBrowser; .NET CLR 1.1.4322; .NET CLR 2.0.50727)",
-                "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.0; Acoo Browser; SLCC1; .NET CLR 2.0.50727; Media Center PC 5.0; .NET CLR 3.0.04506)",
-                "Mozilla/4.0 (compatible; MSIE 7.0; AOL 9.5; AOLBuild 4337.35; Windows NT 5.1; .NET CLR 1.1.4322; .NET CLR 2.0.50727)",
-                "Mozilla/5.0 (Windows; U; MSIE 9.0; Windows NT 9.0; en-US)",
-                "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; Win64; x64; Trident/5.0; .NET CLR 3.5.30729; .NET CLR 3.0.30729; .NET CLR 2.0.50727; Media Center PC 6.0)",
-                "Mozilla/5.0 (compatible; MSIE 8.0; Windows NT 6.0; Trident/4.0; WOW64; Trident/4.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; .NET CLR 1.0.3705; .NET CLR 1.1.4322)",
-                "Mozilla/4.0 (compatible; MSIE 7.0b; Windows NT 5.2; .NET CLR 1.1.4322; .NET CLR 2.0.50727; InfoPath.2; .NET CLR 3.0.04506.30)",
-                "Mozilla/5.0 (Windows; U; Windows NT 5.1; zh-CN) AppleWebKit/523.15 (KHTML, like Gecko, Safari/419.3) Arora/0.3 (Change: 287 c9dfb30)",
-                "Mozilla/5.0 (X11; U; Linux; en-US) AppleWebKit/527+ (KHTML, like Gecko, Safari/419.3) Arora/0.6",
-                "Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.8.1.2pre) Gecko/20070215 K-Ninja/2.1.1",
-                "Mozilla/5.0 (Windows; U; Windows NT 5.1; zh-CN; rv:1.9) Gecko/20080705 Firefox/3.0 Kapiko/3.0",
-                "Mozilla/5.0 (X11; Linux i686; U;) Gecko/20070322 Kazehakase/0.4.5",
-                "Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.0.8) Gecko Fedora/1.9.0.8-1.fc10 Kazehakase/0.5.6",
-                "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/535.11 (KHTML, like Gecko) Chrome/17.0.963.56 Safari/535.11",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_7_3) AppleWebKit/535.20 (KHTML, like Gecko) Chrome/19.0.1036.7 Safari/535.20",
-                "Opera/9.80 (Macintosh; Intel Mac OS X 10.6.8; U; fr) Presto/2.9.168 Version/11.52",
-                ] 
-    return USER_AGENTS[random.randint(0,len(USER_AGENTS)-1)]
+    # Updated modern User-Agent list (desktop and mobile, common browsers)
+    USER_AGENTS = [
+        # Chrome (Windows)
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.5790.170 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.179 Safari/537.36",
+        # Edge (Chromium)
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.1938.81 Safari/537.36 Edg/116.0.1938.81",
+        # Firefox
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:118.0) Gecko/20100101 Firefox/118.0",
+        # macOS Safari
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+        # Chrome on macOS
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.179 Safari/537.36",
+        # iPhone (Safari)
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/605.1.15",
+        # iPad (Safari)
+        "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/605.1.15",
+        # Android Chrome (Pixel)
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.179 Mobile Safari/537.36",
+        # Samsung Internet
+        "Mozilla/5.0 (Linux; Android 13; SAMSUNG SM-S916B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/21.0 Chrome/115.0.5790.170 Mobile Safari/537.36",
+    ]
+    return random.choice(USER_AGENTS)
 def Pixiv_Tag(url):                                                 #回傳標籤
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50',
@@ -346,8 +437,169 @@ def get_download_url(path,cookie,Agent,num,pid):    #回傳下載連結
     #print(download_url)
     return(download_url)
 def Pixiv_info(url,
-    Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50'):                                                 #回傳標籤
+    Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50'
+    ,cookie=None,ip=None):                                                #回傳標籤
+        id=url.rsplit('/',1)[1]
+
+        # 先用 PID 快取，避免同一作品重複請求
+        try:
+            with _pixiv_info_cache_lock:
+                cached = _pixiv_info_cache.get(str(id))
+            if cached is not None:
+                return copy.deepcopy(cached)
+        except Exception:
+            pass
+
+        ajax_url='https://www.pixiv.net/ajax/illust/'+id
+
+        def _parse_payload(payload):
+            o = payload.get('body', {}) if isinstance(payload, dict) else {}
+            if isinstance(o, list):
+                o = o[0] if (len(o) > 0 and isinstance(o[0], dict)) else {}
+            if not isinstance(o, dict):
+                o = {}
+
+            bookmarkCount = int(o.get('bookmarkCount', 0) or 0)
+
+            pageCount = o.get('pageCount')
+            if pageCount is None:
+                user_illusts = o.get('userIllusts', {})
+                if isinstance(user_illusts, dict):
+                    illust_info = user_illusts.get(str(id)) or user_illusts.get(id) or {}
+                    if isinstance(illust_info, dict):
+                        pageCount = illust_info.get('pageCount')
+            pageCount = int(pageCount or 1)
+
+            raw_tags = o.get('tags', [])
+            if isinstance(raw_tags, dict):
+                raw_tags = raw_tags.get('tags', [])
+            if not isinstance(raw_tags, list):
+                raw_tags = [raw_tags] if raw_tags else []
+            normalized_tags = []
+            for t in raw_tags:
+                if isinstance(t, str):
+                    normalized_tags.append(t)
+                elif isinstance(t, dict):
+                    tag_name = t.get('tag') or t.get('name') or t.get('translated_name')
+                    if not tag_name and isinstance(t.get('translation'), dict):
+                        tag_name = t['translation'].get('en')
+                    if tag_name:
+                        normalized_tags.append(str(tag_name))
+                elif t is not None:
+                    normalized_tags.append(str(t))
+
+            resdicts = tag_edit.Tag(normalized_tags)
+            try:
+                urls_obj = o.get('urls', {})
+                if isinstance(urls_obj, dict):
+                    original_url = urls_obj.get('original') or urls_obj.get('regular')
+                else:
+                    original_url = None
+                img_url = str(original_url).replace("p0","p",1).replace("ugoira0","ugoira",1) if original_url else None
+            except Exception:
+                img_url=None
+            result = [list(resdicts), int(bookmarkCount), int(pageCount), str(img_url)]
+            valid = bool(img_url) and str(img_url) != 'None'
+            return result, valid
+
+        def _fetch(use_cookie=False, retry=0):
+            headers = {
+                'User-Agent': Agent,
+                'referer': 'https://www.pixiv.net/artworks/'+id,
+            }
+            if use_cookie and cookie:
+                headers['Cookie'] = cookie
+            try:
+                res = requests.get(ajax_url, headers=headers, timeout=20)
+            except Exception as e:
+                print(f"Pixiv_info request error pid={id}: {e}")
+                return [404], False, -1
+            if res.status_code == 404:
+                return [404], False, 404
+            if res.status_code == 429 and retry < 1:
+                print(429)
+                time.sleep(60)
+                return _fetch(use_cookie=use_cookie, retry=retry+1)
+            try:
+                payload = res.json()
+            except Exception as e:
+                print(f"Pixiv_info json error pid={id}: {e}")
+                return [404], False, res.status_code
+            parsed, valid = _parse_payload(payload)
+            return parsed, valid, res.status_code
+
+        no_cookie_result, no_cookie_valid, status_no_cookie = _fetch(use_cookie=False)
+        final_result = no_cookie_result
+        requires_cookie = False
+        status_cookie = None
+
+        if no_cookie_result == [404]:
+            final_result = [404]
+        elif (not no_cookie_valid) and cookie:
+            cookie_result, cookie_valid, status_cookie = _fetch(use_cookie=True)
+            if cookie_valid:
+                final_result = cookie_result
+                requires_cookie = True
+            else:
+                final_result = cookie_result if cookie_result != [404] else no_cookie_result
+                requires_cookie = False
+
+        try:
+            trace_entry = {
+                'artwork_url': 'https://www.pixiv.net/artworks/'+id,
+                'ajax_url': ajax_url,
+                'requires_cookie': requires_cookie,
+                'status_no_cookie': status_no_cookie,
+                'status_cookie': status_cookie,
+                'result_preview': {
+                    'tags_len': len(final_result[0]) if isinstance(final_result, list) and len(final_result) >= 1 and isinstance(final_result[0], list) else 0,
+                    'bookmarkCount': final_result[1] if isinstance(final_result, list) and len(final_result) >= 2 else 0,
+                    'pageCount': final_result[2] if isinstance(final_result, list) and len(final_result) >= 3 else 0,
+                    'img_url': final_result[3] if isinstance(final_result, list) and len(final_result) >= 4 else None,
+                },
+                'checked_at': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+            }
+            trace_path = os.path.join(os.getenv('APPDATA')+r'/pixiv_download/', 'pixiv_cookie_requirement.json')
+            os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+            history = {}
+            if os.path.isfile(trace_path):
+                with open(trace_path, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+                    if not isinstance(history, dict):
+                        history = {}
+            history[str(id)] = trace_entry
+            with open(trace_path, 'w', encoding='utf-8') as f:
+                json.dump(history, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+        try:
+            with _pixiv_info_cache_lock:
+                _pixiv_info_cache[str(id)] = copy.deepcopy(final_result)
+        except Exception:
+            pass
+        return final_result
+
+def get_pixiv_cookie_requirement(pid):
+    """回傳指定 PID 最近一次是否需要 cookie，找不到時回傳 None。"""
     try:
+        trace_path = os.path.join(os.getenv('APPDATA')+r'/pixiv_download/', 'pixiv_cookie_requirement.json')
+        if not os.path.isfile(trace_path):
+            return None
+        with open(trace_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        entry = data.get(str(pid))
+        if isinstance(entry, dict):
+            return entry.get('requires_cookie')
+    except Exception:
+        return None
+    return None
+    
+def userId(url,
+    Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50'):                                                 #回傳標籤
+    # try:
         headers = {
             'User-Agent': Agent,
             'referer': 'https://www.pixiv.net/',        
@@ -362,31 +614,27 @@ def Pixiv_info(url,
         obj=obj.replace('id="meta-preload-data" name="preload-data"/>','') 
         o=obj.rsplit('\'',1)[0] 
         #print(o)
-        o=o.encode('UTF-8')
-        o=json.loads(o)['illust'][id]
-        bookmarkCount = o['bookmarkCount']
-        pageCount=o['userIllusts'][id]["pageCount"]
-        resdicts =o['userIllusts'][id]["tags"]
-        resdicts=tag_edit.Tag(resdicts)
-        img_url=o['urls']['original'].replace("p0","p",1).replace("ugoira0","ugoira",1)  
-        return resdicts,int(bookmarkCount),int(pageCount),img_url
-    except Exception as err:
-        print(err)
-        try:
-            obj = str(bs4.BeautifulSoup(res.text, 'lxml').find_all('meta')[26])
-            obj=obj.replace('<meta content=\'','')
+        o = o.encode('UTF-8')
+        data = json.loads(o)
+        userId = data['illust'].get(id)
+        return userId['userId']
+    # except Exception as err:
+    #     print(err)
+    #     try:
+    #         obj = str(bs4.BeautifulSoup(res.text, 'lxml').find_all('meta')[26])
+    #         obj=obj.replace('<meta content=\'','')
             
-            obj=obj.replace('id="meta-preload-data" name="preload-data"/>','') 
-            o=obj.rsplit('\'',1)[0] 
+    #         obj=obj.replace('id="meta-preload-data" name="preload-data"/>','') 
+    #         o=obj.rsplit('\'',1)[0] 
             
-            o=o.encode('UTF-8')
-            bookmarkCount = str(json.loads(o)['illust'][str(id)]['bookmarkCount'])
-            resdicts =json.loads(o)['illust'][str(id)]['tags']['tags']
-            resdicts=tag_edit.Tag(resdicts)
-            return resdicts,int(bookmarkCount)
-        except:
-            print('error')
-            return [],[]
+    #         o=o.encode('UTF-8')
+    #         bookmarkCount = str(json.loads(o)['illust'][str(id)]['bookmarkCount'])
+    #         resdicts =json.loads(o)['illust'][str(id)]['tags']['tags']
+    #         resdicts=tag_edit.Tag(resdicts)
+    #         return resdicts,int(bookmarkCount)
+    #     except:
+    #         print('error')
+    #         return [],[]
 def pixiv_following_count(id,cookie,Agent):
     url = ("https://www.pixiv.net/ajax/user/extra?lang=zh_tw") # 访问存有画师所有作品
     print(url)
@@ -423,28 +671,34 @@ def no_use_seleium_get_pid(author_pids,cookie,Agent,q,path,num,exist_pid):
 
        
 if __name__ == '__main__':
+    for i in range(400):
+        print(i)
+        #49.0.2.242:8090
+        print(Pixiv_info('https://www.pixiv.net/artworks/103276448'))
+
+        
     '''all_pixiv_ids = illusts('21971914'
             ,'first_visit_datetime_pc=2021-10-28+00%3A33%3A54; yuid_b=IgaEcIM; p_ab_id=9; p_ab_id_2=2; p_ab_d_id=1655378609; c_type=34; privacy_policy_notification=0; a_type=0; b_type=1; privacy_policy_agreement=3; login_ever=yes; PHPSESSID=27915696_PjlaOdEHhwZxxwFR6QhmWdmUAguAJ05n; device_token=b0e8ae7f1085345fd97205929a8c801f; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:16; tag_view_ranking=0xsDLqCEW6~qWFESUmfEs~RTJMXD26Ak~lH5YZxnbfC~Bd2L9ZBE8q~kGYw4gQ11Z~Lt-oEicbBr~HLWLeyYOUF~xa5-CDAPro~Txs9grkeRc~jH0uD88V6F~5oPIfUbtd6~Avyrt8Dl6U~Ie2c51_4Sp~KN7uxuR89w~iFcW6hPGPU~LVSDGaCAdn~aKhT3n4RHZ~HY55MqmzzQ~QKeXYK2oSR~s1DI4r3R9d~-StjcwdYwv~_hSAdpN9rx~Zw76BPYnQY~LLyDB5xskQ~Je_lQPk0GY~At-5ulc3K-~MM6RXH_rlN~PKOnf9fn03~kWRbcAGDa9~_pwIgrV8TB~HBlflqJjBZ~rIovsiOt91~kqu7T68WD3~_EOd7bsGyl~ziiAzr_h04~wKl4cqK7Gl~YXsA4N8tVW~uGQeWvelyQ~EGefOqA6KB~yS_WrRrWFi~y0H0q1mN2T~bbZFcn8nQh~7eQw69bujS~hfCvniImMk~0M0zAeslDb~Ti1gvrVQFO~Hjx7wJwsUT~gpglyfLkWs~cbmDKjZf9z~t_MXrQdcbG~v3nOtgG77A~hRUnVPuHhQ~Cj_Gcw9KR1~txZ9z5ByU7~vdbd7LdFLQ~BtXd1-LPRH~q303ip6Ui5~faHcYIP1U0~jsuXqE_4cM~yPNaP3JSNF~4QveACRzn3~T40wdiG5yy~sqGkVxMuMR~y8GNntYHsi~TWrozby2UO~n39RQWfHku~w04oCbou_K~EWR7JDW6jH~qsesP1OhVb~O_HW-VFJqw~tzIoUMzCb7~q3eUobDMJW~qiO14cZMBI~zJ9HPr_eGC~py0hn8jqar~RokSaRBUGr~KavbyZsaB1~rgxOsa3XtV~phyAxUXrUB~o1uJiiK9Pb~3gc3uGrU1V~m3EJRa33xU~zIv0cf5VVk~JBqkgBEhOH~bhGHO52dlK~_Rh3LLrBkn~Sp679VBWVz~PNmj47oZlB~5ObVqT-Fku~svKogfYWcS~2bq8SNVWly~j7DYHEocqe~VP5Nfk8taA~mxDE3obNef~bkSTvfrPKL~Peat8vFmO1~pYlUxeIoeg~zASPXsXKdt~DADQycFGB0; __cf_bm=amkOyDjW98gUXXLbSGYlOQO2yEr_dO3dsGfCSusktuQ-1647280343-0-AdCW/o0Ks2IM0BaHV5g6N6BeBELcwf82kJgll/tiqKrCBt9+JZIka7Ipba1bqJqV+sjZK6c8unyuAxUFXKv0qmKT3NSzntjWOFBvjLeo0wCY'
             ,'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 Safari/537.36 Edg/99.0.1150.36')
     '''
-    cookie=['p_ab_id=5; p_ab_id_2=5; p_ab_d_id=1125130963; first_visit_datetime_pc=2021-02-23+02%3A32%3A11; yuid_b=OJRESQg; a_type=0; b_type=1; login_ever=yes; privacy_policy_notification=0; c_type=34; PHPSESSID=27915696_60l9nve4HS7Z2Y0bngGXRZQwV4W4DvJ0; privacy_policy_agreement=3; QSI_S_ZN_5hF4My7Ad6VNNAi=v:0:0; tag_view_ranking=0xsDLqCEW6~qWFESUmfEs~LVSDGaCAdn~QKeXYK2oSR~Txs9grkeRc~RTJMXD26Ak~kGYw4gQ11Z~lH5YZxnbfC~Lt-oEicbBr~_EOd7bsGyl~yS_WrRrWFi~G-44hwuIPi~LLyDB5xskQ~Ie2c51_4Sp~HLWLeyYOUF~DADQycFGB0~sqGkVxMuMR~jk9IzfjZ6n~uvBGOtCzqF~MM6RXH_rlN~aKhT3n4RHZ~HY55MqmzzQ~Ti1gvrVQFO~bXMh6mBhl8~RokSaRBUGr~aC55Umcfh1~zsm1ECW5Wb~5f1R8PG9ra~xa5-CDAPro~G_f4j5NH8i~v3nOtgG77A~0RGtdYkK6L~abNIEh2zTB~Bd2L9ZBE8q~0jyux9PxkH~QaiOjmwQnI~n39RQWfHku~vxqZQOR3t2~hk_QPyZfi8~Tg1PbOMGRv~qXzcci65nj~ZTBAtZUDtQ~1VgdMhBiax~dUhrZMpRPB~tgP8r-gOe_~YTKjYV1RQx~Je_lQPk0GY~m3EJRa33xU~iVTmZJMGJj~rMC0CLW0cf~mHukPa9Swj~GuK7T6aGv6~T6NhuB95ST~CLTDpOEHJL~gpglyfLkWs~NGpDowiVmM~MnGbHeuS94~mZurA-1CO-~Am8pyjYCcZ~Riqeg_qBGT~jfnUZgnpFl~BtXd1-LPRH~ujS7cIBGO-~zZZn32I7eS~CrFcrMFJzz~ZN5DR5ie1W~AZ1ov2QNRs~N7rBHi7ijr~QzKFCsGzn-~PBxKNk7VAD~zyKU3Q5L4C~vAwbTkrP0I~P5-w_IbJrm~Ltbk6w58aR~l2rugVKl6u~ajFGI2BXvo~R0DtApn-IB~W4_X_Af3yY~OUF2gvwPef~D4hLr_YmAD~QIa7PLv7ZL~EQ_o6ZyXFg~lf-Uj4GKzU~2FO_ideA5k~18j5-cWRq2~FPCeANM2Bm~TWrozby2UO~9Gbahmahac~2QTW_H5tVX~bplY14maDo~jjVAJCBCtW~B2kc8vAuXw~m3sqCXWo7m~k39B1CkQWC~muA8Dd9eL4~I-ST5EF_lI~wbvCWCYbkM~mVhi1hBMit~Hry6GxyqEm~i8u6Dgt7ao; __cf_bm=cqoyzD4i.qO0s1sUnjhOf9p5ytamrWA2qApQNhhiIKE-1656319872-0-AaXwpJas6wECDAH0caPNgFN5+Y5wjvrFlFzdxBuyzQz6oQGTN8qILCJhy4DeWPqBE9H8Msy1ymtWXbBqLJ6dRm160hdvQQHr56qP0p3ZdhTI',
+    '''cookie=['p_ab_id=5; p_ab_id_2=5; p_ab_d_id=1125130963; first_visit_datetime_pc=2021-02-23+02%3A32%3A11; yuid_b=OJRESQg; a_type=0; b_type=1; login_ever=yes; privacy_policy_notification=0; c_type=34; PHPSESSID=27915696_60l9nve4HS7Z2Y0bngGXRZQwV4W4DvJ0; privacy_policy_agreement=3; QSI_S_ZN_5hF4My7Ad6VNNAi=v:0:0; tag_view_ranking=0xsDLqCEW6~qWFESUmfEs~LVSDGaCAdn~QKeXYK2oSR~Txs9grkeRc~RTJMXD26Ak~kGYw4gQ11Z~lH5YZxnbfC~Lt-oEicbBr~_EOd7bsGyl~yS_WrRrWFi~G-44hwuIPi~LLyDB5xskQ~Ie2c51_4Sp~HLWLeyYOUF~DADQycFGB0~sqGkVxMuMR~jk9IzfjZ6n~uvBGOtCzqF~MM6RXH_rlN~aKhT3n4RHZ~HY55MqmzzQ~Ti1gvrVQFO~bXMh6mBhl8~RokSaRBUGr~aC55Umcfh1~zsm1ECW5Wb~5f1R8PG9ra~xa5-CDAPro~G_f4j5NH8i~v3nOtgG77A~0RGtdYkK6L~abNIEh2zTB~Bd2L9ZBE8q~0jyux9PxkH~QaiOjmwQnI~n39RQWfHku~vxqZQOR3t2~hk_QPyZfi8~Tg1PbOMGRv~qXzcci65nj~ZTBAtZUDtQ~1VgdMhBiax~dUhrZMpRPB~tgP8r-gOe_~YTKjYV1RQx~Je_lQPk0GY~m3EJRa33xU~iVTmZJMGJj~rMC0CLW0cf~mHukPa9Swj~GuK7T6aGv6~T6NhuB95ST~CLTDpOEHJL~gpglyfLkWs~NGpDowiVmM~MnGbHeuS94~mZurA-1CO-~Am8pyjYCcZ~Riqeg_qBGT~jfnUZgnpFl~BtXd1-LPRH~ujS7cIBGO-~zZZn32I7eS~CrFcrMFJzz~ZN5DR5ie1W~AZ1ov2QNRs~N7rBHi7ijr~QzKFCsGzn-~PBxKNk7VAD~zyKU3Q5L4C~vAwbTkrP0I~P5-w_IbJrm~Ltbk6w58aR~l2rugVKl6u~ajFGI2BXvo~R0DtApn-IB~W4_X_Af3yY~OUF2gvwPef~D4hLr_YmAD~QIa7PLv7ZL~EQ_o6ZyXFg~lf-Uj4GKzU~2FO_ideA5k~18j5-cWRq2~FPCeANM2Bm~TWrozby2UO~9Gbahmahac~2QTW_H5tVX~bplY14maDo~jjVAJCBCtW~B2kc8vAuXw~m3sqCXWo7m~k39B1CkQWC~muA8Dd9eL4~I-ST5EF_lI~wbvCWCYbkM~mVhi1hBMit~Hry6GxyqEm~i8u6Dgt7ao; __cf_bm=cqoyzD4i.qO0s1sUnjhOf9p5ytamrWA2qApQNhhiIKE-1656319872-0-AaXwpJas6wECDAH0caPNgFN5+Y5wjvrFlFzdxBuyzQz6oQGTN8qILCJhy4DeWPqBE9H8Msy1ymtWXbBqLJ6dRm160hdvQQHr56qP0p3ZdhTI',
         'first_visit_datetime_pc=2022-02-22+01%3A16%3A54; p_ab_id=4; p_ab_id_2=7; p_ab_d_id=1650471887; __utma=235335808.1075363582.1645460214.1645460214.1645460214.1; __utmc=235335808; __utmz=235335808.1645460214.1.1.utmcsr=(direct)|utmccn=(direct)|utmcmd=(none); __cf_bm=0a88D.DNolnjql11bA2YlSX0AcrLNbOeH4e01.n9Bxo-1645460214-0-AZBMYe8wLu85sKJgxlsiLyTfyRirq9PImai1YQW6aqaElwzgwilYvqTg1yArIG9dhNAWfXUnstyJaUnA7KjsC4hCuS2VpDjkwIxqiWZjNpEfds/gw+Fti9Xi7WNGm60A275E+delw5z8UbPR+KvvWIsu+gzXXX+bNS+iKfwixI8fUjhytmLnoA2qeosMkwT2EA==; _fbp=fb.1.1645460216607.810010051; __utmt=1; yuid_b=ExaEQEI; _ga=GA1.2.1075363582.1645460214; _gid=GA1.2.1775348523.1645460337; _gat=1; PHPSESSID=78672220_Guho8rq4QaKdQmhrizUuq9XBanNhtU5S; device_token=9fed18d4053fdd2dd3c14b6a8b9487f6; privacy_policy_agreement=3; c_type=23; privacy_policy_notification=0; a_type=0; b_type=1; __utmv=235335808.|3=plan=normal=1^5=gender=male=1^6=user_id=78672220=1^11=lang=zh_tw=1; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:1; tag_view_ranking=qiO14cZMBI~RVRPe90CVr~oCR2Pbz1ly~Lt-oEicbBr~eVxus64GZU~uKsA-LcJvn; __utmb=235335808.4.10.1645460214'
-        ]
+        ]'''
         #Test_cookies(cookie)
     '''url='https://www.pixiv.net/artworks/96429430'
     tag=Pixiv_Tag(url) ''' 
     '''q=Queue()'''
     #print(Pixiv_info('https://www.pixiv.net/artworks/98019845'))  
-    start=time.time() 
+    '''start=time.time() 
     Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.74 Safari/537.36 Edg/99.0.1150.55'
-    #print(illusts('27915696',cookie[0],'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.124 Safari/537.36 Edg/102.0.1245.41'))
+    '''#print(illusts('27915696',cookie[0],'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.124 Safari/537.36 Edg/102.0.1245.41'))
     #illusts('59115126',cookie[0],'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.124 Safari/537.36 Edg/102.0.1245.41')
     #pixiv_following_count('27915696',cookie[0],'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.124 Safari/537.36 Edg/102.0.1245.41')
-    path=r'D:/pixiv/'
+    #path=r'D:/pixiv/'
 
-    print(thread_no_use_seleium_get_pid(cookie[0],Agent,path,'1','59115126'))
+    '''print(thread_no_use_seleium_get_pid(cookie[0],Agent,path,'1','59115126'))
     stop=time.time()
-    print(stop-start)
+    print(stop-start)'''
     '''i,cookies=Test_cookies(['p_ab_id=5; p_ab_id_2=5; p_ab_d_id=1125130963; first_visit_datetime_pc=2021-02-23+02%3A32%3A11; yuid_b=OJRESQg; a_type=0; b_type=1; login_ever=yes; privacy_policy_notification=0; c_type=34; PHPSESSID=27915696_60l9nve4HS7Z2Y0bngGXRZQwV4W4DvJ0; privacy_policy_agreement=3; tag_view_ranking=0xsDLqCEW6~RTJMXD26Ak~lH5YZxnbfC~kGYw4gQ11Z~Ie2c51_4Sp~Lt-oEicbBr~HLWLeyYOUF~6lAZFEHdIG~tgP8r-gOe_~v3nOtgG77A~q303ip6Ui5~SnoEe7upUJ~VbPCYJXdEP~4QveACRzn3~hRUnVPuHhQ~fkptjjF31f~liM64qjhwQ~LcFnY5KMB3~R8jL-NaEv1~5oPIfUbtd6~HY55MqmzzQ~EZQqoW9r8g~rIovsiOt91~xZMlo13i1B~jXyAkKG_r6~fwLb-f-Cyw~1KCppYVBZi~xS1IEbYkDC~D2Z9yqNh4C~q3eUobDMJW~LLyDB5xskQ~qWFESUmfEs~PwDMGzD6xn~UCT8y2nU0w~Txs9grkeRc~9aCtrIRNdF~8zydy1kf22~zvcWye7PPU~QkN-eEgwBf~BRoQO5EgS6~DlBi_h7Pbj~Syl9NQhE_u~H0KKRBjKCB~oLKtJ-caOt~jH0uD88V6F~Yw6zHqltKg~ltbsxp8yio~bX7kls1wXg~LVSDGaCAdn~qkC-JF_MXY~yJr9CrS0uL~JXmGXDx4tL~8qzNKXwVP9~P9jONkE5Ux~aMSPvw-ONW~49mOVaB3jw~77cKnr2WaY~y9_ytVF_KY~lLoGT15boh~CO8L4b7n_7~dUhrZMpRPB~reR7DUAWuG~sHj972WME6~1VgdMhBiax~jFLb4HjoWf~bXMh6mBhl8~3Q3HW-78l_~_EOd7bsGyl~ziiAzr_h04~9Gbahmahac~6vriIwKZAv~u3EAZmzDcl~2R7RYffVfj~SapL8yQw4Y~Ed_W9RQRe_~QaiOjmwQnI~o8a--Qa5of~cHpSJQiKeZ~KexWqtgzW1~wLSj8MDOo8~mLrrjwTHBm~WVrsHleeCL~OUsYoX1-GT~_vCZ2RLsY2~_3oeEue7S7~FrNQVCB8yi~YHRjLHL-7q~4sdiKNzOsj~hMzrji99a1~PrND0ipqBX~Uw_mm-h1Wo~FgYArp6riX~MM6RXH_rlN~EsPictrypp~MA6EUZYaNt~ZEYMFD786k~RcahSSzeRf~ePN3h1AXKX~R97S29V8Qw~YXsA4N8tVW; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:19; __cf_bm=0m8DlJrBTwZ.UkA95H91jwWjQYvzJ9v53XH1_hDO.tg-1648960602-0-AeDEXETjg7BWesTTPlyV2jRCeYr/S60VaHO7W/8JyG0+ycRcVcHsn2T3uBQjbBzkpXVgf7VMxxf53z8IeftahY/hNQEmRpLmUBzLfObJxdCO']
     )'''
     '''with open((r"R:/picture_ids0.txt")) as file:     #讀取寫入的文檔

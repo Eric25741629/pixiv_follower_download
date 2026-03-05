@@ -12,6 +12,7 @@ import tqdm as tqdm
 from pathlib import Path
 import numpy as np
 import random
+
 def gif_download(cookie,agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36 Edg/96.0.1054.62',path=r'C:\Users',url=None):
     try:
         cookies=random.choice(cookie)
@@ -145,7 +146,7 @@ def Download_Pixiv_url(path,lock,url):
 global download_start_time
 #download_start_time=datetime.datetime(2022, 7, 19, 14, 20, 0)
 download_start_time=datetime.datetime.now()
-def get_filelist(path):
+def get_filelist(self,path):
     Filelist = []
     for home, dirs, files in os.walk(path):
         for filename in files:
@@ -212,6 +213,7 @@ def del_emp_dir(path):
       try:
         os.rmdir(dir) #os.rmdir() 方法用於刪除指定路徑的目錄。僅當這資料夾是空的才可以,否則,丟擲OSError。
       except Exception as e:
+        print(e)
         pass
 def download_img_main(download_path,start,stop,cookie=None,Agent=None):
     #print(Agent)
