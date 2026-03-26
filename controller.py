@@ -19,13 +19,21 @@ from Ui2 import Ui_MainWindow
 import sys
 import traceback
 import pixiv_api
+from run_actions import (
+    start_get_following,
+    start_get_pid,
+    start_get_url,
+    start_download,
+    start_all,
+    continue_all,
+)
 global cookies
 global Agent
 global path
 
 
 class Runthread(QtCore.QThread):
-    #  通過類成員物件定義信號物件
+    #  ???????????????????????????????
     _signal = pyqtSignal(str)
 
     def __init__(self):
@@ -37,7 +45,7 @@ class Runthread(QtCore.QThread):
     def run(self):
         for i in range(100):
             time.sleep(0.2)
-            self._signal.emit(int(i))  # 注意這裡與_signal = pyqtSignal(str)中的類型相同
+            self._signal.emit(int(i))  # ?????怏??????????????????nal = pyqtSignal(str)?????????桀???????
 
 
 class MainWindow_controller(QtWidgets.QMainWindow):
@@ -70,11 +78,11 @@ class MainWindow_controller(QtWidgets.QMainWindow):
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         try:
-            # 限制 QTextBrowser 保留的最大區塊數，避免累積大量行造成記憶體/渲染問題
+            # ???? QTextBrowser ????????????Ⅹ鞊???????????????????????????????????????????怏???????
             self.ui.output.document().setMaximumBlockCount(2000)
         except Exception:
             pass
-        self.thread1 = None  # 初始化執行緒
+        self.thread1 = None  # ??????????????????Ⅹ????
         self._countdown_output_active = False
         self._countdown_block_number = None
         self._last_countdown_second = None
@@ -83,23 +91,23 @@ class MainWindow_controller(QtWidgets.QMainWindow):
         output = os.getenv('APPDATA')+r'/pixiv_download/update.txt'
         url = 'https://drive.google.com/u/1/uc?id=1uGppiPKA6TF0Zxz3SjCnAp_5_0YsPXYF&export=download'
         gdown.download(url, output)
-        with open(output, encoding="utf-8") as file:  # 讀取寫入的文檔
+        with open(output, encoding="utf-8") as file:  # ????????????????????
             data = json.load(file)
 
         msgBox = QMessageBox()
         msgBox.setTextFormat(Qt.RichText)
         msgBox.setText(
-            "有新的更新   <a href='https://drive.google.com/file/d/1zZF9kFVCP8HuwbZLu6sqEiyQmaEbuUSJ/view?usp=share_link'>按我跳轉至下載頁面</a>.")
-        msgBox.setWindowTitle("檢測到新的版本")
+            "??????????  <a href='https://drive.google.com/file/d/1zZF9kFVCP8HuwbZLu6sqEiyQmaEbuUSJ/view?usp=share_link'>??????????????????怏??????/a>.")
+        msgBox.setWindowTitle("?????????????")
         msgBox.exec()
         '''output=self.path+r'/check.json'
 
-        with open(output, encoding="utf-8") as file:     #讀取寫入的文檔
+        with open(output, encoding="utf-8") as file:     #????????????????????
             data = json.load(file)
         vision=float(data['updata_vision'])
         if vision>0.15:
             self.label.setOpenExternalLinks(True)
-            self.label.setText(u'<a href="https://datutu.blog.csdn.net/" style="color:#0000ff;"><b> 我的CSDN博客 </b></a>')'''
+            self.label.setText(u'<a href="https://datutu.blog.csdn.net/" style="color:#0000ff;"><b> ???CSDN????????</b></a>')'''
 
     def disable_button(self):
         self.ui.get_following.setDisabled(True)
@@ -134,8 +142,12 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             os.makedirs(user_data_path, exist_ok=True)
             date_str = datetime.now().strftime('%Y-%m-%d')
             logfile = os.path.join(user_data_path, f'log-{date_str}.txt')
-            with open(logfile, 'a', encoding='utf-8') as f:
-                f.write(f'[{ts}] {log_text}\n')
+            try:
+                from safe_io import atomic_append_text
+                atomic_append_text(logfile, f'[{ts}] {log_text}')
+            except Exception:
+                with open(logfile, 'a', encoding='utf-8') as f:
+                    f.write(f'[{ts}] {log_text}\n')
         except Exception:
             pass
 
@@ -158,7 +170,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             userdata_controller.write_data()
         except Exception as e:
             try:
-                self.ui.output.append('寫入 user data 失敗: ' + str(e))
+                self.ui.output.append("Failed to save user data: " + str(e))
             except Exception:
                 pass
         try:
@@ -173,7 +185,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
                              self.ui.radioButton_2, self.ui.radioButton_3).write_data()
         except Exception as e:
             try:
-                self.ui.output.append('寫入 logging mode 失敗: ' + str(e))
+                self.ui.output.append("Failed to save logging mode: " + str(e))
             except Exception:
                 pass
 
@@ -182,7 +194,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
                         self.ui.account1, self.ui.password1, self.mode).write_cookies()
         except Exception as e:
             try:
-                self.ui.output.append('寫入 cookies 失敗: ' + str(e))
+                self.ui.output.append("Failed to save cookies: " + str(e))
             except Exception:
                 pass
 
@@ -191,10 +203,16 @@ class MainWindow_controller(QtWidgets.QMainWindow):
                           self.ui.create_dir, self.ui.no_R18G_dir,
                           getattr(self.ui, 'single_thread_mode', None),
                           getattr(self.ui, 'pid_wait_min', None),
-                          getattr(self.ui, 'pid_wait_max', None)).write_other_date()
+                          getattr(self.ui, 'pid_wait_max', None),
+                          getattr(self.ui, 'pid_wait_nocookie_min', None),
+                          getattr(self.ui, 'pid_wait_nocookie_max', None),
+                          getattr(self.ui, 'jxl_enable', None),
+                          getattr(self.ui, 'jxl_cjxl_path', None),
+                          getattr(self.ui, 'jxl_delete_original', None),
+                          getattr(self.ui, 'jxl_effort', None)).write_other_date()
         except Exception as e:
             try:
-                self.ui.output.append('寫入 other settings 失敗: ' + str(e))
+                self.ui.output.append("Failed to save other settings: " + str(e))
             except Exception:
                 pass
 
@@ -202,7 +220,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             userpass(self.ui.pass_tag, self.ui.pass_like).write()
         except Exception as e:
             try:
-                self.ui.output.append('寫入 pass 設定失敗: ' + str(e))
+                self.ui.output.append("Failed to save pass settings: " + str(e))
             except Exception:
                 pass
 
@@ -211,18 +229,18 @@ class MainWindow_controller(QtWidgets.QMainWindow):
     def ui_cookies(self):
         print(self.cookies)
         print(f"[controller] ui_cookies: current mode={self.mode}")
-        if (self.cookies == ""):
+        if self.cookies == "":
             if self.ui.account1.text() == '' or self.ui.password1.text() == '':
-                QMessageBox.warning(None, '錯誤', '帳號或密碼不得為空')
+                QMessageBox.warning(None, "Warning", "Please input account/password or paste cookies.")
                 return
-            else:
-                cookies = cookies_set(
-                    self.cookies, self.Agent, self.userid, self.ui.account1, self.ui.password1, self.mode)
-                self.userid, self.cookies, self.Agent = cookies.get_cookies()
+            cookies = cookies_set(
+                self.cookies, self.Agent, self.userid, self.ui.account1, self.ui.password1, self.mode
+            )
+            self.userid, self.cookies, self.Agent = cookies.get_cookies()
 
     def log_start(self, text):
         try:
-            self.ui.output.append('開始: ' + text)
+            self.ui.output.append('Start: ' + text)
             print('[controller] ' + text + ' started')
             self.ui.output.moveCursor(QTextCursor.End)
         except Exception:
@@ -231,19 +249,86 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    def _setup_action_ui(self):
+        try:
+            self.ui.get_following.setText('Step 1: Get Following Artists')
+            self.ui.get_pid.setText('Step 2: Get Artwork IDs')
+            self.ui.get_url.setText('Step 3: Get Artwork Details')
+            self.ui.download_url.setText('Step 4: Start Download')
+            self.ui.all_start.setText('Run All (1->4)')
+            self.ui.get_following.setToolTip('Sync your following artist list first')
+            self.ui.get_pid.setToolTip('Fetch artwork IDs from following artists')
+            self.ui.get_url.setToolTip('Resolve artwork URLs and metadata by IDs')
+            self.ui.download_url.setToolTip('Download from all_url.txt')
+            self.ui.all_start.setToolTip('Run steps 1 to 4 in sequence')
+        except Exception:
+            pass
+        try:
+            section_label = QLabel('Recommended: run Step 1,2,3 then Step 4.')
+            section_label.setStyleSheet('color:#374151; padding:4px 2px;')
+            self.ui.run_tab_actions_layout.insertWidget(0, section_label)
+        except Exception:
+            pass
+
+    def _setup_jxl_ui(self):
+        try:
+            # Create JXL controls dynamically to avoid requiring .ui regeneration.
+            group = QGroupBox('JXL 自動轉檔')
+            layout = QGridLayout(group)
+
+            self.ui.jxl_enable = QCheckBox('下載完成後自動轉為 JXL (無損)')
+            self.ui.jxl_enable.setChecked(False)
+            layout.addWidget(self.ui.jxl_enable, 0, 0, 1, 4)
+
+            layout.addWidget(QLabel('cjxl 路徑'), 1, 0)
+            self.ui.jxl_cjxl_path = QLineEdit(r'C:\Users\Eric\Downloads\jxl-x64-windows\bin\cjxl.exe')
+            self.ui.jxl_cjxl_path.setPlaceholderText(r'C:\Users\Eric\Downloads\jxl-x64-windows\bin\cjxl.exe')
+            layout.addWidget(self.ui.jxl_cjxl_path, 1, 1, 1, 2)
+
+            self.ui.jxl_browse = QPushButton('瀏覽...')
+            self.ui.jxl_browse.clicked.connect(self.on_browse_jxl_cjxl_clicked)
+            layout.addWidget(self.ui.jxl_browse, 1, 3)
+
+            layout.addWidget(QLabel('壓縮 effort (1-9)'), 2, 0)
+            self.ui.jxl_effort = QSpinBox()
+            self.ui.jxl_effort.setRange(1, 9)
+            self.ui.jxl_effort.setValue(7)
+            layout.addWidget(self.ui.jxl_effort, 2, 1)
+
+            self.ui.jxl_delete_original = QCheckBox('轉檔成功後刪除原圖')
+            self.ui.jxl_delete_original.setChecked(False)
+            layout.addWidget(self.ui.jxl_delete_original, 2, 2, 1, 2)
+
+            try:
+                self.ui.run_tab_actions_layout.addWidget(group)
+            except Exception:
+                # Fallback: attach to central widget layout if available.
+                container = self.ui.centralwidget.layout() if hasattr(self.ui, 'centralwidget') else None
+                if container is not None:
+                    container.addWidget(group)
+        except Exception:
+            pass
+
+    def _print_backup_policy(self):
+        try:
+            self.ui.output.append('[Backup Policy]')
+            self.ui.output.append('1) atomic_write_* backs up old file to sibling history/')
+            self.ui.output.append('2) backup=False skips history (ex: cookies.json)')
+            self.ui.output.append('3) Name: filename.YYYYMMDD(.N), keep latest 10')
+        except Exception:
+            pass
+
     @QtCore.pyqtSlot(int)
     def update_countdown(self, seconds):
         try:
-            # 在狀態列只顯示剩餘秒數，避免大量文字刷屏
-            self.statusBar().showMessage(f"等待 {seconds} 秒...")
+            self.statusBar().showMessage(f"Waiting {seconds}s..." if seconds > 0 else "Wait complete")
         except Exception:
             pass
-        # 依需求：直接覆寫輸出框「最後一行」倒數，不做文字比對
         try:
             if self._last_countdown_second == seconds:
                 return
             self._last_countdown_second = seconds
-            text = f"等待 {seconds} 秒..." if seconds > 0 else "等待結束"
+            text = f"Waiting {seconds}s..." if seconds > 0 else "Wait complete"
 
             if not self._countdown_output_active:
                 self.ui.output.append(text)
@@ -281,8 +366,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             pass
 
     def notice(self, message):
-        QMessageBox.warning(None, '完成', message)
-        # 當執行緒完成時停用暫停/繼續/中止按鈕
+        QMessageBox.warning(None, 'Notice', message)
         self.disable_thread_controls()
         self.enable_button()
         try:
@@ -290,9 +374,23 @@ class MainWindow_controller(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _on_qthread_finished(self):
+        # ?????????????????雓飭???????????????????_finished ???????I ??????????????????
+        try:
+            self.disable_thread_controls()
+            self.enable_button()
+            try:
+                self.statusBar().clearMessage()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def setup_control(self):
         # self.update()
         # TODO
+        self._setup_action_ui()
+        self._setup_jxl_ui()
         self.userdata_controller = Userdata_controller(self.path,
                                                        self.exist_pid,
                                                        self.Author_list,
@@ -308,7 +406,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
                                                        self.ui.must_tag_list
                                                        )
 
-        # 讀取用戶選擇的登入方式
+        # ??????????????????????????????
         # logging_mode_set expects args: (mode, _ui_pixiv_mode, _ui_fb_mode, _ui_google_mode)
         # UI object names: radioButton = pixiv, radioButton_2 = Google, radioButton_3 = FB
         # pass radioButton_3 (FB) as _ui_fb_mode and radioButton_2 (Google) as _ui_google_mode
@@ -317,22 +415,28 @@ class MainWindow_controller(QtWidgets.QMainWindow):
         self.mode = loggingmode.load_data()
         self.path, self.download_path, self.exist_pid, self.user_path1, self.Author_list, self.ban_tag, self.must_tag = self.userdata_controller.load_data()
 
-        # 讀取cookies檔案
+        # ?????????璈????????窺????
         userid, cookies, agent = cookies_set(
             self.cookies, self.Agent, self.userid, self.ui.account1, self.ui.password1, self.mode).read_cookies()
         if (cookies != 0 and cookies != "" and agent != 0 and userid != 0):
             self.cookies = cookies
             self.Agent, self.userid = agent, userid
-            self.ui.output.append('加載'+self.userid+'cookies完成')
+            self.ui.output.append(f"Cookies loaded for user: {self.userid}")
             self.ui.output.moveCursor(QTextCursor.End)
         else:
-            self.ui.output.append('無法加載cookies'+self.userid+'')
-        # 設定雜項
+            self.ui.output.append(f"No valid cookies found for user: {self.userid}")
+        # ????????????
         othersettings(self.ui.hidefollow, self.ui.nogif, self.ui.notag,
                   self.ui.notime, self.ui.create_dir, self.ui.no_R18G_dir,
                   getattr(self.ui, 'single_thread_mode', None),
                   getattr(self.ui, 'pid_wait_min', None),
-                  getattr(self.ui, 'pid_wait_max', None)).setinfo()
+                  getattr(self.ui, 'pid_wait_max', None),
+                  getattr(self.ui, 'pid_wait_nocookie_min', None),
+                  getattr(self.ui, 'pid_wait_nocookie_max', None),
+                  getattr(self.ui, 'jxl_enable', None),
+                  getattr(self.ui, 'jxl_cjxl_path', None),
+                  getattr(self.ui, 'jxl_delete_original', None),
+                  getattr(self.ui, 'jxl_effort', None)).setinfo()
         userpass(self.ui.pass_tag, self.ui.pass_like).read_info()
         self.path = os.getenv('APPDATA')+r'/pixiv_download/'
 
@@ -353,9 +457,11 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             self.test_cookies()
         except Exception as e:
             try:
-                self.ui.output.append('test_cookies 發生錯誤: ' + str(e))
+                self.ui.output.append("test_cookies failed: " + str(e))
             except Exception:
                 pass
+
+        self._print_backup_policy()
 
     def test_cookies(self):
         test, cookies = pixiv_api.Test_cookies([self.cookies], self.Agent)
@@ -368,7 +474,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot()
     def on_pause_all_clicked(self):
         if not self.thread1:
-            QMessageBox.warning(None, '錯誤', '沒有正在執行的工作可暫停')
+            QMessageBox.warning(None, "Warning", "No running task to pause")
             return
         try:
             if hasattr(self.thread1, 'pause'):
@@ -379,14 +485,14 @@ class MainWindow_controller(QtWidgets.QMainWindow):
                 except Exception:
                     pass
             else:
-                QMessageBox.warning(None, '錯誤', '當前執行緒不支援暫停')
+                QMessageBox.warning(None, "Warning", "Current task does not support pause")
         except Exception as e:
-            QMessageBox.warning(None, '錯誤', str(e))
+            QMessageBox.warning(None, "Warning", str(e))
 
     @QtCore.pyqtSlot()
     def on_continue_2_clicked(self):
         if not self.thread1:
-            QMessageBox.warning(None, '錯誤', '沒有正在執行的工作可繼續')
+            QMessageBox.warning(None, "Warning", "No running task to resume")
             return
         try:
             if hasattr(self.thread1, 'resume'):
@@ -397,28 +503,28 @@ class MainWindow_controller(QtWidgets.QMainWindow):
                 except Exception:
                     pass
             else:
-                QMessageBox.warning(None, '錯誤', '當前執行緒不支援繼續')
+                QMessageBox.warning(None, "Warning", "Current task does not support resume")
         except Exception as e:
-            QMessageBox.warning(None, '錯誤', str(e))
+            QMessageBox.warning(None, "Warning", str(e))
 
     @QtCore.pyqtSlot()
     def on_stop_clicked(self):
         if not self.thread1:
-            QMessageBox.warning(None, '錯誤', '沒有正在執行的工作可中止')
+            QMessageBox.warning(None, "Warning", "No running task to stop")
             return
         try:
             if hasattr(self.thread1, 'stop'):
                 self.thread1.stop()
-                # 停止後停用所有控制按鈕
+                # ???????????????????????????????
                 try:
                     self.disable_thread_controls()
                     self.disable_button()
                 except Exception:
                     pass
             else:
-                QMessageBox.warning(None, '錯誤', '當前執行緒不支援中止')
+                QMessageBox.warning(None, "Warning", "Current task does not support stop")
         except Exception as e:
-            QMessageBox.warning(None, '錯誤', str(e))
+            QMessageBox.warning(None, "Warning", str(e))
 
     @QtCore.pyqtSlot()
     def on_add_ban_tag_clicked(self):
@@ -435,13 +541,13 @@ class MainWindow_controller(QtWidgets.QMainWindow):
         self.ui.ban_tag_list.takeItem(choose_item.row())
 
     def output_err(self, e):
-        error_class = e.__class__.__name__  # 取得錯誤類型
-        detail = e.args[0]  # 取得詳細內容
-        cl, exc, tb = sys.exc_info()  # 取得Call Stack
-        lastCallStack = traceback.extract_tb(tb)[-1]  # 取得Call Stack的最後一筆資料
-        fileName = lastCallStack[0]  # 取得發生的檔案名稱
-        lineNum = lastCallStack[1]  # 取得發生的行號
-        funcName = lastCallStack[2]  # 取得發生的函數名稱
+        error_class = e.__class__.__name__  # ????????????桀????
+        detail = e.args[0]  # ???????????
+        cl, exc, tb = sys.exc_info()  # ???Call Stack
+        lastCallStack = traceback.extract_tb(tb)[-1]  # ???Call Stack???????????????
+        fileName = lastCallStack[0]  # ???????????????
+        lineNum = lastCallStack[1]  # ???????????
+        funcName = lastCallStack[2]  # ???????????????
         errMsg = "File \"{}\",  in {}: [{}] ".format(
             fileName, funcName, error_class)
         return (errMsg)
@@ -451,11 +557,11 @@ class MainWindow_controller(QtWidgets.QMainWindow):
         try:
             file_name = "tag_ban_pid.txt"
             os.remove(self.path+file_name)
-            QMessageBox.warning(None, '完成', '已刪除')
+            QMessageBox.warning(None, "Info", "Record cleared")
         except Exception as e:
             # self.add_output((self.output_err(e)))
-            error_class = e.__class__.__name__  # 取得錯誤類型
-            QMessageBox.warning(None, '錯誤', error_class)
+            error_class = e.__class__.__name__  # ????????????桀????
+            QMessageBox.warning(None, "Warning", error_class)
 
     @QtCore.pyqtSlot()
     def on_relogging_clicked(self):
@@ -465,16 +571,16 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             self.userid, self.cookies, self.Agent = cookies.get_cookies()
         except Exception as e:
             # self.add_output((self.output_err(e)))
-            error_class = e.__class__.__name__  # 取得錯誤類型
-            QMessageBox.warning(None, '錯誤', error_class)
+            error_class = e.__class__.__name__  # ????????????桀????
+            QMessageBox.warning(None, "Warning", error_class)
 
     @QtCore.pyqtSlot()
     def on_save_cookies_clicked(self):
         try:
             raw = self.ui.cookies_input.text()
-            # 清理開頭/結尾空白與換行
+            # ?????怏??????????/??????????????????
             cookies_text = raw.strip().replace('\r', '').replace('\n', ' ').strip()
-            # 嘗試分離可能被貼在尾端的 User-Agent（通常以 Mozilla/ 開頭）
+            # ????????????????????????????????????? User-Agent???????????Mozilla/ ????????
             ua = None
             idx = cookies_text.find('Mozilla/')
             if idx != -1:
@@ -491,7 +597,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             if ua is None and '=' not in cookies_text and cookies_text:
                 ua = cookies_text
                 cookies_text = ''
-            # 將清理後的 cookie 回寫到 UI
+            # ????????????cookie ????????UI
             self.ui.cookies_input.setText(cookies_text)
             user_data_path = os.getenv('APPDATA')+r'/pixiv_download/'
             if not os.path.exists(user_data_path):
@@ -505,25 +611,39 @@ class MainWindow_controller(QtWidgets.QMainWindow):
                 "password": self.ui.password1.text(),
                 "cookies": cookies_text
             }
-            with open(fileName, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            try:
+                from safe_io import atomic_write_json
+                # cookies.json ??????????? history/ ???
+                atomic_write_json(fileName, data, backup=False)
+            except Exception:
+                with open(fileName, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
             self.cookies = cookies_text
             if ua:
                 self.Agent = ua
-            self.ui.output.append('已儲存 cookies 至設定檔')
+            self.ui.output.append("Cookies saved successfully.")
         except Exception as e:
-            QMessageBox.warning(None, '錯誤', str(e))
+            QMessageBox.warning(None, "Warning", str(e))
+
+    @QtCore.pyqtSlot()
+    def on_browse_jxl_cjxl_clicked(self):
+        try:
+            selected, _ = QFileDialog.getOpenFileName(self, "Select cjxl.exe", "", "Executable (*.exe);;All Files (*)")
+            if selected:
+                self.ui.jxl_cjxl_path.setText(selected)
+        except Exception as e:
+            QMessageBox.warning(None, "Warning", str(e))
 
     @QtCore.pyqtSlot()
     def on_remove_like_num_clicked(self):
         try:
             file_name = "pid_num_pid.txt"
             os.remove(self.path+file_name)
-            QMessageBox.warning(None, '完成', '已刪除')
+            QMessageBox.warning(None, "Info", "Record cleared")
         except Exception as e:
             # self.add_output((self.output_err(e)))
-            error_class = e.__class__.__name__  # 取得錯誤類型
-            QMessageBox.warning(None, '錯誤', error_class)
+            error_class = e.__class__.__name__  # ????????????桀????
+            QMessageBox.warning(None, "Warning", error_class)
 
     @QtCore.pyqtSlot()
     def on_add_must_tag_clicked(self):
@@ -541,7 +661,7 @@ class MainWindow_controller(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def on_radioButton_clicked(self):
-        print('本家')
+        print('????????')
         self.mode = 0
 
     @QtCore.pyqtSlot()
@@ -556,30 +676,16 @@ class MainWindow_controller(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def on_get_following_clicked(self):
-        self.disable_button()
-        self.ui_cookies()
-        self.ui.progressBar.reset()
-        self.log_start('獲取關注畫師')
-        # print(self.ui.hidefollow.isChecked())
-        self.thread1 = pixiv_thread.get_following(
-            self.userid, self.cookies, self.Agent, self.ui.hidefollow)
-        self.enable_thread_controls()
-        # 連接信號
-        self.thread1._signal.connect(self.progress_changed)  # 進程連接回傳到GUI的事件
-        self.thread1._output.connect(self.add_output)
-        self.thread1._finished.connect(self.notice)
-        # 開始執行緒
-        self.thread1.start()
-        self.enable_thread_controls()
+        start_get_following(self)
 
     def test(self):
-        # 創建執行緒
+        # ?????????????
         self.thread1 = pixiv_thread.test_thread()
-        # 連接信號
+        # ????????
         self.thread1.valueChange.connect(
-            self.progress_changed)  # 進程連接回傳到GUI的事件
+            self.progress_changed)  # ???????????????????????桀???????
 
-        # 開始執行緒
+        # ????????
         self.thread1.start()
         self.enable_thread_controls()
         while not self.thread1.isFinished():
@@ -587,215 +693,22 @@ class MainWindow_controller(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def on_get_pid_clicked(self):
-        # Start fetching author PIDs (images IDs)
-        self.disable_button()
-        self.ui_cookies()
-        self.log_start('獲取關注畫師的圖片ID')
-        try:
-            single_mode = self.ui.single_thread_mode.isChecked()
-        except Exception:
-            single_mode = False
-        try:
-            pid_wait_min = int(self.ui.pid_wait_min.value())
-            pid_wait_max = int(self.ui.pid_wait_max.value())
-        except Exception:
-            pid_wait_min, pid_wait_max = 10, 60
-        self.thread1 = pixiv_thread.get_pixiv_author_imgID_Thread(
-            self.Author_list, self.Agent, self.path, self.cookies, self.exist_pid, single_mode, pid_wait_min, pid_wait_max)
-        # connect signals
-        self.thread1._signal.connect(self.progress_changed)
-        self.thread1._output.connect(self.add_output)
-        self.thread1._finished.connect(self.notice)
-        if hasattr(self.thread1, '_countdown'):
-            try:
-                self.thread1._countdown.connect(self.update_countdown)
-            except Exception:
-                pass
-        self.thread1.start()
-        self.enable_thread_controls()
+        start_get_pid(self)
 
     @QtCore.pyqtSlot()
     def on_get_url_clicked(self):
-        self.ui_cookies()
-        # 創建執行緒
-        self.disable_button()
-        self.log_start('獲取圖片id的詳細資料')
-        no_to_check = []
-        if self.ui.pass_tag.isChecked():
-            try:
-                with open((self.path+r"/tag_ban_pid.txt")) as file:  # 讀取寫入的文檔
-                    no_to_check += [line.rstrip() for line in file]
-            except:
-                pass
-        if self.ui.pass_like.isChecked():
-            try:
-                with open((self.path+r"/pid_num_pid.txt")) as file:  # 讀取寫入的文檔
-                    no_to_check += [line.rstrip() for line in file]
-                    print(len(no_to_check))
-                    no_to_check = set(no_to_check)
-            except:
-                pass
-        try:
-            single_mode = self.ui.single_thread_mode.isChecked()
-        except Exception:
-            single_mode = False
-        try:
-            pid_wait_min = int(self.ui.pid_wait_min.value())
-            pid_wait_max = int(self.ui.pid_wait_max.value())
-        except Exception:
-            pid_wait_min, pid_wait_max = 10, 60
-        self.thread1 = pixiv_thread.get_img_url_thread(
-            self.Author_list, self.Agent, self.cookies, self.exist_pid, self.ban_tag, self.must_tag, self.ui.like_num.value(), no_to_check,
-            single_mode, pid_wait_min, pid_wait_max)
-        # 連接信號
-        self.thread1._signal.connect(self.progress_changed)  # 進程連接回傳到GUI的事件
-        self.thread1._output.connect(self.add_output)
-        if hasattr(self.thread1, '_countdown'):
-            try:
-                self.thread1._countdown.connect(self.update_countdown)
-            except Exception:
-                pass
-        self.thread1._finished.connect(self.notice)
-        # 開始執行緒
-        self.thread1.start()
+        start_get_url(self)
 
     @QtCore.pyqtSlot()
     def on_download_url_clicked(self):
-        self.ui_cookies()
-        self.disable_button()
-        try:
-            self.ui.progressBar.reset()
-            self.ui.progressBar.setValue(0)
-        except Exception:
-            pass
-        self.log_start('開始下載')
-        # single_thread_mode: 超慢速單執行緒，若勾選則下載使用單一 worker
-        # 傳入 single_thread_mode 參數
-        # NOTE: rebuild thread with single_thread_mode if UI checkbox present
-        try:
-            single_mode = self.ui.single_thread_mode.isChecked()
-        except Exception:
-            single_mode = False
-        try:
-            pid_wait_min = int(self.ui.pid_wait_min.value())
-            pid_wait_max = int(self.ui.pid_wait_max.value())
-        except Exception:
-            pid_wait_min, pid_wait_max = 1, 3
-        # recreate thread with single_mode
-        self.thread1 = pixiv_thread.download_thread(self.ui.nogif.isChecked(),
-                                                    self.ui.notag.isChecked(),
-                                                    self.ui.notime.isChecked(),
-                                                    self.ui.create_dir.isChecked(),
-                                                    self.ui.user_path1.text(),
-                                                    self.cookies, self.Agent,
-                                                    datetime.strptime(self.ui.download_time.dateTime().toString("yyyy-MM-dd hh:mm:ss"),
-                                                                      '%Y-%m-%d %H:%M:%S'), self.ui.no_R18G_dir.isChecked(), single_mode, pid_wait_min, pid_wait_max)
-        self.thread1._signal.connect(self.progress_changed)  # 進程連接回傳到GUI的事件
-        self.thread1._output.connect(self.add_output)
-        if hasattr(self.thread1, '_countdown'):
-            try:
-                self.thread1._countdown.connect(self.update_countdown)
-            except Exception:
-                pass
-        self.thread1._finished.connect(self.notice)
-        self.thread1._timechanged.connect(self.timechanged)
-        self.thread1.start()
-        self.enable_thread_controls()
+        start_download(self)
 
     @QtCore.pyqtSlot()
     def on_all_start_clicked(self):
-        self.disable_button()
-        self.ui_cookies()
-        self.ui.progressBar.reset()
-        self.log_start('一鍵開始')
-        # print(self.ui.hidefollow.isChecked())
-        self.thread1 = pixiv_thread.get_following(
-            self.userid, self.cookies, self.Agent, self.ui.hidefollow)
-        self.enable_thread_controls()
-        # 連接信號
-        self.thread1._signal.connect(self.progress_changed)
-        self.thread1._output.connect(self.add_output)
-        self.thread1._thenext.connect(self.the_next)
-        if hasattr(self.thread1, '_countdown'):
-            try:
-                self.thread1._countdown.connect(self.update_countdown)
-            except Exception:
-                pass
-        self.thread1.start()
+        start_all(self)
 
     def the_next(self, num):
-        if (num == -1):
-            self.enable_button()
-            self.notice('已終止')
-        elif (num == 2):
-            self.log_start('獲取關注畫師的圖片ID')
-            try:
-                single_mode = self.ui.single_thread_mode.isChecked()
-            except Exception:
-                single_mode = False
-            try:
-                pid_wait_min = int(self.ui.pid_wait_min.value())
-                pid_wait_max = int(self.ui.pid_wait_max.value())
-            except Exception:
-                pid_wait_min, pid_wait_max = 10, 60
-            self.thread1 = pixiv_thread.get_pixiv_author_imgID_Thread(
-                self.Author_list, self.Agent, self.path, self.cookies, self.exist_pid, single_mode, pid_wait_min, pid_wait_max)
-            # 連接信號
-            self.thread1._signal.connect(
-                self.progress_changed)  # 進程連接回傳到GUI的事件
-            self.thread1._output.connect(self.add_output)
-            self.thread1._thenext.connect(self.the_next)
-            if hasattr(self.thread1, '_countdown'):
-                try:
-                    self.thread1._countdown.connect(self.update_countdown)
-                except Exception:
-                    pass
-            self.thread1.start()
-            self.enable_thread_controls()
-        elif (num == 3):
-            self.ui_cookies()
-            # 創建執行緒
-            no_to_check = []
-            if self.ui.pass_tag.isChecked():
-                try:
-                    with open((self.path+r"/tag_ban_pid.txt")) as file:  # 讀取寫入的文檔
-                        no_to_check += [line.rstrip() for line in file]
-                except:
-                    pass
-            if self.ui.pass_like.isChecked():
-                try:
-                    with open((self.path+r"/pid_num_pid.txt")) as file:  # 讀取寫入的文檔
-                        no_to_check += [line.rstrip() for line in file]
-                except:
-                    pass
-            try:
-                single_mode = self.ui.single_thread_mode.isChecked()
-            except Exception:
-                single_mode = False
-            try:
-                pid_wait_min = int(self.ui.pid_wait_min.value())
-                pid_wait_max = int(self.ui.pid_wait_max.value())
-            except Exception:
-                pid_wait_min, pid_wait_max = 10, 60
-            self.thread1 = pixiv_thread.get_img_url_thread(
-                self.Author_list, self.Agent, self.cookies, self.exist_pid, self.ban_tag, self.must_tag, self.ui.like_num.value(), no_to_check,
-                single_mode, pid_wait_min, pid_wait_max)
-            # 連接信號
-            self.thread1._signal.connect(
-                self.progress_changed)  # 進程連接回傳到GUI的事件
-            self.thread1._output.connect(self.add_output)
-            if hasattr(self.thread1, '_countdown'):
-                try:
-                    self.thread1._countdown.connect(self.update_countdown)
-                except Exception:
-                    pass
-            self.thread1._thenext.connect(self.the_next)
-            # self.thread1._finished.connect(self.notice)
-            # 開始執行緒
-            self.thread1.start()
-            self.enable_thread_controls()
-        elif (num == 4):
-            self.on_download_url_clicked()
+        continue_all(self, num)
 
     def timechanged(self, mytime):
         dt = QDateTime.fromString(mytime, "yyyy-MM-dd hh:mm:ss")
@@ -803,38 +716,36 @@ class MainWindow_controller(QtWidgets.QMainWindow):
             self.ui.download_time.setDateTime(dt)
             self.last_download_time = mytime
         else:
-            # 保底：格式異常時仍用目前時間，避免欄位不更新
+            # ????????????????????????????????????????????????????????豲?????????????
             self.ui.download_time.setDateTime(QDateTime.currentDateTime())
             self.last_download_time = self.ui.download_time.dateTime().toString("yyyy-MM-dd hh:mm:ss")
 
-        # 立即落盤，避免只在關閉程式時才寫入導致「上次下載時間」看起來沒更新
+        # ?????????????????豲???????????????????????????????????????????????????怏????????????????????
         try:
             if getattr(self, 'userdata_controller', None):
                 self.userdata_controller.write_data()
         except Exception as e:
             try:
-                self.ui.output.append('寫入下載時間失敗: ' + str(e))
+                self.ui.output.append("Failed to persist download time: " + str(e))
             except Exception:
                 pass
 
     def progress_changed(self, step, setmax):
         self.ui.progressBar.setMaximum(setmax)
         value = self.ui.progressBar.value() + step
-        if (value > setmax):
+        if value > setmax:
             value = setmax
         self.ui.progressBar.setValue(value)
         try:
             self.ui.progressBar.setTextVisible(True)
-            self.ui.progressBar.setFormat(f"已處理 {value}/{setmax}")
+            self.ui.progressBar.setFormat(f"Progress {value}/{setmax}")
         except Exception:
             pass
         self.ui.progressBar.update()
         try:
-            # 顯示已處理 / 總數於狀態列
-            msg = f"已處理 {value}/{setmax}"
+            msg = f"Progress {value}/{setmax}"
             self.statusBar().showMessage(msg)
             try:
-                # 也寫入 QTextBrowser
                 self.ui.output.append(msg)
             except Exception:
                 pass
@@ -849,3 +760,5 @@ class MainWindow_controller(QtWidgets.QMainWindow):
         path = folder_path
         return path
         # self.ui.show_folder_path.setText(folder_path)
+
+

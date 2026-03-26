@@ -261,10 +261,17 @@ def download_img_main(download_path,start,stop,cookie=None,Agent=None):
         results=([item for item in results if item!=1])
         print(results)
         if(results!=[]):
-            f = open((path+"/network_err"+str(i)+".txt"), "w+")
-            for err_url in results:
-                f.write(err_url+'\n')
-            f.close()
+            try:
+                from safe_io import atomic_write_text
+                atomic_write_text(os.path.join(path, f"network_err{int(i)}.txt"), results)
+            except Exception:
+                try:
+                    f = open((path+"/network_err"+str(i)+".txt"), "w+")
+                    for err_url in results:
+                        f.write(err_url+'\n')
+                    f.close()
+                except Exception:
+                    pass
 
         loguru.logger.success("開始下載pics:")
         global download_start_time
@@ -285,9 +292,16 @@ def download_img_main(download_path,start,stop,cookie=None,Agent=None):
             exist=f.read()
             f.close()
             if str(url) not in exist:
-                f = open((path+"network_err"+str(i)+".txt"), "a+")  
-                f.write(str(url)+'\n')
-                f.close()
+                try:
+                    from safe_io import atomic_append_text
+                    atomic_append_text(os.path.join(path, f"network_err{int(i)}.txt"), str(url))
+                except Exception:
+                    try:
+                        f = open((path+"network_err"+str(i)+".txt"), "a+")  
+                        f.write(str(url)+'\n')
+                        f.close()
+                    except Exception:
+                        pass
         loguru.logger.success('下載完成%d'%i)
 
         del_emp_dir(download_path)
@@ -297,12 +311,20 @@ def download_img_main(download_path,start,stop,cookie=None,Agent=None):
             exist_pid = set(exist_pid)
         download_id=splitID(get_filelist(download_path))
         #print(download_id)
-        f = open((path+"existPID.txt"), "a+")
-        for text in download_id:
-            if text not in exist_pid:
-                #print(text)
-                f.write(text+'\n')
-        f.close()
+        try:
+            from safe_io import atomic_append_text
+            to_append = [text for text in download_id if text not in exist_pid]
+            if to_append:
+                atomic_append_text(os.path.join(path, "existPID.txt"), to_append)
+        except Exception:
+            try:
+                f = open((path+"existPID.txt"), "a+")
+                for text in download_id:
+                    if text not in exist_pid:
+                        f.write(text+'\n')
+                f.close()
+            except Exception:
+                pass
         loguru.logger.success('寫入完成')
         #exist_pid = set(exist_pid)
         

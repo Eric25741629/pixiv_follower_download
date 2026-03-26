@@ -27,16 +27,24 @@ def main(cookie,Agent):
     results=([i for item in results for i in item]) 
     pid=[i for i in results if 'https' not in i]
     results=[i for i in results if 'https' in i]
-    f = open((path+"/innvid"+".txt"), "w+")     #讀取寫入的文檔
-    for text in results:
-        f.write(str(text)+'\n')
-    f.close()
-    results = np.array_split(results,100)  
-    for i in range(0,100):   
-        f = open((path+"/pictures_url"+str(i)+".txt"), "w+")     #讀取寫入的文檔
-        for text in results[i]:
+    try:
+        from safe_io import atomic_write_text
+        atomic_write_text(os.path.join(path, "innvid.txt"), results)
+    except Exception:
+        f = open((path+"/innvid"+".txt"), "w+")     #讀取寫入的文檔
+        for text in results:
             f.write(str(text)+'\n')
         f.close()
+    results = np.array_split(results,100)  
+    for i in range(0,100):   
+        try:
+            from safe_io import atomic_write_text
+            atomic_write_text(os.path.join(path, f"pictures_url{int(i)}.txt"), list(results[i]))
+        except Exception:
+            f = open((path+"/pictures_url"+str(i)+".txt"), "w+")     #讀取寫入的文檔
+            for text in results[i]:
+                f.write(str(text)+'\n')
+            f.close()
     #print(pixiv_api.get_download_url(pictures_id,path,cookie,Agent,1))
     
 if __name__ == '__main__':

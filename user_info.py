@@ -6,6 +6,7 @@ from PyQt5.QtWidgets import QFileDialog
 from PyQt5.QtCore import QDateTime
 import pixiv_api
 import update_selenium
+from safe_io import atomic_write_json
 
 
 class Userdata_controller(object):
@@ -55,8 +56,12 @@ class Userdata_controller(object):
                     self.exist_pid = set(str(i).replace("p0", "") for i in data)
                 else:
                     self.exist_pid = set()
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(sorted(self.exist_pid), f, ensure_ascii=False, indent=2)
+                try:
+                    from safe_io import atomic_write_json
+                    atomic_write_json(json_path, sorted(self.exist_pid))
+                except Exception:
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(sorted(self.exist_pid), f, ensure_ascii=False, indent=2)
             except Exception as err:
                 print(f"讀取/遷移 exist.json 失敗：{err}")
                 self.exist_pid = set()
@@ -65,8 +70,12 @@ class Userdata_controller(object):
                 self.exist_pid = set(line.rstrip().replace("p0", "") for line in file if line.rstrip())
             # 自動遷移到 json
             try:
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(sorted(self.exist_pid), f, ensure_ascii=False, indent=2)
+                try:
+                    from safe_io import atomic_write_json
+                    atomic_write_json(json_path, sorted(self.exist_pid))
+                except Exception:
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(sorted(self.exist_pid), f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
         else:
@@ -157,9 +166,11 @@ class Userdata_controller(object):
         }
         user_data = self.path
         fileName = user_data+"data.json"
-        file = open(fileName, "w")
-        json.dump(jsonObject, file, indent=4)
-        file.close()
+        try:
+            atomic_write_json(fileName, jsonObject)
+        except Exception:
+            with open(fileName, "w", encoding='utf-8') as file:
+                json.dump(jsonObject, file, indent=4, ensure_ascii=False)
 
 
 class logging_mode_set(object):
@@ -198,13 +209,15 @@ class logging_mode_set(object):
         }
         user_data = self.path
         fileName = user_data+"logging.json"
-        file = open(fileName, "w")
-        json.dump(jsonObject, file, indent=4)
-        file.close()
+        try:
+            atomic_write_json(fileName, jsonObject)
+        except Exception:
+            with open(fileName, "w", encoding='utf-8') as file:
+                json.dump(jsonObject, file, indent=4, ensure_ascii=False)
 
 
 class othersettings(object):
-    def __init__(self, hidefollow, nogif, notag, notime, create_dir, no_R18G_dir, single_thread_mode=None, pid_wait_min=None, pid_wait_max=None):
+    def __init__(self, hidefollow, nogif, notag, notime, create_dir, no_R18G_dir, single_thread_mode=None, pid_wait_min=None, pid_wait_max=None, pid_wait_nocookie_min=None, pid_wait_nocookie_max=None, jxl_enable=None, jxl_cjxl_path=None, jxl_delete_original=None, jxl_effort=None):
         self._ui_hidefollow = hidefollow
         self._ui_nogif = nogif
         self._ui_notag = notag
@@ -214,6 +227,12 @@ class othersettings(object):
         self._ui_single_thread_mode = single_thread_mode
         self._ui_pid_wait_min = pid_wait_min
         self._ui_pid_wait_max = pid_wait_max
+        self._ui_pid_wait_nocookie_min = pid_wait_nocookie_min
+        self._ui_pid_wait_nocookie_max = pid_wait_nocookie_max
+        self._ui_jxl_enable = jxl_enable
+        self._ui_jxl_cjxl_path = jxl_cjxl_path
+        self._ui_jxl_delete_original = jxl_delete_original
+        self._ui_jxl_effort = jxl_effort
         self.path = os.getenv('APPDATA')+r'/pixiv_download/'
 
     def setinfo(self):
@@ -240,6 +259,36 @@ class othersettings(object):
                 if self._ui_pid_wait_max is not None:
                     try:
                         self._ui_pid_wait_max.setValue(int(data.get('pid_wait_max', 60)))
+                    except Exception:
+                        pass
+                if self._ui_pid_wait_nocookie_min is not None:
+                    try:
+                        self._ui_pid_wait_nocookie_min.setValue(int(data.get('pid_wait_nocookie_min', 1)))
+                    except Exception:
+                        pass
+                if self._ui_pid_wait_nocookie_max is not None:
+                    try:
+                        self._ui_pid_wait_nocookie_max.setValue(int(data.get('pid_wait_nocookie_max', 6)))
+                    except Exception:
+                        pass
+                if self._ui_jxl_enable is not None:
+                    try:
+                        self._ui_jxl_enable.setChecked(bool(data.get('jxl_enable', False)))
+                    except Exception:
+                        pass
+                if self._ui_jxl_cjxl_path is not None:
+                    try:
+                        self._ui_jxl_cjxl_path.setText(str(data.get('jxl_cjxl_path', r'C:\Users\Eric\Downloads\jxl-x64-windows\bin\cjxl.exe')))
+                    except Exception:
+                        pass
+                if self._ui_jxl_delete_original is not None:
+                    try:
+                        self._ui_jxl_delete_original.setChecked(bool(data.get('jxl_delete_original', False)))
+                    except Exception:
+                        pass
+                if self._ui_jxl_effort is not None:
+                    try:
+                        self._ui_jxl_effort.setValue(int(data.get('jxl_effort', 7)))
                     except Exception:
                         pass
         except:
@@ -271,9 +320,41 @@ class othersettings(object):
                 jsonObject['pid_wait_max'] = int(self._ui_pid_wait_max.value())
             except Exception:
                 jsonObject['pid_wait_max'] = 60
-        file = open(fileName, "w")
-        json.dump(jsonObject, file, indent=4)
-        file.close()
+        if self._ui_pid_wait_nocookie_min is not None:
+            try:
+                jsonObject['pid_wait_nocookie_min'] = int(self._ui_pid_wait_nocookie_min.value())
+            except Exception:
+                jsonObject['pid_wait_nocookie_min'] = 1
+        if self._ui_pid_wait_nocookie_max is not None:
+            try:
+                jsonObject['pid_wait_nocookie_max'] = int(self._ui_pid_wait_nocookie_max.value())
+            except Exception:
+                jsonObject['pid_wait_nocookie_max'] = 6
+        if self._ui_jxl_enable is not None:
+            try:
+                jsonObject['jxl_enable'] = bool(self._ui_jxl_enable.isChecked())
+            except Exception:
+                jsonObject['jxl_enable'] = False
+        if self._ui_jxl_cjxl_path is not None:
+            try:
+                jsonObject['jxl_cjxl_path'] = str(self._ui_jxl_cjxl_path.text()).strip()
+            except Exception:
+                jsonObject['jxl_cjxl_path'] = r'C:\Users\Eric\Downloads\jxl-x64-windows\bin\cjxl.exe'
+        if self._ui_jxl_delete_original is not None:
+            try:
+                jsonObject['jxl_delete_original'] = bool(self._ui_jxl_delete_original.isChecked())
+            except Exception:
+                jsonObject['jxl_delete_original'] = False
+        if self._ui_jxl_effort is not None:
+            try:
+                jsonObject['jxl_effort'] = int(self._ui_jxl_effort.value())
+            except Exception:
+                jsonObject['jxl_effort'] = 7
+        try:
+            atomic_write_json(fileName, jsonObject)
+        except Exception:
+            with open(fileName, "w", encoding='utf-8') as file:
+                json.dump(jsonObject, file, indent=4, ensure_ascii=False)
 
 
 class cookies_set(object):
@@ -308,9 +389,11 @@ class cookies_set(object):
         fileName = user_data+"/cookies.json"
         jsonObject = {"agent": self.Agent, "userid": self.userid, "account": self._ui_anncount_input.text(
         ), "password": self._ui_password_input.text(), "cookies": self.cookies}
-        file = open(fileName, "w")
-        json.dump(jsonObject, file, indent=4)
-        file.close()
+        try:
+            atomic_write_json(fileName, jsonObject)
+        except Exception:
+            with open(fileName, "w", encoding='utf-8') as file:
+                json.dump(jsonObject, file, indent=4, ensure_ascii=False)
 
     def get_cookies(self):
         anncount = self._ui_anncount_input.text()
@@ -353,9 +436,11 @@ class userpass(object):
             fileName = user_data+"/pass.json"
             jsonObject = {"pass_tag": self._ui_pass_tag.isChecked(
             ), "pass_num": self._ui_pass_num.isChecked()}
-            file = open(fileName, "w")
-            json.dump(jsonObject, file, indent=4)
-            file.close()
+            try:
+                atomic_write_json(fileName, jsonObject)
+            except Exception:
+                with open(fileName, "w", encoding='utf-8') as file:
+                    json.dump(jsonObject, file, indent=4, ensure_ascii=False)
             return 1
         except:
             # print('寫入userpass失敗')

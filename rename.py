@@ -20,6 +20,7 @@ import tqdm as tqdm
 from PIL import Image
 from datetime import datetime
 from os.path import getmtime
+from safe_io import atomic_write_json
 def get_filelist(path):
     Filelist = []
     homes=[]
@@ -85,9 +86,7 @@ def rename(path):#重新命名
             continue
         mydict[pid[i]] = filenames[i]
         #mydict.append({pid[i]:homes[i]+filenames[i]})
-    file = open(homes[0]+'fileName.json', "w")
-    json.dump(mydict, file)
-    file.close()
+    atomic_write_json(homes[0]+'fileName.json', mydict)
     for i in range(0,len(pid)):
         #print(homes[i]+filenames[i], homes[i]+pid[i]+"."+(filenames[i].rsplit(".",1)[1]))
         if(filenames[i].rsplit(".",1)[1]!='jpg' and filenames[i].rsplit(".",1)[1]!='png' and filenames[i].rsplit(".",1)[1]!='gif'):
@@ -146,9 +145,7 @@ def net_recover(path):
 for i in range(0,len(pid)):
     mydict[pid[i]] = homes[i]+filenames[i]
     #mydict.append({pid[i]:homes[i]+filenames[i]})
-file = open(homes[0]+'fileName.json', "w")
-json.dump(mydict, file)
-file.close()
+atomic_write_json(homes[0]+'fileName.json', mydict)
 for i in range(0,len(pid)):
 
     shutil.move(homes[i]+filenames[i], homes[i]+pid[i]+"."+(filenames[i].rsplit(".",1)[1]))'''

@@ -232,9 +232,16 @@ def get_author_picture_ids(illust_ids,path,num,q,exist_pid):
                     download_Pid.append(Pid)
         except Exception as err:
             print(Pid+'獲取失敗',err)
-            f = open((path+"get_download_author_err"+str(num)+".txt"), "a")
-            f.write(illust_id+'\n')
-            f.close()
+            try:
+                from safe_io import atomic_append_text
+                atomic_append_text(os.path.join(path, f"get_download_author_err{int(num)}.txt"), illust_id)
+            except Exception:
+                try:
+                    f = open((path+"get_download_author_err"+str(num)+".txt"), "a")
+                    f.write(illust_id+'\n')
+                    f.close()
+                except Exception:
+                    pass
         time.sleep(random())
         #print(num)
     q.put(download_Pid)
@@ -304,9 +311,16 @@ def thread_no_use_seleium_get_pid(cookie,Agent,path,num,author_pids):
             pid.append(key)
     except Exception as err:
         print(err)
-        f = open((path+"authorPids_err"+str(num)+".txt"), "a+")
-        f.write(author_pids+'\n')
-        f.close() 
+        try:
+            from safe_io import atomic_append_text
+            atomic_append_text(os.path.join(path, f"authorPids_err{int(num)}.txt"), author_pids)
+        except Exception:
+            try:
+                f = open((path+"authorPids_err"+str(num)+".txt"), "a+")
+                f.write(author_pids+'\n')
+                f.close()
+            except Exception:
+                pass
     return pid
 
 def random_Agent():
@@ -417,8 +431,16 @@ def get_download_url(path,cookie,Agent,num,pid):    #回傳下載連結
                     exist=f.read()
                     f.close()
                     if str(pid) not in exist:
-                        f = open((path+"network_err"+str(num%20)+".txt"), "a+")  
-                        f.write(str(pid)+'\n')
+                        try:
+                            from safe_io import atomic_append_text
+                            atomic_append_text(os.path.join(path, f"network_err{int(num%20)}.txt"), str(pid))
+                        except Exception:
+                            try:
+                                f = open((path+"network_err"+str(num%20)+".txt"), "a+")  
+                                f.write(str(pid)+'\n')
+                                f.close()
+                            except Exception:
+                                pass
                         f.close() '''
         except Exception as err:
             print(pid+'獲取失敗',err) 
@@ -430,8 +452,16 @@ def get_download_url(path,cookie,Agent,num,pid):    #回傳下載連結
                     exist=f.read()
                     f.close()
                     if str(pid) not in exist:
-                        f = open((path+"network_err"+str(num%20)+".txt"), "a+")  
-                        f.write(str(pid)+'\n')
+                        try:
+                            from safe_io import atomic_append_text
+                            atomic_append_text(os.path.join(path, f"network_err{int(num%20)}.txt"), str(pid))
+                        except Exception:
+                            try:
+                                f = open((path+"network_err"+str(num%20)+".txt"), "a+")  
+                                f.write(str(pid)+'\n')
+                                f.close()
+                            except Exception:
+                                pass
                         f.close() 
         time.sleep(random())
     #print(download_url)
@@ -470,12 +500,19 @@ def Pixiv_info(url,
                         pageCount = illust_info.get('pageCount')
             pageCount = int(pageCount or 1)
 
+            normalized_tags = []
+            
+            # 先提取 aiType 並轉換為標籤（放在最前面）
+            ai_type = o.get('aiType', None)
+            if ai_type is not None:
+                ai_type = int(ai_type)
+                if ai_type == 2:
+                    normalized_tags.append('AI生成')
             raw_tags = o.get('tags', [])
             if isinstance(raw_tags, dict):
                 raw_tags = raw_tags.get('tags', [])
             if not isinstance(raw_tags, list):
                 raw_tags = [raw_tags] if raw_tags else []
-            normalized_tags = []
             for t in raw_tags:
                 if isinstance(t, str):
                     normalized_tags.append(t)
@@ -524,6 +561,8 @@ def Pixiv_info(url,
                 payload = res.json()
             except Exception as e:
                 print(f"Pixiv_info json error pid={id}: {e}")
+                print(f"Pixiv_info response content: {res.text[:500]}")
+                print(f"Pixiv_info status code: {res.status_code}")
                 return [404], False, res.status_code
             parsed, valid = _parse_payload(payload)
             return parsed, valid, res.status_code
@@ -568,8 +607,13 @@ def Pixiv_info(url,
                     if not isinstance(history, dict):
                         history = {}
             history[str(id)] = trace_entry
-            with open(trace_path, 'w', encoding='utf-8') as f:
-                json.dump(history, f, indent=2, ensure_ascii=False)
+            try:
+                from safe_io import atomic_write_json
+                # pixiv_cookie_requirement.json 會備份，但最多保留 10 個歷史檔
+                atomic_write_json(trace_path, history, backup=True)
+            except Exception:
+                with open(trace_path, 'w', encoding='utf-8') as f:
+                    json.dump(history, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
