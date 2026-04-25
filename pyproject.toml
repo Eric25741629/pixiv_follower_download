@@ -1,0 +1,40 @@
+[project]
+name = "pixiv-img-download"
+version = "0.1.0"
+description = "PyQt5 desktop app for scraping Pixiv following lists, fetching artwork URLs, and downloading images with optional JXL post-processing."
+requires-python = ">=3.10"
+
+# Runtime deps deliberately not pinned here — managed via the conda env (pixiv_env).
+# This block exists for tooling discovery, not as a build manifest.
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = [
+    "__pycache__",
+    "trash",
+    ".conda",
+    ".claude",
+    "新增資料夾",
+    "manual_download",
+    "tmp_single_test",
+    "rc_icon.py",
+    "icon_rc.py",
+    "Ui2.py",
+]
+
+[tool.ruff.lint]
+# Conservative rule set — focus on correctness + modernization (UP).
+select = ["E", "F", "UP", "B", "SIM"]
+# E501 (line length): we set line-length=120 but plenty of legacy code still exceeds it.
+# B008 (Do not perform function call in argument defaults): used legitimately for QtCore signal init.
+# SIM117 (Combine if branches): noisy on legacy code.
+ignore = ["E501", "B008", "SIM117"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # asserts in tests are fine
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: live/integration tests that may need network or real credentials",
+]

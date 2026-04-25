@@ -1,0 +1,374 @@
+************* Module app.gui.__init__
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.thread_download:[259:315]
+==app.core.thread_url_fetch:[746:802]
+        file_path = os.path.join(self.path, "all_url.txt")
+        safe_lines = [str(x) for x in (urls or [])]
+        before_count = self._count_text_lines(file_path)
+        self._diag(
+            "all_url_write_attempt",
+            reason=reason,
+            before_count=before_count,
+            target_count=len(safe_lines),
+        )
+        try:
+            atomic_write_text(file_path, safe_lines, backup=True)
+            after_count = self._count_text_lines(file_path)
+            self._diag(
+                "all_url_write_done",
+                reason=reason,
+                success=True,
+                before_count=before_count,
+                after_count=after_count,
+            )
+            return True
+        except Exception as err:
+            self._diag(
+                "all_url_write_primary_failed",
+                reason=reason,
+                error=str(err),
+            )
+            try:
+                from safe_io import backup_file
+                backup_file(file_path)
+            except Exception:
+                pass
+            try:
+                with open(file_path, "w+", encoding="utf-8") as f:
+                    f.writelines([line + "\n" for line in safe_lines])
+                after_count = self._count_text_lines(file_path)
+                self._diag(
+                    "all_url_write_done",
+                    reason=reason,
+                    success=True,
+                    via="fallback",
+                    before_count=before_count,
+                    after_count=after_count,
+                )
+                return True
+            except Exception as fallback_err:
+                self._diag(
+                    "all_url_write_done",
+                    reason=reason,
+                    success=False,
+                    error=str(fallback_err),
+                )
+                return False
+
+    def _write_all_url_snapshot(self, fetched_urls):
+        """Write merged all_url snapshot to disk."""
+        try: (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.pixiv_thread_utils:[331:376]
+==app.core.safe_io:[7:63]
+    try:
+        d = os.path.dirname(file_path) or os.getcwd()
+        hist = os.path.join(d, 'history')
+        os.makedirs(hist, exist_ok=True)
+        return hist
+    except Exception:
+        return None
+
+
+def backup_file(file_path, max_history=10):
+    try:
+        if not os.path.exists(file_path):
+            return
+        hist = _ensure_history_dir(file_path)
+        if not hist:
+            return
+        ts = datetime.datetime.now().strftime('%Y%m%d')
+        base = os.path.basename(file_path)
+        dst = os.path.join(hist, f"{base}.{ts}")
+        if os.path.exists(dst):
+            idx = 1
+            while True:
+                candidate = os.path.join(hist, f"{base}.{ts}.{idx}")
+                if not os.path.exists(candidate):
+                    dst = candidate
+                    break
+                idx += 1
+        shutil.copy2(file_path, dst)
+        try:
+            files = [f for f in os.listdir(hist) if f.startswith(base + '.')]
+            files.sort(key=lambda x: os.path.getmtime(os.path.join(hist, x)), reverse=True)
+            while len(files) > max_history:
+                old_file = os.path.join(hist, files.pop())
+                os.remove(old_file)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def append_diagnostic_event(base_path, event, **fields):
+    """
+    Append one JSON-line diagnostic event under user data folder.
+    """
+    try: (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.pixiv_thread_utils:[395:450]
+==app.core.safe_io:[62:119]
+    try:
+        if backup:
+            try:
+                backup_file(file_path)
+            except Exception:
+                pass
+        tmp = file_path + '.tmp'
+        dirp = os.path.dirname(file_path)
+        if dirp:
+            os.makedirs(dirp, exist_ok=True)
+        with open(tmp, 'w', encoding=encoding) as f:
+            if isinstance(lines, (list, tuple)):
+                f.writelines([str(x) + '\n' for x in lines])
+            else:
+                f.write(str(lines))
+        os.replace(tmp, file_path)
+    except Exception:
+        try:
+            with open(file_path, 'w', encoding=encoding) as f:
+                if isinstance(lines, (list, tuple)):
+                    f.writelines([str(x) + '\n' for x in lines])
+                else:
+                    f.write(str(lines))
+        except Exception:
+            pass
+
+
+def atomic_write_json(file_path, obj, encoding='utf-8', backup=True):
+    """
+    原子寫入 JSON 檔，可選擇是否備份。
+    :param file_path: 檔案路徑
+    :param obj: 要寫入的物件
+    :param encoding: 編碼
+    :param backup: 是否備份到 history/（預設 True）
+    """
+    try:
+        if backup:
+            try:
+                backup_file(file_path)
+            except Exception:
+                pass
+        tmp = file_path + '.tmp'
+        dirp = os.path.dirname(file_path)
+        if dirp:
+            os.makedirs(dirp, exist_ok=True)
+        with open(tmp, 'w', encoding=encoding) as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, file_path)
+    except Exception:
+        try:
+            with open(file_path, 'w', encoding=encoding) as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+def atomic_append_text(file_path, lines, encoding='utf-8'): (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.thread_download:[217:246]
+==app.core.thread_url_fetch:[627:656]
+        stage_key = str(stage or "").strip().lower()
+        if stage_key not in self._cookie_usage_counts:
+            return ""
+        cookie_text = str(cookie_value or "").strip()
+        label = _cookie_usage_label(cookie_text, self.cookie_pool, self._cookie_alias_map)
+        if not cookie_text:
+            return label
+        pid_key = normalize_pid(pid) or str(pid)
+        try:
+            seen = self._cookie_usage_seen.setdefault(stage_key, set())
+            if pid_key in seen:
+                return label
+            seen.add(pid_key)
+            counts = self._cookie_usage_counts.setdefault(stage_key, {})
+            counts[label] = int(counts.get(label, 0)) + 1
+        except Exception:
+            pass
+        return label
+
+    def _emit_cookie_usage_summary(self, stage, title):
+        try:
+            stage_key = str(stage or "").strip().lower()
+            counts = self._cookie_usage_counts.get(stage_key, {}) if isinstance(self._cookie_usage_counts, dict) else {}
+            summary = _format_cookie_usage_summary(counts, self.cookie_pool, self._cookie_alias_map)
+            self._output.emit("<p><font color='gray'>[{}] {}</font></p>".format(title, summary))
+        except Exception:
+            pass
+
+    def _refresh_cookie_requirement(self, pid, fallback=None): (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.thread_download:[448:477]
+==app.core.thread_url_fetch:[652:680]
+        except Exception:
+            pass
+
+    def _refresh_cookie_requirement(self, pid, fallback=None):
+        pid_key = normalize_pid(pid)
+        if not pid_key:
+            return fallback
+        try:
+            if isinstance(getattr(self, '_cookie_requirement_map', None), dict) and pid_key in self._cookie_requirement_map:
+                return self._cookie_requirement_map.get(pid_key)
+        except Exception:
+            pass
+
+        latest = fallback
+        # First-time resolution only: if fallback already exists, don't re-query trace.
+        if latest is None:
+            try:
+                latest = pixiv_api.get_pixiv_cookie_requirement(pid_key)
+            except Exception:
+                latest = fallback
+        try:
+            if not isinstance(getattr(self, '_cookie_requirement_map', None), dict):
+                self._cookie_requirement_map = {}
+            self._cookie_requirement_map[pid_key] = latest
+        except Exception:
+            pass
+        return latest
+
+    def _select_cookie_for_pid(self, pid): (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.thread_download:[1603:1621]
+==app.core.thread_url_fetch:[695:713]
+        except Exception:
+            pass
+
+    def _mark_gif_cookie_usage(self, pid, used, source="unknown"):
+        pid_key = normalize_pid(pid) or str(pid)
+        used_flag = bool(used)
+        try:
+            self._pid_cookie_used[pid_key] = used_flag
+        except Exception:
+            pass
+
+        if not used_flag:
+            return
+
+        try:
+            meta = self.url_meta.get(pid_key, {}) if isinstance(self.url_meta, dict) else {}
+            if not isinstance(meta, dict):
+                meta = {} (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.pixiv_thread_utils:[418:434]
+==app.core.safe_io:[50:73]
+        except Exception:
+            pass
+
+
+def atomic_write_json(file_path, obj, encoding='utf-8', backup=True):
+    try:
+        if backup:
+            try:
+                backup_file(file_path)
+            except Exception:
+                pass
+        tmp = file_path + '.tmp'
+        dirp = os.path.dirname(file_path)
+        if dirp:
+            os.makedirs(dirp, exist_ok=True)
+        with open(tmp, 'w', encoding=encoding) as f: (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.pixiv_thread_base:[155:167]
+==app.core.thread_download:[994:1009]
+                break
+            while self._isPause == 1:
+                time.sleep(1)
+            try:
+                self._countdown.emit(remaining)
+            except Exception:
+                pass
+            time.sleep(1)
+        try:
+            self._countdown.emit(0)
+        except Exception:
+            pass (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.thread_download:[477:489]
+==app.core.thread_url_fetch:[609:621]
+        pid_key = normalize_pid(pid) or str(pid)
+        try:
+            if pid_key in self._pid_cookie_selection:
+                return self._pid_cookie_selection.get(pid_key, "")
+        except Exception:
+            pass
+        if self.cookie_pool:
+            selected = pyrandom.choice(self.cookie_pool)
+        else:
+            selected = str(self.cookies or "").strip()
+        try:
+            self._pid_cookie_selection[pid_key] = selected (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.pixiv_thread_utils:[395:406]
+==app.core.safe_io:[97:108]
+    try:
+        if backup:
+            try:
+                backup_file(file_path)
+            except Exception:
+                pass
+        tmp = file_path + '.tmp'
+        dirp = os.path.dirname(file_path)
+        if dirp:
+            os.makedirs(dirp, exist_ok=True)
+        with open(tmp, 'w', encoding=encoding) as f: (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.thread_download:[1595:1607]
+==app.core.thread_pid_scan:[78:90]
+        try:
+            executor = getattr(self, 'executor', None)
+            if executor is not None:
+                executor.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            self.wait()
+        except Exception:
+            pass
+
+    def _mark_gif_cookie_usage(self, pid, used, source="unknown"): (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.thread_download:[326:337]
+==app.core.thread_url_fetch:[167:178]
+        try:
+            if isinstance(value, str):
+                s = value.strip().replace(",", "").replace("_", "")
+                if not s:
+                    return default
+                return int(float(s))
+            return int(value)
+        except Exception:
+            return default
+
+    def _normalize_filter_tags(self, tags): (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.thread_download:[337:346]
+==app.core.thread_url_fetch:[311:320]
+        out = []
+        if not isinstance(tags, list):
+            return out
+        try:
+            tags = tag_edit.Tag(tags)
+        except Exception:
+            pass
+        for t in tags:
+            s = str(t).strip() (duplicate-code)
+app\gui\__init__.py:1:0: R0801: Similar lines in 2 files
+==app.core.thread_download:[1622:1632]
+==app.core.thread_url_fetch:[717:727]
+            meta["cookie_used"] = True
+            meta["cookie_used_source"] = str(source)
+            meta["cookie_used_updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.url_meta[pid_key] = meta
+        except Exception:
+            pass
+
+        try:
+            atomic_write_json(self.url_meta_path, self.url_meta, backup=True)
+        except Exception: (duplicate-code)
+
+-----------------------------------
+Your code has been rated at 9.98/10
+

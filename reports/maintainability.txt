@@ -1,0 +1,8 @@
+app\core\pixiv_api.py - B
+app\core\pixiv_thread_utils.py - B
+app\core\thread_download.py - C
+app\core\thread_pid_scan.py - B
+app\core\thread_url_fetch.py - C
+app\gui\controller.py - C
+app\gui\run_actions.py - B
+app\gui\user_info.py - B
