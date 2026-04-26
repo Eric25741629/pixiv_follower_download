@@ -220,3 +220,22 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 ### 驗證（Phase 28+29）
 - `pytest -m "not integration"`: **102 passed**
 - `from app.entry.main import main`: ok
+
+### Phase 28-B ✅ — safe_json helper
+- 新增 `safe_json(res, *keys, default=None)` 到 `app/core/pixiv_thread_utils.py`
+- 改寫 10 個 call site：`pixiv_api.py`(6)、`thread_following.py`(3)、`thread_pid_scan.py`(1)
+- 新增 `tests/test_safe_json.py`（7 tests，涵蓋：嵌套 key、缺鍵、Pixiv error envelope、非 JSON、中間值非 dict）
+- 結果：cookie 失效 / 限流回 `{"error":true,...}` 不再 KeyError 直接炸，而是優雅回傳 default（`[]` / `{}` / `0`）
+
+### Phase 28-C ✅ — jpg_download 重試指數退避
+- 發現原 `for i in range(0,5)` 是死碼：`except` 立即 `return`，5 次只執行 1 次
+- 修正：`except` → `last_err=err; if i<4: time.sleep(min(30, 2**i + random())); continue`
+- Loop 外才 `return [url, timetag]`
+- 隱式 cookie rotation：每次重試 `_select_cookie_for_pid` 重新挑
+
+### Phase 29-B 🔒 deferred
+- 60+ 觸點 + 無 pause/stop test，不適合無 test 框架就強行改
+- 前置：補 pause/stop/resume 語意 test 後再啟動
+
+### 驗證（Phase 28-B + 28-C）
+- `pytest -m "not integration"`: **109 passed**（+7 safe_json tests）

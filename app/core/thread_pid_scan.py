@@ -15,6 +15,7 @@ from app.core.pixiv_thread_utils import (
     init_cookie_fields,
     normalize_pid,
     normalize_pid_set,
+    safe_json,
     safe_read_json,
 )
 from app.core.pixiv_thread_base import (
@@ -405,7 +406,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             ,'referer': 'https://www.pixiv.net/users/'+author_pids,        
             }
             res = requests.get(url, headers=headers, timeout=(10, 30))
-            resdicts = res.json()['body']['illusts']
+            resdicts = safe_json(res, 'body', 'illusts', default={})
             if isinstance(resdicts, dict):
                 pid = [key for key in resdicts.keys()]
             elif isinstance(resdicts, list):

@@ -1749,11 +1749,12 @@ class download_thread(PauseableThread):
             print(err,self.cookies)
         return [url,my_time.strftime('%Y%m%d_%H%M%S')]          
     
-    def jpg_download(self,url, session=None): 
+    def jpg_download(self,url, session=None):
         self.timelock.lock()
         timetag=self.download_time.strftime('%Y%m%d_%H%M%S')
         self.download_time += datetime.timedelta(seconds=1)
         self.timelock.unlock()
+        last_err = None
         for i in range (0,5): # 最多重試 5 次，失敗就回傳錯誤
             try:
                 pid_candidate = str(url).rsplit('/',1)[1].rsplit('_',1)[0]  # 從 URL 解析 PID
@@ -1841,9 +1842,13 @@ class download_thread(PauseableThread):
                     self._convert_file_to_jxl(filepath)
                 return 0
             except Exception as err:
-                print(err)
-                return [url,timetag]
-    
+                last_err = err
+                if i < 4:
+                    time.sleep(min(30.0, (2 ** i) + pyrandom.random()))
+                    continue
+        print(last_err)
+        return [url, timetag]
+
     def stop(self):
         if self.single_mode_flag:
             self._stop_after_group = True

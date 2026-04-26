@@ -7,6 +7,30 @@ import sys
 import traceback
 
 
+def safe_json(res, *keys, default=None):
+    """Walk res.json()[k1][k2]... defensively.
+
+    Returns ``default`` if the response is not JSON, the API signalled an
+    error envelope (``{"error": true, ...}``), or any key is missing.
+    Pixiv ajax endpoints return ``{"error": true, "message": "..."}`` (no
+    ``body``) on cookie expiry / rate-limit; without this guard the caller
+    crashes with ``KeyError: 'body'``.
+    """
+    try:
+        data = res.json()
+    except Exception:
+        return default
+    if isinstance(data, dict) and data.get("error"):
+        return default
+    cur = data
+    for key in keys:
+        if isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        else:
+            return default
+    return cur
+
+
 def output_err(e):
     error_class = e.__class__.__name__
     detail = e.args[0] if e.args else ""

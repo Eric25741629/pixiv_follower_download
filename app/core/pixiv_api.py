@@ -43,7 +43,7 @@ if _SELENIUM_AVAILABLE:
 else:
     option = None
 from pathlib import Path
-from app.core.pixiv_thread_utils import safe_read_json
+from app.core.pixiv_thread_utils import safe_json, safe_read_json
 
 # 快取同一程序內已查過的作品資訊，避免重複打 Pixiv API
 _pixiv_info_cache = {}
@@ -387,7 +387,7 @@ def get_follow_illust(id,headers,state,times):
     url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
     
     res = requests.get(url.format(id), headers=headers, timeout=(10, 30))
-    resdicts = res.json()['body']['users']
+    resdicts = safe_json(res, 'body', 'users', default=[])
     return [int(_.get('userId')) for _ in resdicts]
 def illusts(id,cookie,Agent):				#輸入你的id得到你所有關注的P站畫師
     headers = {
@@ -401,10 +401,10 @@ def illusts(id,cookie,Agent):				#輸入你的id得到你所有關注的P站畫�
     url = ('https://www.pixiv.net/ajax/user/27915696/following?offset='+str(times)+'&limit=1&rest=show&tag=&lang=zh_tw') # 访问存有画师所有作品
     print(url)
     res = requests.get(url, headers=headers, timeout=(10, 30))
-    show_total_num=(res.json()['body']['total'])
+    show_total_num = safe_json(res, 'body', 'total', default=0)
     url = ('https://www.pixiv.net/ajax/user/27915696/following?offset='+str(times)+'&limit=1&rest=hide&tag=&lang=zh_tw')
     res = requests.get(url, headers=headers, timeout=(10, 30))
-    hide_total_num=(res.json()['body']['total'])
+    hide_total_num = safe_json(res, 'body', 'total', default=0)
     print(show_total_num,hide_total_num)
     threads=[]
     queue=Queue() 
@@ -442,8 +442,7 @@ def thread_no_use_seleium_get_pid(cookie,Agent,path,num,author_pids):
         ,'referer': 'https://www.pixiv.net/users/'+author_pids,
         }
         res = requests.get(url, headers=headers, timeout=(10, 30))
-        resdicts = res.json()['body']['illusts']
-        #print(resdicts)
+        resdicts = safe_json(res, 'body', 'illusts', default={})
         for key in resdicts:
             pid.append(key)
     except Exception as err:
@@ -801,7 +800,7 @@ def pixiv_following_count(id,cookie,Agent):
         ,'referer': 'https://www.pixiv.net/users/'+id+'/following',        
     }
     res = requests.get(url,headers=headers, timeout=(10, 30))
-    return res.json()['body']['following']
+    return safe_json(res, 'body', 'following', default=0)
 
     #objSoup = bs4.BeautifulSoup(res.content, 'lxml')
     #print(objSoup)
@@ -817,10 +816,10 @@ def no_use_seleium_get_pid(author_pids,cookie,Agent,q,path,num,exist_pid):
             ,'referer': 'https://www.pixiv.net/users/'+author_pids[i],        
             }
             res = requests.get(url, headers=headers, timeout=(10, 30))
-            resdicts = res.json()['body']['illusts']
+            resdicts = safe_json(res, 'body', 'illusts', default={})
             for key in resdicts:
                 if key not in exist_pid:
-                    q.put(key) 
+                    q.put(key)
         except:
             f = open((path+"authorPids_err"+str(num)+".txt"), "a+")
             f.write(author_pids[i]+'\n')

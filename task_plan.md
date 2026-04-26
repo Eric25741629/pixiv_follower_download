@@ -579,3 +579,40 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 
 **延後（拆 Phase 29-B）：**
 - `_isPause: int` → `threading.Event` — 60+ 觸點、無暫停/停止語意 test、風險高，需先補 test 框架
+
+---
+
+### Phase 28-B — safe_json helper ✅
+**優先級: 🟡 IMPORTANT**
+
+完成：
+1. ✅ 新增 `safe_json(res, *keys, default=None)` 至 `app/core/pixiv_thread_utils.py`（含 docstring 說明 Pixiv error envelope 行為）
+2. ✅ 改寫 10 個 call site：`pixiv_api.py`（6 處）、`thread_following.py`（3 處）、`thread_pid_scan.py`（1 處）
+3. ✅ 新增 `tests/test_safe_json.py`（7 tests）涵蓋：嵌套 key 走訪、缺鍵、`error=true` envelope、非 JSON、中間值非 dict、預設 None
+4. **驗證：** `pytest -m "not integration"`: **109 passed**（102 + 7）
+
+### Phase 28-C — jpg_download 重試指數退避 ✅
+**優先級: 🟡 IMPORTANT**
+
+完成（最小化版）：
+1. ✅ `jpg_download` 原本 `for i in range(0,5)` 重試圈是**死碼**（except 立即 `return [url,timetag]`，5 次只執行 1 次）
+2. ✅ 改為：`except` 內 `last_err = err; if i < 4: time.sleep(min(30, 2**i + random())); continue`，loop 外才回傳失敗
+3. ✅ 隱式 cookie rotation：每次重試 `_select_cookie_for_pid` 重新挑（cookie pool > 1 時自動有換）
+
+**延後（拆 Phase 28-D）：**
+- 顯式 cookie rotation（強制 `i>=2` 換另一條 cookie），需修改 `_select_cookie_for_pid` 或新增 `_select_alternate_cookie_for_pid`
+- `gif_download` 增加 retry wrapper（已用 `fetch_with_cookie_retry` 處理 ugoira_meta 階段，下載階段尚無 retry）
+- `err_url.txt` 寫入 status code / exception 類別
+
+### Phase 29-B — _isPause: int → threading.Event 🔒 deferred
+**優先級: 🟢 LOW（風險高、收益小於 28-B/C）**
+
+**結論：暫不執行。**
+
+60+ 觸點橫跨 6 檔（`pixiv_thread_base`, `thread_download`, `thread_url_fetch`, `thread_pid_scan`, `thread_following`, `thread_test`）。CPython int 在 x86 「碰巧」atomic，目前實務上無可見問題，只缺正式保證。
+
+**前置條件（必須先做）：**
+- 補 pause/stop/resume 語意 test：mock thread + `QSignalSpy` 驗證 `stop()` 後不再 emit；`pause()` 後 sleep 持續阻塞；`resume()` 後 sleep 真的恢復
+- 補 test 後此 phase 才有意義
+
+不在當前 sprint 範圍。
