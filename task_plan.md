@@ -526,3 +526,48 @@ Phase 18-25 全部完成後的收尾。
 |-------|---------|------------|
 | test_cookie_cooldown stub 缺 cookie_pool | Phase 2 | 在 stub 加 t.cookie_pool = [] |
 | Edit tool 無法匹配 CRLF 檔案 | Phase 7-10 | 改用 Python 腳本直接處理 bytes |
+
+---
+
+## Session 6 — 2026-04-26 (code-review-skill 衍生新 Phase)
+
+code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
+
+### Phase 27 — 統一 import 路徑（修正 app/core 死碼） ✅
+**優先級: 🔴 BLOCKING**
+
+**問題：** `main.py` 從 repo 根啟動，sys.path[0]=repo 根。`app/core/*.py` 內部 `from pixiv_api import *` / `import pixiv_api` 會命中 root `pixiv_api.py`（897 行舊版），不是 `app/core/pixiv_api.py`（890 行新版）。後果：Phase 25 的 vulture 清理、selenium try/except 包裝、`safe_read_json` 遷移在 runtime 全部沒跑到。同樣問題影響 `pixiv_thread.py` / `safe_io.py` / `pixiv_thread_utils.py`。
+
+**範圍：**
+
+| 檔案 | 行數 | 動作 |
+|---|---|---|
+| 根 `pixiv_api.py` | 897 | 移到 `backup/` → 替換成 shim `from app.core.pixiv_api import *` |
+| 根 `pixiv_thread.py` | 1932 | 移到 `backup/` → shim `from app.core.pixiv_thread import *` |
+| 根 `safe_io.py` | 131 | 移到 `backup/` → shim |
+| 根 `pixiv_thread_utils.py` | 141 | 移到 `backup/` → shim |
+| 根 `download_img.py` | 411 | 移到 `backup/`（只 `other/scripts/` 與 `.claude/worktrees/` 引用） |
+| 根 `run_actions.py` | 278 | 移到 `backup/`（只 `.claude/worktrees/` 引用） |
+
+**驗證：**
+- pytest 全綠（102 passed）
+- `python -c "import pixiv_api; print(pixiv_api.__file__)"` 應指到 `app/core/pixiv_api.py`（透過 shim 的 `__all__`）
+- ruff 違規數應略降
+
+### Phase 28 — 網路韌性（timeout / safe_json / TLS / 退避） ⏸ pending
+**優先級: 🔴 BLOCKING**
+
+1. 所有 `requests.get` / `requests.post` 加 `timeout=(10, 30)`
+2. `pixiv_thread_utils.py` 新增 `safe_json(res, *keys, default=None)`
+3. 移除 `verify=False`
+4. `gif_download` / `jpg_download` 重試加指數退避 + 換 cookie
+
+### Phase 29 — Thread lifecycle 與密碼安全 ⏸ pending
+**優先級: 🟡 IMPORTANT**
+
+1. `controller.closeEvent` 改 `stop() → wait(5000) → terminate()`
+2. `_isPause: int` → `threading.Event`
+3. `pass.json` 從 `cookies.json` 拆出（`backup=False`）
+4. `err_url.txt` 改走 `atomic_write_text`
+5. 移除 `__del__ self.wait()`
+6. `controller.py:776` `msgBox.exec()` → `exec_()`

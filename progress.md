@@ -178,3 +178,31 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 - P-γ: `Pixiv_info` 拆 `_parse_payload`
 - P-δ: `_write_all_url_file` 上提到 utils（56 行重複）
 - P-ε: 仍剩餘的 ruff 違規（F403/F405 import-star、SIM105）
+
+---
+
+## Session 6 — 2026-04-26 (code-review-skill → Phase 27)
+
+### code-review 發現
+- 跑 `Plan` agent 全面 review；發現 5 個 Blocking + 11 個 Important
+- 最關鍵：`main.py` 從 repo 根啟動 → root `pixiv_api.py`(897 行) 影子化 `app/core/pixiv_api.py`(890 行)，Phase 25 的 vulture 清理、selenium try/except、`safe_read_json` 遷移在 runtime 全沒跑到
+- 同問題影響 root `pixiv_thread.py` / `safe_io.py` / `pixiv_thread_utils.py`
+
+### Phase 27 ✅ — 統一 import 路徑
+**動作：**
+1. 備份 root 6 個檔到 `backup/dead_root_dupes/`
+2. 4 個被主流程載入的 root 檔轉成 1 行 shim：`pixiv_api.py` / `pixiv_thread.py` / `safe_io.py` / `pixiv_thread_utils.py` 全部改成 `from app.core.X import *` + 動態 `__all__`
+3. 2 個非主流程孤立檔搬到 `backup/`：`download_img.py`(411 行)、`run_actions.py`(278 行) — 只被 `other/scripts/` 與 `.claude/worktrees/` 引用
+
+**驗證：**
+- `pytest -m "not integration"`: **102 passed**（與 Session 5 同）
+- `python -c "import pixiv_api; print(pixiv_api.Pixiv_info.__module__)"` → `app.core.pixiv_api` ✅
+- `safe_io.atomic_write_json.__module__` → `app.core.safe_io` ✅
+- `pixiv_thread.download_thread.__module__` → `app.core.thread_download` ✅
+- `from app.entry.main import main`: ok
+
+**成果：** `app/core/pixiv_api.py`, `app/core/safe_io.py`, `app/core/pixiv_thread_utils.py`, `app/core/pixiv_thread.py` 變成真正被 runtime 載入的 source of truth；後續 Phase 28-29 修補才會生效。
+
+### 待續
+- Phase 28: 網路韌性（timeout / safe_json / verify=True / 退避）
+- Phase 29: Thread lifecycle + `pass.json` 拆分

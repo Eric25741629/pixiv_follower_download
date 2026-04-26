@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 import re
 import pixiv_thread
 
@@ -156,6 +156,7 @@ def start_get_url(controller):
         controller.must_tag,
         controller.ui.like_num.value(),
         no_to_check,
+        controller.path,
         single_mode,
         pid_wait_min,
         pid_wait_max,
@@ -262,6 +263,7 @@ def continue_all(controller, num):
             controller.must_tag,
             controller.ui.like_num.value(),
             no_to_check,
+            controller.path,
             single_mode,
             pid_wait_min,
             pid_wait_max,

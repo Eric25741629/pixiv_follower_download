@@ -13,11 +13,54 @@ from pathlib import Path
 import numpy as np
 import random
 
-def gif_download(cookie,agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36 Edg/96.0.1054.62',path=r'C:\Users',url=None):
+
+def _load_json_list(path):
     try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [str(item).strip() for item in data if str(item).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _resolve_user_agent(agent_value=""):
+    """
+    Resolve UA with best-effort priority:
+    1) explicit function arg
+    2) %APPDATA%/pixiv_download/cookies.json -> agent
+    3) modern fallback UA
+    """
+    explicit = str(agent_value or "").strip()
+    if explicit:
+        return explicit
+    try:
+        cfg = os.path.join(os.getenv("APPDATA") or "", "pixiv_download", "cookies.json")
+        if os.path.isfile(cfg):
+            with open(cfg, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            ua = str(data.get("agent", "")).strip()
+            if ua:
+                return ua
+    except Exception:
+        pass
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
+    )
+
+def gif_download(cookie,agent='',path=r'C:\Users',url=None):
+    try:
+        agent = _resolve_user_agent(agent)
         cookies=random.choice(cookie)
         pid=url.rsplit('/',1)[1].rsplit('_')[0]
-        tag,like,pagecount,img_url=pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/'+pid)
+        tag,like,pagecount,img_url=pixiv_api.Pixiv_info(
+            'https://www.pixiv.net/artworks/'+pid,
+            Agent=agent,
+            cookie=cookies,
+        )
         url='https://www.pixiv.net/ajax/illust/%s/ugoira_meta?lang=zh_tw'%pid
         headers = { 'User-Agent':agent,
                     'Cookie':cookies
@@ -219,7 +262,9 @@ def download_img_main(download_path,start,stop,cookie=None,Agent=None):
     #print(Agent)
     for i in range(start,stop+1):
         if not cookie:
-            cookie='p_ab_id=5; p_ab_id_2=5; p_ab_d_id=1125130963; first_visit_datetime_pc=2021-02-23+02%3A32%3A11; yuid_b=OJRESQg; a_type=0; b_type=1; login_ever=yes; privacy_policy_notification=0; c_type=34; PHPSESSID=27915696_60l9nve4HS7Z2Y0bngGXRZQwV4W4DvJ0; privacy_policy_agreement=3; QSI_S_ZN_5hF4My7Ad6VNNAi=v:0:0; tag_view_ranking=0xsDLqCEW6~qWFESUmfEs~LVSDGaCAdn~QKeXYK2oSR~Txs9grkeRc~RTJMXD26Ak~kGYw4gQ11Z~lH5YZxnbfC~Lt-oEicbBr~_EOd7bsGyl~yS_WrRrWFi~G-44hwuIPi~LLyDB5xskQ~Ie2c51_4Sp~HLWLeyYOUF~DADQycFGB0~sqGkVxMuMR~jk9IzfjZ6n~uvBGOtCzqF~MM6RXH_rlN~aKhT3n4RHZ~HY55MqmzzQ~Ti1gvrVQFO~bXMh6mBhl8~RokSaRBUGr~aC55Umcfh1~zsm1ECW5Wb~5f1R8PG9ra~xa5-CDAPro~G_f4j5NH8i~v3nOtgG77A~0RGtdYkK6L~abNIEh2zTB~Bd2L9ZBE8q~0jyux9PxkH~QaiOjmwQnI~n39RQWfHku~vxqZQOR3t2~hk_QPyZfi8~Tg1PbOMGRv~qXzcci65nj~ZTBAtZUDtQ~1VgdMhBiax~dUhrZMpRPB~tgP8r-gOe_~YTKjYV1RQx~Je_lQPk0GY~m3EJRa33xU~iVTmZJMGJj~rMC0CLW0cf~mHukPa9Swj~GuK7T6aGv6~T6NhuB95ST~CLTDpOEHJL~gpglyfLkWs~NGpDowiVmM~MnGbHeuS94~mZurA-1CO-~Am8pyjYCcZ~Riqeg_qBGT~jfnUZgnpFl~BtXd1-LPRH~ujS7cIBGO-~zZZn32I7eS~CrFcrMFJzz~ZN5DR5ie1W~AZ1ov2QNRs~N7rBHi7ijr~QzKFCsGzn-~PBxKNk7VAD~zyKU3Q5L4C~vAwbTkrP0I~P5-w_IbJrm~Ltbk6w58aR~l2rugVKl6u~ajFGI2BXvo~R0DtApn-IB~W4_X_Af3yY~OUF2gvwPef~D4hLr_YmAD~QIa7PLv7ZL~EQ_o6ZyXFg~lf-Uj4GKzU~2FO_ideA5k~18j5-cWRq2~FPCeANM2Bm~TWrozby2UO~9Gbahmahac~2QTW_H5tVX~bplY14maDo~jjVAJCBCtW~B2kc8vAuXw~m3sqCXWo7m~k39B1CkQWC~muA8Dd9eL4~I-ST5EF_lI~wbvCWCYbkM~mVhi1hBMit~Hry6GxyqEm~i8u6Dgt7ao; __cf_bm=cqoyzD4i.qO0s1sUnjhOf9p5ytamrWA2qApQNhhiIKE-1656319872-0-AaXwpJas6wECDAH0caPNgFN5+Y5wjvrFlFzdxBuyzQz6oQGTN8qILCJhy4DeWPqBE9H8Msy1ymtWXbBqLJ6dRm160hdvQQHr56qP0p3ZdhTI'
+            #呼叫錯誤 印出提示訊息
+            print("請提供cookie")
+            return
         if not Agent:
             Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36 Edg/96.0.1054.62'
     
@@ -228,12 +273,27 @@ def download_img_main(download_path,start,stop,cookie=None,Agent=None):
             print((path+r"/pictures_url"+str(i)+".txt"))
             pictures_urls = [line.rstrip() for line in file]
         #download_path=r'D:\P站爬蟲/new/'
-        with open((path+r"/existPID.txt")) as file:     #讀取寫入的文檔
-            #print(splitID(get_filelist(download_path)))
-            exist_pid = [line.rstrip()for line in file]+splitID(get_filelist(download_path))
-            exist_pid = set(exist_pid)
+        exist_json_path = os.path.join(path, "exist_pid.json")
+        exist_pid = _load_json_list(exist_json_path)
+        if not exist_pid:
+            legacy_exist_json = os.path.join(path, "exist.json")
+            exist_pid = _load_json_list(legacy_exist_json)
+        if not exist_pid:
+            legacy_exist_txt = os.path.join(path, "existPID.txt")
+            try:
+                with open(legacy_exist_txt, encoding='utf-8') as file:     # 舊格式相容
+                    exist_pid = [line.rstrip().replace('p0', '') for line in file if line.rstrip()]
+                try:
+                    from safe_io import atomic_write_json
+                    atomic_write_json(exist_json_path, sorted(set(exist_pid)))
+                except Exception:
+                    with open(exist_json_path, 'w', encoding='utf-8') as f:
+                        json.dump(sorted(set(exist_pid)), f, ensure_ascii=False, indent=2)
+            except Exception:
+                exist_pid = []
+        #print(splitID(get_filelist(download_path)))
+        exist_pid = set(exist_pid + splitID(get_filelist(download_path)))
         gifs=[]
-
         pics=[]
         for line in trange(0,len(pictures_urls)):
                 if 'ugoira' in pictures_urls[line]:
@@ -306,23 +366,28 @@ def download_img_main(download_path,start,stop,cookie=None,Agent=None):
 
         del_emp_dir(download_path)
         loguru.logger.info('寫入文檔')
-        with open((path+r"/existPID.txt")) as file:     #讀取寫入的文檔
-            exist_pid = [line.rstrip()for line in file]
-            exist_pid = set(exist_pid)
+        exist_json_path = os.path.join(path, "exist_pid.json")
+        exist_pid = set(_load_json_list(exist_json_path))
+        if not exist_pid:
+            legacy_exist_json = os.path.join(path, "exist.json")
+            exist_pid = set(_load_json_list(legacy_exist_json))
+        if not exist_pid:
+            legacy_exist_txt = os.path.join(path, "existPID.txt")
+            try:
+                with open(legacy_exist_txt, encoding='utf-8') as file:     # 舊格式相容
+                    exist_pid = set(line.rstrip().replace('p0', '') for line in file if line.rstrip())
+            except Exception:
+                exist_pid = set()
         download_id=splitID(get_filelist(download_path))
         #print(download_id)
         try:
-            from safe_io import atomic_append_text
-            to_append = [text for text in download_id if text not in exist_pid]
-            if to_append:
-                atomic_append_text(os.path.join(path, "existPID.txt"), to_append)
+            from safe_io import atomic_write_json
+            to_save = sorted(exist_pid.union(download_id))
+            atomic_write_json(exist_json_path, to_save)
         except Exception:
             try:
-                f = open((path+"existPID.txt"), "a+")
-                for text in download_id:
-                    if text not in exist_pid:
-                        f.write(text+'\n')
-                f.close()
+                with open(exist_json_path, "w", encoding='utf-8') as f:
+                    json.dump(sorted(exist_pid.union(download_id)), f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
         loguru.logger.success('寫入完成')
@@ -342,21 +407,5 @@ if __name__ == '__main__':
     print(len(get_filelist(download_path)))
     print(len(download_id))
     #print(splitID(get_filelist(r'D:\P站爬蟲\35/')))      
-    '''path=os.getenv('APPDATA')+r'/pixiv_download/'
-    with open((path+r"/existPID.txt")) as file:     #讀取寫入的文檔
-        exist_pid = [line.rstrip()for line in file]
-        exist_pid = set(exist_pid)
-    download_path=r'D:/pixiv/'
-    download_id=splitID(get_filelist(download_path))
-    print(download_id)
-    #print(download_id)
-    f = open((path+"existPID.txt"), "a+")
-    for text in download_id:
-        if text not in exist_pid:
-            print(text)
-            time.sleep(10)
-            #f.write(text+'\n')
-        else:
-            print('存在')
-    f.close()'''
+
     
