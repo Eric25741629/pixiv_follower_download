@@ -404,7 +404,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             'Cookie':cookie
             ,'referer': 'https://www.pixiv.net/users/'+author_pids,        
             }
-            res = requests.get(url, headers=headers)
+            res = requests.get(url, headers=headers, timeout=(10, 30))
             resdicts = res.json()['body']['illusts']
             if isinstance(resdicts, dict):
                 pid = [key for key in resdicts.keys()]

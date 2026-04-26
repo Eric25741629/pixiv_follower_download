@@ -554,20 +554,28 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 - `python -c "import pixiv_api; print(pixiv_api.__file__)"` 應指到 `app/core/pixiv_api.py`（透過 shim 的 `__all__`）
 - ruff 違規數應略降
 
-### Phase 28 — 網路韌性（timeout / safe_json / TLS / 退避） ⏸ pending
+### Phase 28 — 網路韌性（timeout / TLS） ✅
 **優先級: 🔴 BLOCKING**
 
-1. 所有 `requests.get` / `requests.post` 加 `timeout=(10, 30)`
-2. `pixiv_thread_utils.py` 新增 `safe_json(res, *keys, default=None)`
-3. 移除 `verify=False`
-4. `gif_download` / `jpg_download` 重試加指數退避 + 換 cookie
+完成（最小化版）：
+1. ✅ 12 處 `requests.get` 全部加 `timeout=(10, 30)`（pixiv_api / thread_following / thread_pid_scan / update_selenium）
+2. ✅ 移除 4 處 `verify=False`（pixiv_thread_utils:641,653、thread_download:1707,1817）
 
-### Phase 29 — Thread lifecycle 與密碼安全 ⏸ pending
+**延後（拆 Phase 28-B）：**
+- `safe_json(res, *keys, default=None)` helper + 4 個 call site 改寫
+- `gif_download` / `jpg_download` 重試指數退避 + 換 cookie（80+ 行巢狀邏輯，需先補 test）
+
+### Phase 29 — Thread lifecycle ✅
 **優先級: 🟡 IMPORTANT**
 
-1. `controller.closeEvent` 改 `stop() → wait(5000) → terminate()`
-2. `_isPause: int` → `threading.Event`
-3. `pass.json` 從 `cookies.json` 拆出（`backup=False`）
-4. `err_url.txt` 改走 `atomic_write_text`
-5. 移除 `__del__ self.wait()`
-6. `controller.py:776` `msgBox.exec()` → `exec_()`
+完成：
+1. ✅ `controller.closeEvent` 改 `stop() → wait(5000) → terminate()`（controller.py:856-863）
+2. ✅ 移除 `__del__ self.wait()`（controller.py:56-57、thread_following.py:139-140）
+3. ✅ `err_url.txt` 改走 `atomic_write_text(backup=False)`（thread_download.py:1383-1385）
+4. ✅ `controller.py:777` `msgBox.exec()` → `exec_()`
+
+**已過時 / 已完成（不需動）：**
+- `pass.json` 從 `cookies.json` 拆出 — Phase 17 已併入 `settings.json` 且 `SettingsStore.save()` 用 `backup=False`，密碼不會進 history/
+
+**延後（拆 Phase 29-B）：**
+- `_isPause: int` → `threading.Event` — 60+ 觸點、無暫停/停止語意 test、風險高，需先補 test 框架

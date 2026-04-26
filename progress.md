@@ -203,6 +203,20 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 
 **成果：** `app/core/pixiv_api.py`, `app/core/safe_io.py`, `app/core/pixiv_thread_utils.py`, `app/core/pixiv_thread.py` 變成真正被 runtime 載入的 source of truth；後續 Phase 28-29 修補才會生效。
 
-### 待續
-- Phase 28: 網路韌性（timeout / safe_json / verify=True / 退避）
-- Phase 29: Thread lifecycle + `pass.json` 拆分
+### Phase 28 ✅ — 網路韌性（最小化版）
+- 12 處 `requests.get` 加 `timeout=(10, 30)`：`app/core/pixiv_api.py`(8 處)、`thread_following.py`(3 處)、`thread_pid_scan.py`(1 處)、`update_selenium.py`(1 處)
+- 移除 4 處 `verify=False`：`pixiv_thread_utils.py:641,653`、`thread_download.py:1707,1817`
+- 用 Python regex 腳本批次處理（避免逐點 Edit 浪費 round trip）
+- **延後** Phase 28-B：`safe_json` helper + 下載重試指數退避（80+ 行）
+
+### Phase 29 ✅ — Thread lifecycle（narrowed）
+- `controller.closeEvent`: `stop() → wait(5000) → terminate() → wait(2000)`
+- 移除 `__del__ self.wait()`：`controller.py:56-57`、`thread_following.py:139-140`
+- `err_url.txt` 改走 `atomic_write_text(backup=False)`
+- `msgBox.exec()` → `exec_()`（`controller.py:777`）
+- **發現** code review 中「pass.json 拆分」過時：Phase 17 已合併到 `settings.json` 且 `SettingsStore.save()` 已用 `backup=False`
+- **延後** Phase 29-B：`_isPause int → threading.Event`（60+ 觸點，需先有 pause/stop 語意 test）
+
+### 驗證（Phase 28+29）
+- `pytest -m "not integration"`: **102 passed**
+- `from app.entry.main import main`: ok

@@ -638,7 +638,7 @@ def fetch_with_cookie_retry(http_get, url, headers, cookies, retry_statuses=(403
     Returns (final_response, trace_info, first_response_or_none).
     """
     first_headers = dict(headers or {})
-    first_response = http_get(url, headers=first_headers, verify=False, stream=True)
+    first_response = http_get(url, headers=first_headers, stream=True)
     first_status = getattr(first_response, "status_code", None)
     trace = {
         "first_try_status": first_status,
@@ -650,7 +650,7 @@ def fetch_with_cookie_retry(http_get, url, headers, cookies, retry_statuses=(403
     if first_status in set(retry_statuses or ()) and (not has_cookie_in_first) and str(cookies or "").strip():
         retry_headers = dict(first_headers)
         retry_headers["Cookie"] = str(cookies).strip()
-        retry_response = http_get(url, headers=retry_headers, verify=False, stream=True)
+        retry_response = http_get(url, headers=retry_headers, stream=True)
         retry_status = getattr(retry_response, "status_code", None)
         trace["retry_used"] = True
         trace["retry_with_cookie_status"] = retry_status

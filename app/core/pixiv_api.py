@@ -326,7 +326,7 @@ def Test_cookies(lists,agent):
                 ,'Referer':('http://www.pixiv.net/'+str(pid)),        
                     } 
             url='https://www.pixiv.net/ajax/illust/'+pid+'/pages?lang=zh_tw'            
-            htmlfile = requests.get(url,headers=headers)
+            htmlfile = requests.get(url,headers=headers,timeout=(10, 30))
             #print(htmlfile.text)
             htmlfile.raise_for_status() 
             #objSoup = bs4.BeautifulSoup(htmlfile.text, 'lxml')
@@ -386,8 +386,8 @@ def get_follow_illust(id,headers,state,times):
     '''獲得所有你關注的畫師 需輸入查詢的ID 第幾個 偽裝 公開/私人'''
     url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
     
-    res = requests.get(url.format(id), headers=headers)
-    resdicts = res.json()['body']['users'] 
+    res = requests.get(url.format(id), headers=headers, timeout=(10, 30))
+    resdicts = res.json()['body']['users']
     return [int(_.get('userId')) for _ in resdicts]
 def illusts(id,cookie,Agent):				#輸入你的id得到你所有關注的P站畫師
     headers = {
@@ -400,10 +400,10 @@ def illusts(id,cookie,Agent):				#輸入你的id得到你所有關注的P站畫�
     limit=1
     url = ('https://www.pixiv.net/ajax/user/27915696/following?offset='+str(times)+'&limit=1&rest=show&tag=&lang=zh_tw') # 访问存有画师所有作品
     print(url)
-    res = requests.get(url, headers=headers)
+    res = requests.get(url, headers=headers, timeout=(10, 30))
     show_total_num=(res.json()['body']['total'])
     url = ('https://www.pixiv.net/ajax/user/27915696/following?offset='+str(times)+'&limit=1&rest=hide&tag=&lang=zh_tw')
-    res = requests.get(url, headers=headers)
+    res = requests.get(url, headers=headers, timeout=(10, 30))
     hide_total_num=(res.json()['body']['total'])
     print(show_total_num,hide_total_num)
     threads=[]
@@ -439,9 +439,9 @@ def thread_no_use_seleium_get_pid(cookie,Agent,path,num,author_pids):
         headers = {
         'User-Agent': Agent,
         'Cookie':cookie
-        ,'referer': 'https://www.pixiv.net/users/'+author_pids,        
+        ,'referer': 'https://www.pixiv.net/users/'+author_pids,
         }
-        res = requests.get(url, headers=headers)
+        res = requests.get(url, headers=headers, timeout=(10, 30))
         resdicts = res.json()['body']['illusts']
         #print(resdicts)
         for key in resdicts:
@@ -491,7 +491,7 @@ def Pixiv_Tag(url):                                                 #回傳標�
         ,'referer': 'https://www.pixiv.net/users/27915696/following',        
     }
     id=url.rsplit('/',1)[1]
-    res = requests.get(url, headers=headers)
+    res = requests.get(url, headers=headers, timeout=(10, 30))
     obj = str(bs4.BeautifulSoup(res.text, 'lxml').find_all('meta')[25])
     obj=obj.replace('<meta content=\'','')
     obj=obj.replace('id="meta-preload-data" name="preload-data"/>','') 
@@ -762,7 +762,7 @@ def userId(url,
         }
         headers = _clean_headers(headers)
         id=url.rsplit('/',1)[1]
-        res = requests.get(url, headers=headers)
+        res = requests.get(url, headers=headers, timeout=(10, 30))
         if res.status_code == 404:
             return 404,404,404,404
         #print(res.json())
@@ -800,7 +800,7 @@ def pixiv_following_count(id,cookie,Agent):
         'Cookie':cookie
         ,'referer': 'https://www.pixiv.net/users/'+id+'/following',        
     }
-    res = requests.get(url,headers=headers)
+    res = requests.get(url,headers=headers, timeout=(10, 30))
     return res.json()['body']['following']
 
     #objSoup = bs4.BeautifulSoup(res.content, 'lxml')
@@ -816,7 +816,7 @@ def no_use_seleium_get_pid(author_pids,cookie,Agent,q,path,num,exist_pid):
             'Cookie':cookie
             ,'referer': 'https://www.pixiv.net/users/'+author_pids[i],        
             }
-            res = requests.get(url, headers=headers)
+            res = requests.get(url, headers=headers, timeout=(10, 30))
             resdicts = res.json()['body']['illusts']
             for key in resdicts:
                 if key not in exist_pid:

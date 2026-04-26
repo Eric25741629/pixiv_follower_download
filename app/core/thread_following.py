@@ -66,7 +66,7 @@ class get_following(PauseableThread):
         global pid_num
         pid_num=pid_num+100
         url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
-        res = requests.get(url.format(id), headers=headers)
+        res = requests.get(url.format(id), headers=headers, timeout=(10, 30))
         resdicts = res.json()['body']['users'] 
         self._signal.emit(100,self.max)
         i=[]
@@ -92,7 +92,7 @@ class get_following(PauseableThread):
         url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=1&rest=show&tag=&lang=zh_tw') # 先查公開關注總數
         print(url.format(self.userid))
 
-        res = requests.get(url.format(self.userid), headers=headers)
+        res = requests.get(url.format(self.userid), headers=headers, timeout=(10, 30))
         print(res.text)
         show_total_num=(res.json()['body']['total'])
         show_list = list(range(0, show_total_num+200, 100))
@@ -100,7 +100,7 @@ class get_following(PauseableThread):
         if (self.hide==False):
             #print("yes")
             url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=1&rest=hide&tag=&lang=zh_tw')
-            res = requests.get(url.format(self.userid), headers=headers)
+            res = requests.get(url.format(self.userid), headers=headers, timeout=(10, 30))
             hide_total_num=(res.json()['body']['total'])
             hide_list=[i for i in range(0,hide_total_num+200,100)]
             self.max=int(hide_total_num+show_total_num)
@@ -136,6 +136,4 @@ class get_following(PauseableThread):
             self._output.emit('Task failed')
             self._output.emit(output_err(e))
             self._thenext.emit(-1)
-    def __del__(self):
-        self.wait()
 

@@ -1380,10 +1380,8 @@ class download_thread(PauseableThread):
             else:
                 fail_records.append((str(item), ""))
         if fail_records:
-            f = open((self.path+"/err_url"+".txt"), "w+")
-            for url_text, info_text in fail_records:
-                f.write(str(url_text) + ' ' + str(info_text) + '\n')
-            f.close()
+            err_lines = [f"{url_text} {info_text}" for url_text, info_text in fail_records]
+            atomic_write_text(self.path + "/err_url.txt", err_lines, backup=False)
         self._diag("step4_fail_records", fail_record_count=len(fail_records))
         stop_to_download = [self.q.get() for _ in range(self.q.qsize())]
         failed_to_download = []
@@ -1704,7 +1702,7 @@ class download_thread(PauseableThread):
                         'Referer':('http://www.pixiv.net/'+str(pid))}
             if (need_cookie is True or self._pid_cookie_used.get(str(pid), False)) and pid_cookie:
                 headers['Cookie'] = pid_cookie
-            htmlfile = http.get(url,headers=headers,verify=False,stream=True)
+            htmlfile = http.get(url,headers=headers,stream=True)
             my_time=self.download_time
             zip_bytes = None
             if htmlfile.status_code == 200: # 請求成功才開始下載資料
@@ -1814,7 +1812,7 @@ class download_thread(PauseableThread):
                 except Exception:
                     pass
                 http = session if session is not None else requests
-                htmlfile = http.get(url,headers=headers,verify=False,stream=True,timeout=5)
+                htmlfile = http.get(url,headers=headers,stream=True,timeout=5)
                 htmlfile.raise_for_status() 
                 size = 0
                 chunk_size = 1024

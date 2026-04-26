@@ -25,7 +25,7 @@ def getChromeDriver(options=None):
         messagebox.showinfo("提示：","驅動版本：%s\ngoogle瀏覽器版本：%s\n無法兼容\n開始更新驅動..."%(driver_version,chrome_version))    
         print(f"驅動版本：{driver_version}，google瀏覽器版本：{chrome_version}，不兼容\n開始更新驅動...")
         res = requests.get(
-            "https://registry.npmmirror.com/-/binary/chromedriver/")
+            "https://registry.npmmirror.com/-/binary/chromedriver/", timeout=(10, 30))
         versions = [obj["name"][:-1] for obj in res.json() if re.match("\d+",
                                                                        obj["name"]) and obj["name"].count(".") == 3]
         versions = {key: max(versions_split, key=lambda x: int(x[x.rfind(".")+1:]))
@@ -40,7 +40,7 @@ def getChromeDriver(options=None):
         if not os.path.exists(file):
             url = f"https://registry.npmmirror.com/-/binary/chromedriver/{dest_version}/chromedriver_win32.zip"
             print("驅動下載地址：", url)
-            res = requests.get(url)
+            res = requests.get(url, timeout=(10, 30))
             with open(file, 'wb') as f:
                 f.write(res.content)
         else:

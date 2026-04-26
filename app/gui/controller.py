@@ -53,9 +53,6 @@ class Runthread(QtCore.QThread):
     def __init__(self):
         super().__init__()
 
-    def __del__(self):
-        self.wait()
-
     def run(self):
         for i in range(100):
             time.sleep(0.2)
@@ -774,7 +771,7 @@ class MainWindow_controller(FramelessMainWindow):
         msgBox.setText(
             "偵測到新版本，請到這裡下載：<a href='https://drive.google.com/file/d/1zZF9kFVCP8HuwbZLu6sqEiyQmaEbuUSJ/view?usp=share_link'>點我開啟下載頁</a>。")
         msgBox.setWindowTitle("版本更新提醒")
-        msgBox.exec()
+        msgBox.exec_()
         '''output=self.path+r'/check.json'
 
         with open(output, encoding="utf-8") as file:     # 讀取更新資訊
@@ -854,9 +851,11 @@ class MainWindow_controller(FramelessMainWindow):
             except Exception:
                 pass
         try:
-            if self.thread1 != None:
-                if self.thread1.isRunning():
-                    self.thread1.stop()
+            if self.thread1 is not None and self.thread1.isRunning():
+                self.thread1.stop()
+                if not self.thread1.wait(5000):
+                    self.thread1.terminate()
+                    self.thread1.wait(2000)
         except Exception:
             pass
 
