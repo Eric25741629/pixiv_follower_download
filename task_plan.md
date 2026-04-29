@@ -604,7 +604,27 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 - `gif_download` 增加 retry wrapper（已用 `fetch_with_cookie_retry` 處理 ugoira_meta 階段，下載階段尚無 retry）
 - `err_url.txt` 寫入 status code / exception 類別
 
-### Phase 30 (P-α) — get_download_url F→D ⏸ blocked-on-test
+### Phase 39 — thread_no_use_seleium_get_pid 拆解 ✅
+**位置：** `app/core/thread_pid_scan.py:413`
+
+抽 6 個 `_step2_*` helper（fetch_artist_pid_list / emit_incremental_status / record_skipped_pids / append_new_pids / record_author_progress / record_artist_failure）。
+- **D (30) → B (6)**（101 → 21 行 orchestrator）
+
+### Phase 40 — _finalize_downloads 拆解 ✅
+**位置：** `app/core/thread_download.py:1471`
+
+抽 `_classify_download_results` / `_compute_remaining_urls` / `_persist_url_meta`。
+- **D (25) → A (5)**（61 → 16 行）
+- `tests/test_step4_download_helpers.py` 9 tests 仍綠
+
+### Phase 30 (P-α) — get_download_url F→D ✅
+**位置：** `app/core/thread_url_fetch.py:1365`
+
+謹慎模式（無 golden test 安全網）：抽 8 個 `_step3_*` helper，只動純資料/log/sequencing 段，不碰網路重試與 cookie 邏輯。
+- **F (52) → D (28)** — codebase 主流程 **0 個 F 級函式**
+- 行為等價：`_diag` 事件順序、`_output.emit` 順序、`_sleep_ultra_slow` 時序皆保留
+- `_finalize` 仍為 closure（保留 query_source / need_cookie 的延遲求值語意）
+- 剩餘 CC 主要在 6 個 skip-path 分支，深入抽要動 emit 順序，不在當前 scope
 **優先級: 🔴 (HIGH ROI but BLOCKED)**  **位置:** `thread_url_fetch.py:1353`（CC=52，142 行）
 
 **問題：** 同時做 5 件事 — fetch URL / 解析 response / cookie retry / diag log / 寫檔。

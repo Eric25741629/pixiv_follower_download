@@ -378,3 +378,37 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 
 ### 驗證
 - `pytest -m "not integration"`: **119 passed**
+
+---
+
+## Session 11 — 2026-04-29 (3 個 agent 平行：F=52 + 兩條 D)
+
+派 3 個 agent 平行（不同檔案）：
+
+### Phase 39 ✅ — `thread_no_use_seleium_get_pid` 拆解
+- 抽 6 個 `_step2_*` helper（fetch / emit / record skipped / append new / record progress / record failure）
+- 主函式 101 行 → 21 行 orchestrator
+- CC：**D (30) → B (6)**
+
+### Phase 40 ✅ — `_finalize_downloads` 拆解
+- 抽 `_classify_download_results`（@staticmethod）+ `_compute_remaining_urls` + `_persist_url_meta`
+- 主函式 61 行 → 16 行
+- CC：**D (25) → A (5)**
+- `tests/test_step4_download_helpers.py` 9 tests 全綠
+
+### Phase 30 (P-α) ✅ — `get_download_url` F=52 解放
+**最大那條炸彈降下來。** 謹慎模式（無 golden test）：
+- 抽 8 個 `_step3_*` helper：advance_progress / extract_meta_from_cache / build_url_meta_entry / record_filter_result / safe_cookie_requirement / safe_emit / finalize_query / build_pid_download_urls
+- **不碰** Pixiv_info call、retry、cookie 切換
+- `_finalize` 保留為 closure（query_source / need_cookie 延遲求值）
+- CC：**F (52) → D (28)**
+- 142 行 → ~92 行
+
+### 終局狀態（截至 Session 11 結束）
+- **0 個 F 級函式**（主流程）
+- **0 個 E 級函式**
+- 剩 D 級：7 個（多在 thread_url_fetch 與其他次要函式）
+- 119 passed、無 regression
+
+### 驗證
+- `pytest -m "not integration"`: **119 passed**
