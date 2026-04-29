@@ -693,7 +693,30 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 
 職責：副檔名 gating + 重試 + 成功/失敗計數 + log。拆 `_jxl_should_convert(path)` / `_jxl_run_conversion(path)` / `_jxl_record_outcome(...)`。
 
-### Phase 33 — download_thread.__init__ 21-param → DownloadConfig dataclass ⏸ pending
+### Phase 37 — _commit_step2_outputs D→A ✅
+**位置：** `app/core/thread_pid_scan.py:282`
+
+抽出 5 helper（`_persist_author_progress` / `_collect_step2_pids_from_queue` / `_merge_step2_pids_with_existing` / `_write_step2_pictures_id` / `_write_step2_skip_pids`）。主函式從 88 行 → 7 行 orchestrator。
+- `_commit_step2_outputs`: **D (30) → A (2)**
+
+### Phase 38 — Userdata_controller schema 化 ✅
+**位置：** `app/gui/user_info.py:43`(load_data) + `:215`(setinfo)
+
+引入 `_LOAD_FIELDS` / `_SETINFO_FIELDS` schema + `_apply_field` / `_apply_widget_value` helper。
+- `load_data`: **D (23) → A (3)**（72 → 24 行）
+- `setinfo`: **D (22) → A (4)**（68 → 19 行）
+- 兩 class 整體：B → A
+
+### Phase 33 — download_thread.__init__ 21-param → DownloadConfig dataclass 🔒 declined
+**結論：投入 vs 報酬不成比例，主動延後。**
+
+**重新評估後（2026-04-29，動工前先讀代碼）：**
+- 現況 `__init__` CC=20 (C 級)，**已不是熱點**——Phase 21 已抽出 legacy args，validation 邏輯 ~30 行，attribute assignment ~50 行
+- 「21 params」是 signature 美觀問題，不是真實邏輯複雜度
+- 加 `DownloadConfig` dataclass 只是把 21 個 named args 從 `download_thread(...)` 平移到 `DownloadConfig(...)`，**內部 validation 與 assignment 不會消失**，總 LOC 反而變多（多一層 dataclass + adapter）
+- 跨 `run_actions.py` 改動有 regression 風險，收益不成比例
+
+**何時值得做：** 若未來新增 download options 從 21 → 30+，或者要支援多個進入點（CLI / batch script / config file）才有結構性收益。目前單一 GUI 進入點不必要。
 **優先級: 🟡 IMPORTANT**  **位置:** `thread_download.py:55`（144 行，21 params）
 
 `__init__` 經 Phase 21 抽過 legacy args 後仍 21 個 named params。建立 `@dataclass DownloadConfig` 一次傳入；同步改 `app/gui/run_actions.py` call site。**風險中-高**：影響跨檔 call site，需先 grep 所有實例化點並準備一次性遷移。

@@ -279,92 +279,116 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                 results = list(self.executor.map(self._run_step2_with_random_cookie, work_list))
         return results
 
-    def _commit_step2_outputs(self, end):
-        progress_file = os.path.join(self.path, 'author_progress.json')
+    def _persist_author_progress(self, progress_file):
+        """寫入 author_progress.json（concern 1）：silent-failure 一致保留。"""
         try:
-            if hasattr(self, '_progress_updates') and self._progress_updates:
-                try:
-                    prog = {}
-                    if os.path.isfile(progress_file):
-                        try:
-                            with open(progress_file, encoding='utf-8') as pf:
-                                prog = json.load(pf)
-                        except Exception:
-                            prog = {}
-                    with self._progress_updates_lock:
-                        for aid, ts in self._progress_updates:
-                            prog[str(aid)] = ts
-                    tmpfile = progress_file + '.tmp'
-                    with open(tmpfile, 'w', encoding='utf-8') as pf:
-                        json.dump(prog, pf, ensure_ascii=False, indent=2)
-                    os.replace(tmpfile, progress_file)
-                except Exception as e:
+            if not (hasattr(self, '_progress_updates') and self._progress_updates):
+                return
+            try:
+                prog = {}
+                if os.path.isfile(progress_file):
                     try:
-                        self._output.emit(f"<p><font color='red'>寫入 author_progress 失敗：{e}</font></p>")
+                        with open(progress_file, encoding='utf-8') as pf:
+                            prog = json.load(pf)
                     except Exception:
-                        pass
+                        prog = {}
+                with self._progress_updates_lock:
+                    for aid, ts in self._progress_updates:
+                        prog[str(aid)] = ts
+                tmpfile = progress_file + '.tmp'
+                with open(tmpfile, 'w', encoding='utf-8') as pf:
+                    json.dump(prog, pf, ensure_ascii=False, indent=2)
+                os.replace(tmpfile, progress_file)
+            except Exception as e:
+                try:
+                    self._output.emit(f"<p><font color='red'>寫入 author_progress 失敗：{e}</font></p>")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _collect_step2_pids_from_queue(self, end):
+        """收集 collected pids（從鎖保護的 buffer）並與 end 合併。回傳 (combined_iterable,)。"""
+        try:
+            with self._collected_pids_lock:
+                collected = list(self._collected_pids)
+        except Exception:
+            collected = list(getattr(self, '_collected_pids', []))
+        return list(end) + collected
+
+    def _merge_step2_pids_with_existing(self, pics_file, combined_pids):
+        """讀現有 pictures_id.txt 並 dedup，回傳 (existing_list, new_candidates)。"""
+        existing_list = []
+        if os.path.isfile(pics_file):
+            try:
+                with open(pics_file, encoding='utf-8') as pf:
+                    existing_list = [line.strip() for line in pf if line.strip()]
+            except Exception:
+                existing_list = []
+        existing_seen = set(existing_list)
+        new_candidates = []
+        for pid in combined_pids:
+            spid = str(pid).strip()
+            if not spid or spid in self.exist_pid or spid in existing_seen:
+                continue
+            new_candidates.append(spid)
+            existing_seen.add(spid)
+        return existing_list, new_candidates
+
+    def _write_step2_pictures_id(self, end):
+        """concern 2：合併 collected pids 並寫入 pictures_id.txt。"""
+        pics_file = os.path.join(self.path, 'pictures_id.txt')
+        try:
+            os.makedirs(self.path, exist_ok=True)
         except Exception:
             pass
         try:
-            pics_file = os.path.join(self.path, 'pictures_id.txt')
-            try:
-                os.makedirs(self.path, exist_ok=True)
-            except Exception:
+            with open(pics_file, 'a+', encoding='utf-8'):
                 pass
+        except Exception:
+            pass
+        combined = self._collect_step2_pids_from_queue(end)
+        existing_list, new_candidates = self._merge_step2_pids_with_existing(pics_file, combined)
+        if new_candidates:
             try:
-                with open(pics_file, 'a+', encoding='utf-8'):
-                    pass
-            except Exception:
-                pass
-            try:
-                with self._collected_pids_lock:
-                    collected = list(self._collected_pids)
-            except Exception:
-                collected = list(getattr(self, '_collected_pids', []))
-            existing_list = []
-            if os.path.isfile(pics_file):
+                with open(pics_file, 'a+', encoding='utf-8') as pf:
+                    for text in new_candidates:
+                        pf.write(str(text) + '\n')
+            except Exception as e2:
                 try:
-                    with open(pics_file, encoding='utf-8') as pf:
-                        existing_list = [line.strip() for line in pf if line.strip()]
+                    self._output.emit(f"<p><font color='red'>寫入 pictures_id 失敗：{e2}</font></p>")
                 except Exception:
-                    existing_list = []
-            existing_seen = set(existing_list)
-            new_candidates = []
-            for pid in (end + collected):
-                spid = str(pid).strip()
-                if not spid or spid in self.exist_pid or spid in existing_seen:
-                    continue
-                new_candidates.append(spid)
-                existing_seen.add(spid)
-            if new_candidates:
-                try:
-                    with open(pics_file, 'a+', encoding='utf-8') as pf:
-                        for text in new_candidates:
-                            pf.write(str(text) + '\n')
-                except Exception as e2:
-                    try:
-                        self._output.emit(f"<p><font color='red'>寫入 pictures_id 失敗：{e2}</font></p>")
-                    except Exception:
-                        pass
-            try:
-                self._output.emit(
-                    f"<p><font color='gray'>pictures_id 既有 {len(existing_list)} 筆，新增 {len(new_candidates)} 筆，合計 {len(existing_list) + len(new_candidates)} 筆</font></p>"
-                )
-            except Exception:
-                pass
-            skip_file = os.path.join(self.path, "step2_skip_pid.txt")
-            with self._step2_skip_lock:
-                skip_lines = sorted(
-                    [str(x) for x in self._step2_early_skip_pids if str(x).strip()],
-                    key=lambda s: int(s) if str(s).isdigit() else str(s),
-                )
-            atomic_write_text(skip_file, skip_lines, backup=True)
-            try:
-                self._output.emit(
-                    f"<p><font color='gray'>[PID增量] 已寫入步驟2提前跳過清單：{skip_file}（{len(skip_lines)} 筆）</font></p>"
-                )
-            except Exception:
-                pass
+                    pass
+        try:
+            self._output.emit(
+                f"<p><font color='gray'>pictures_id 既有 {len(existing_list)} 筆，新增 {len(new_candidates)} 筆，合計 {len(existing_list) + len(new_candidates)} 筆</font></p>"
+            )
+        except Exception:
+            pass
+
+    def _write_step2_skip_pids(self):
+        """concern 3：寫入 step2_skip_pid.txt 提前跳過清單。"""
+        skip_file = os.path.join(self.path, "step2_skip_pid.txt")
+        with self._step2_skip_lock:
+            skip_lines = sorted(
+                [str(x) for x in self._step2_early_skip_pids if str(x).strip()],
+                key=lambda s: int(s) if str(s).isdigit() else str(s),
+            )
+        atomic_write_text(skip_file, skip_lines, backup=True)
+        try:
+            self._output.emit(
+                f"<p><font color='gray'>[PID增量] 已寫入步驟2提前跳過清單：{skip_file}（{len(skip_lines)} 筆）</font></p>"
+            )
+        except Exception:
+            pass
+
+    def _commit_step2_outputs(self, end):
+        progress_file = os.path.join(self.path, 'author_progress.json')
+        self._persist_author_progress(progress_file)
+        # 原本 pictures_id 與 step2_skip 共用一個 outer try/except: pass，保留同等 silent-failure 邊界
+        try:
+            self._write_step2_pictures_id(end)
+            self._write_step2_skip_pids()
         except Exception:
             pass
 

@@ -337,3 +337,44 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 ### 待續
 - Phase 33: `download_thread.__init__` 21-param → `DownloadConfig` dataclass（自己做，跨 `run_actions.py`）
 - Phase 30 (P-α): `get_download_url` F=52 — 仍 blocked，需先補 golden test
+
+---
+
+## Session 10 — 2026-04-29 (兩個 D 級函式平行 agent)
+
+派 2 個 general-purpose agent 平行（不同檔案）：
+
+### Phase 37 ✅ — `_commit_step2_outputs` 拆解
+- 抽 5 helper：`_persist_author_progress` / `_collect_step2_pids_from_queue` / `_merge_step2_pids_with_existing` / `_write_step2_pictures_id` / `_write_step2_skip_pids`
+- 主函式 88 行 → 7 行 orchestrator
+- CC：**D (30) → A (2)**
+- 行為等價：原本 outer try/except 邊界保留
+
+### Phase 38 ✅ — `Userdata_controller` / `othersettings` schema 化
+- 引入 `_LOAD_FIELDS`（6 條）+ `_SETINFO_FIELDS`（16 條）class-level tuple schema
+- 抽 helper：`_apply_field` / `_apply_widget_value` / `_load_following` / `_apply_download_section`
+- `load_data`: **D (23) → A (3)**（72 → 24 行）
+- `setinfo`: **D (22) → A (4)**（68 → 19 行）
+- 兩 class 整體 CC: B → A
+- 特殊欄位（`download_time` QDateTime、`ban_tag`/`must_tag` instance attr）保留在 `_apply_download_section`，不進 schema
+
+### Phase 33 🔒 declined
+- `__init__` CC=20 (C)，**已不是熱點**——21 params 是 signature 美觀問題，不是真實複雜度炸彈
+- 加 dataclass 只是把 21 個 named args 從 `download_thread(...)` 平移到 `DownloadConfig(...)`，內部 validation 不變、總 LOC 反增
+- 跨 `run_actions.py` 改動有 regression 風險，收益不成比例
+
+### CC 最新熱點（截至 Phase 38）
+| 函式 | CC | 備註 |
+|---|---|---|
+| `thread_url_fetch.get_download_url` | **F (52)** | Phase 30，blocked on golden tests |
+| `pixiv_api.get_download_url` | D (29) | 主流程不用（孤兒函式） |
+| `thread_pid_scan.thread_no_use_seleium_get_pid` | D (30) | 候選 |
+| `thread_url_fetch.check_exist` | D (26) | 候選 |
+| `thread_url_fetch._finalize_on_complete` | D (26) | 候選 |
+| `thread_download._finalize_downloads` | D (25) | 候選 |
+| `pixiv_thread_utils.normalize_cookie_entries` | D (22) | 候選 |
+| `thread_download.gif_download` | D (22) | Phase 31 已從 E 降下來，仍有空間 |
+| `thread_url_fetch._load_saved_cookie_requirement_map` | D (21) | 候選 |
+
+### 驗證
+- `pytest -m "not integration"`: **119 passed**
