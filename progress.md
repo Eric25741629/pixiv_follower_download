@@ -308,3 +308,32 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 
 ### 驗證
 - `pytest -m "not integration"`: **119 passed**
+
+---
+
+## Session 9 — 2026-04-29 (Phase 32 + 34 平行 agent)
+
+派 2 個 general-purpose agent 平行動工（不同檔案、低風險）：
+
+### Phase 32 ✅ — `_convert_file_to_jxl` 三段拆
+- 抽 `_jxl_should_convert(src_path)` / `_jxl_run_conversion(src_path, dst_path, ext)` / `_jxl_record_outcome(...)`
+- 主 `_convert_file_to_jxl` 從 86 行縮成 6 行 orchestrator
+- CC：**E (34) → A (2)**；helper 全 B/C 級
+- 行為等價：cjxl 缺失一次性警告、subprocess timeout、`jxl_delete_original`、CC 計數皆保留
+
+### Phase 34 (P-γ) ✅ — `Pixiv_info._parse_payload` 拆
+- 抽 7 個 module-level helper（`_extract_artwork_body` / `_ai_type_label` / `_normalize_raw_tags_field` / `_tag_entry_to_str` / `_extract_artwork_tags` / `_extract_artwork_pagecount` / `_extract_artwork_img_url`）
+- `_parse_payload` body 從 56 行 → 11 行
+- lizard CCN：32 → 4
+- helper 全 A/B 級（A: 4-5, B: 6-9）
+- `Pixiv_info` 整體 radon CC 保持 19（外層 dispatch + `_fetch` 仍貢獻）
+- 行為等價：唯一差異是 `int(ai_type)` 多了 try/except（更 defensive，原本 raise 的 case 變回 None）
+- `tests/test_pixiv_api_cookie_requirement.py` 3 tests 全綠
+
+### 驗證
+- `pytest -m "not integration"`: **119 passed**
+- `pytest tests/test_pixiv_api_cookie_requirement.py`: **3 passed**
+
+### 待續
+- Phase 33: `download_thread.__init__` 21-param → `DownloadConfig` dataclass（自己做，跨 `run_actions.py`）
+- Phase 30 (P-α): `get_download_url` F=52 — 仍 blocked，需先補 golden test

@@ -818,17 +818,21 @@ class download_thread(PauseableThread):
             except Exception:
                 pass
 
-    def _convert_file_to_jxl(self, src_path):
-        if not self.jxl_enable:
-            return
-        if not src_path:
-            return
+    def _jxl_should_convert(self, src_path):
+        """Run all gating checks. Returns (proceed, dst_path, ext).
+
+        proceed=False means the orchestrator should return immediately. Side
+        effects: emits the one-shot cjxl-missing warning and handles the
+        "destination already exists" accounting + optional original deletion.
+        """
+        if not self.jxl_enable or not src_path:
+            return False, None, None
         src_path = str(src_path)
         ext = os.path.splitext(src_path)[1].lower()
         if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
-            return
+            return False, None, None
         if not os.path.isfile(src_path):
-            return
+            return False, None, None
         if not os.path.isfile(self.jxl_cjxl_path):
             if not self._jxl_path_warned:
                 self._jxl_path_warned = True
@@ -838,7 +842,7 @@ class download_thread(PauseableThread):
                     )
                 except Exception:
                     pass
-            return
+            return False, None, None
         dst_path = os.path.splitext(src_path)[0] + ".jxl"
         if os.path.isfile(dst_path):
             try:
@@ -847,7 +851,11 @@ class download_thread(PauseableThread):
                     os.remove(src_path)
             except Exception:
                 pass
-            return
+            return False, dst_path, ext
+        return True, dst_path, ext
+
+    def _jxl_run_conversion(self, src_path, dst_path, ext):
+        """Invoke cjxl with extension-aware retry. Returns (ok, reason)."""
         try:
             if ext == ".gif":
                 # GIF uses fixed short ASCII filename directly to avoid path/encoding failures.
@@ -865,9 +873,12 @@ class download_thread(PauseableThread):
                 reason = ""
             else:
                 reason = reason2 or reason
-        if (not ok) and ext == ".gif":
-            # Keep animation correctness: do not fallback to first-frame static conversion.
-            pass
+        # GIF intentionally does not fall back to first-frame static conversion
+        # so animation correctness is preserved.
+        return ok, reason
+
+    def _jxl_record_outcome(self, src_path, dst_path, ok, reason):
+        """Update counters, emit log lines and optionally delete the source."""
         if ok and os.path.isfile(dst_path):
             self._jxl_ok_count += 1
             saved_bytes = None
@@ -895,18 +906,26 @@ class download_thread(PauseableThread):
                     os.remove(src_path)
                 except Exception:
                     pass
-        else:
-            self._jxl_fail_count += 1
-            if len(reason) > 120:
-                reason = reason[:117] + "..."
-            if not reason:
-                reason = "cjxl conversion failed"
-            try:
-                self._output.emit(
-                    f"<p><font color='orange'>JXL 轉檔失敗：{os.path.basename(src_path)} ({reason})</font></p>"
-                )
-            except Exception:
-                pass
+            return
+        self._jxl_fail_count += 1
+        if len(reason) > 120:
+            reason = reason[:117] + "..."
+        if not reason:
+            reason = "cjxl conversion failed"
+        try:
+            self._output.emit(
+                f"<p><font color='orange'>JXL 轉檔失敗：{os.path.basename(src_path)} ({reason})</font></p>"
+            )
+        except Exception:
+            pass
+
+    def _convert_file_to_jxl(self, src_path):
+        proceed, dst_path, ext = self._jxl_should_convert(src_path)
+        if not proceed:
+            return
+        src_path = str(src_path)
+        ok, reason = self._jxl_run_conversion(src_path, dst_path, ext)
+        self._jxl_record_outcome(src_path, dst_path, ok, reason)
 
     def _normalize_ugoira_frames(self, frame_blobs):
         loaded_frames = []

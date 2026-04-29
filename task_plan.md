@@ -688,7 +688,7 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 
 **驗證：** `pytest -m "not integration"`: **119 passed**（+10 helper tests）
 
-### Phase 32 — _convert_file_to_jxl 三段拆 ⏸ pending
+### Phase 32 — _convert_file_to_jxl 三段拆 ✅
 **優先級: 🟢 LOW**  **位置:** `thread_download.py:736`（CC=34, 86 行）
 
 職責：副檔名 gating + 重試 + 成功/失敗計數 + log。拆 `_jxl_should_convert(path)` / `_jxl_run_conversion(path)` / `_jxl_record_outcome(...)`。
@@ -698,7 +698,7 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 
 `__init__` 經 Phase 21 抽過 legacy args 後仍 21 個 named params。建立 `@dataclass DownloadConfig` 一次傳入；同步改 `app/gui/run_actions.py` call site。**風險中-高**：影響跨檔 call site，需先 grep 所有實例化點並準備一次性遷移。
 
-### Phase 34 (P-γ) — Pixiv_info._parse_payload 拆 ⏸ pending
+### Phase 34 (P-γ) — Pixiv_info._parse_payload 拆 ✅
 **優先級: 🟢 LOW**  **位置:** `pixiv_api.py:562`（Pixiv_info CC=31）/ `:598`（_parse_payload CC=32）
 
 把 `_parse_payload` 56 行拆成 3 個小 parser：`_parse_normal_artwork(payload)` / `_parse_manga_payload(payload)` / `_parse_ugoira_payload(payload)`，各自回傳 `(tag, like, pagecount, img_url)` tuple。
