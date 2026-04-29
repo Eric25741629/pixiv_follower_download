@@ -611,6 +611,29 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 
 **前置條件：必須先補 golden test**（mock requests + 一組已知輸入/輸出對照）才能動，否則無法驗證行為等價。同 Phase 29-B 風險模式。
 
+### Phase 35 — UI Frameless 白底進度區可見性修正 ✅
+**優先級: 🔴 BUG**  **位置:** `app/gui/controller.py:640,670`
+
+**根因（Plan agent 回報）：** `WA_TranslucentBackground=True` + `QMainWindow{background:transparent}` + `QProgressBar` 完全沒在 stylesheet 裡 → progressBar 走 native 透明繪製，文字看不見。
+
+**修法（按風險小→大）：**
+1. 刪 `controller.py:640` `self.setAttribute(Qt.WA_TranslucentBackground, True)`（`qframelesswindow` 自己處理視窗形狀，不需要手動 translucent）
+2. 在 `controller.py:670` stylesheet 補 `QProgressBar` / `QProgressBar::chunk` / `QTabBar::tab` / `QSplitter::handle` / `QStatusBar` 規則
+
+### Phase 36 — Step 3 越跑越慢（O(N²) → O(N)） ✅
+**優先級: 🔴 BUG**  **位置:** `app/core/thread_url_fetch.py`
+
+**根因（Plan agent 回報）：** `_mark_pid_processed:989` 在 **每個 PID** 呼叫 `_persist_pending_pid_file:956`，內部 `sorted()` + `atomic_write_text(backup=True)` + `shutil.copy2` 整檔。總 I/O = O(N²/2)，N=10000 估算 300s+ 純磁碟開銷。
+
+**修法（最小化）：**
+1. 移除 `_mark_pid_processed:989` 的 `_persist_pending_pid_file()` 呼叫（只更新 in-memory set）
+2. `_run_processing_loop:1219` batch flush 區塊內加一次 `_persist_pending_pid_file()`，與既有 `_write_all_url_snapshot` 對齊每 100 PID
+3. `_persist_pending_pid_file:962` `backup=True` → `backup=False`（runtime pending 檔不需 history）
+4. `_write_all_url_file:746` 加 `backup=False` 參數預設、`_finalize_on_complete` 路徑保留 `backup=True`
+5. **保證 `_finalize_on_complete` 與 `closeEvent` 仍會 flush 一次** pending PID 與 all_url，避免中斷時資料遺失
+
+**預期：** 寫檔次數 N → N/100，磁碟 I/O 從 O(N²) 降為 O(N²/100) ≈ 100x 加速
+
 ### Phase 31-B — 統一本地快取（移除 pixiv_info_cache.json） ✅
 **優先級: 🟡 IMPORTANT**  **動機:** 使用者觀察到兩份本地快取檔做同一件事
 

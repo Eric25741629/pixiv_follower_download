@@ -636,10 +636,10 @@ class MainWindow_controller(FramelessMainWindow):
                 self.setWindowFlag(Qt.FramelessWindowHint, True)
             except Exception:
                 pass
-        try:
-            self.setAttribute(Qt.WA_TranslucentBackground, True)
-        except Exception:
-            pass
+        # Phase 35: WA_TranslucentBackground caused QProgressBar / QTabBar /
+        # QSplitter::handle to render with no background, hiding their text
+        # against the desktop. qframelesswindow handles the rounded shape
+        # itself so we no longer need this attribute.
         try:
             self.setWindowOpacity(0.995)
         except Exception:
@@ -671,6 +671,34 @@ class MainWindow_controller(FramelessMainWindow):
                     background: rgba(255, 255, 255, 245);
                     border: 1px solid rgba(120, 136, 165, 180);
                     border-radius: 8px;
+                }
+                QTabBar::tab {
+                    background: rgba(248, 251, 255, 235);
+                    border: 1px solid rgba(120, 136, 165, 160);
+                    padding: 4px 12px;
+                    color: #1f2937;
+                }
+                QTabBar::tab:selected {
+                    background: rgba(255, 255, 255, 250);
+                    border-bottom: 1px solid rgba(255, 255, 255, 250);
+                }
+                QSplitter::handle {
+                    background: rgba(248, 251, 255, 230);
+                }
+                QStatusBar {
+                    background: rgba(248, 251, 255, 235);
+                    color: #1f2937;
+                }
+                QProgressBar {
+                    background: rgba(255, 255, 255, 245);
+                    border: 1px solid rgba(120, 136, 165, 180);
+                    border-radius: 6px;
+                    text-align: center;
+                    color: #1f2937;
+                }
+                QProgressBar::chunk {
+                    background: rgba(74, 123, 255, 200);
+                    border-radius: 5px;
                 }
                 QGroupBox {
                     background: rgba(255, 255, 255, 245);
