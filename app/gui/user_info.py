@@ -40,6 +40,74 @@ class Userdata_controller:
         self._ui_rule_tag_2 = ui_rule_tag_2
         self._ui_rule_like_2 = ui_rule_like_2
 
+    # Schema: (widget_attr, setting_key, setter_name, caster, default, fallback_on_error)
+    # Used by load_data to drive widget population from the "download" section.
+    _LOAD_FIELDS = (
+        ("_ui_like_num", "like_num", "setValue", int, 0, 0),
+        ("_ui_r18_like_num", "r18_like_num", "setValue", int, 0, 0),
+        ("_ui_rule_tag_1", "rule_tag_1", "setText", lambda v: str(v).strip(), "", ""),
+        ("_ui_rule_like_1", "rule_like_1", "setValue", int, 0, 0),
+        ("_ui_rule_tag_2", "rule_tag_2", "setText", lambda v: str(v).strip(), "", ""),
+        ("_ui_rule_like_2", "rule_like_2", "setValue", int, 0, 0),
+    )
+
+    @staticmethod
+    def _apply_field(widget, setter_name, value, fallback):
+        """Call widget.<setter_name>(value); on failure fall back to fallback value."""
+        if widget is None:
+            return
+        try:
+            getattr(widget, setter_name)(value)
+        except Exception:
+            try:
+                getattr(widget, setter_name)(fallback)
+            except Exception:
+                pass
+
+    def _load_following(self):
+        """Populate self.Author_list from following.txt or following.json."""
+        following_json = self.path + r"/following.json"
+        following_txt = self.path + r"/following.txt"
+        if os.path.exists(following_txt):
+            with open(following_txt) as f:
+                self.Author_list = [line.rstrip() for line in f]
+            return
+        if not os.path.exists(following_json):
+            print("找不到following文件")
+            return
+        try:
+            with open(following_json, encoding="utf-8") as f:
+                data = json.load(f)
+            self.Author_list = [str(item) for item in data] if isinstance(data, list) else []
+        except Exception as err:
+            print(f"讀取 following.json 失敗：{err}")
+            self.Author_list = []
+
+    def _apply_download_section(self, d):
+        """Populate widgets and instance attrs from settings 'download' section."""
+        self.download_path = d.get("path", "") or os.path.expanduser("~/Pixiv_download/")
+        self._ui_user_path1.setText(self.download_path)
+        self.ban_tag = [t for t in d.get("ban_tag", []) if not str(t).isspace()]
+        self.must_tag = d.get("must_tag", [])
+        self.last_download_time = d.get("download_time", "")
+        self.like_num = d.get("like_num", 0)
+
+        for attr, key, setter, caster, default, fallback in self._LOAD_FIELDS:
+            widget = getattr(self, attr, None)
+            try:
+                value = caster(d.get(key, default))
+            except Exception:
+                value = fallback
+            self._apply_field(widget, setter, value, fallback)
+
+        if self.last_download_time == "":
+            self._ui_download_time.setDateTime(QDateTime.currentDateTime())
+        else:
+            self._ui_download_time.setDateTime(
+                QDateTime.fromString(self.last_download_time, "yyyy-MM-dd hh:mm:ss"))
+        self._ui_ban_tag_list.addItems(self.ban_tag)
+        self._ui_must_tag_list.addItems(self.must_tag)
+
     def load_data(self):
         self.path = os.getenv('APPDATA') + r'/pixiv_download/'
         if not os.path.exists(self.path):
@@ -47,69 +115,14 @@ class Userdata_controller:
 
         # exist_pid — use unified loader (handles migration from exist.json / txt)
         self.exist_pid = load_exist_pid_set(self.path)
-
-        # following artists list
-        following_json = self.path + r"/following.json"
-        following_txt = self.path + r"/following.txt"
-        if not os.path.exists(following_txt):
-            if os.path.exists(following_json):
-                try:
-                    with open(following_json, encoding="utf-8") as f:
-                        data = json.load(f)
-                    self.Author_list = [str(item) for item in data] if isinstance(data, list) else []
-                except Exception as err:
-                    print(f"讀取 following.json 失敗：{err}")
-                    self.Author_list = []
-            else:
-                print("找不到following文件")
-        else:
-            with open(following_txt) as f:
-                self.Author_list = [line.rstrip() for line in f]
+        self._load_following()
 
         # settings — via SettingsStore (auto-migrates legacy files)
         store = SettingsStore(self.path)
         store.migrate_from_legacy()
         d = store.get_section("download")
         try:
-            self.download_path = d.get("path", "") or os.path.expanduser("~/Pixiv_download/")
-            self._ui_user_path1.setText(self.download_path)
-            self.ban_tag = [t for t in d.get("ban_tag", []) if not str(t).isspace()]
-            self.must_tag = d.get("must_tag", [])
-            self.last_download_time = d.get("download_time", "")
-            self.like_num = d.get("like_num", 0)
-            self._ui_like_num.setValue(int(self.like_num))
-            if self._ui_r18_like_num is not None:
-                try:
-                    self._ui_r18_like_num.setValue(int(d.get("r18_like_num", 0)))
-                except Exception:
-                    self._ui_r18_like_num.setValue(0)
-            if self._ui_rule_tag_1 is not None:
-                try:
-                    self._ui_rule_tag_1.setText(str(d.get("rule_tag_1", "")).strip())
-                except Exception:
-                    self._ui_rule_tag_1.setText("")
-            if self._ui_rule_like_1 is not None:
-                try:
-                    self._ui_rule_like_1.setValue(int(d.get("rule_like_1", 0)))
-                except Exception:
-                    self._ui_rule_like_1.setValue(0)
-            if self._ui_rule_tag_2 is not None:
-                try:
-                    self._ui_rule_tag_2.setText(str(d.get("rule_tag_2", "")).strip())
-                except Exception:
-                    self._ui_rule_tag_2.setText("")
-            if self._ui_rule_like_2 is not None:
-                try:
-                    self._ui_rule_like_2.setValue(int(d.get("rule_like_2", 0)))
-                except Exception:
-                    self._ui_rule_like_2.setValue(0)
-            if self.last_download_time == "":
-                self._ui_download_time.setDateTime(QDateTime.currentDateTime())
-            else:
-                self._ui_download_time.setDateTime(
-                    QDateTime.fromString(self.last_download_time, "yyyy-MM-dd hh:mm:ss"))
-            self._ui_ban_tag_list.addItems(self.ban_tag)
-            self._ui_must_tag_list.addItems(self.must_tag)
+            self._apply_download_section(d)
         except Exception as err:
             print(err)
             self.download_path = os.path.expanduser("~/Pixiv_download/")
@@ -212,72 +225,55 @@ class othersettings:
         self._ui_jxl_effort = jxl_effort
         self.path = os.getenv('APPDATA') + r'/pixiv_download/'
 
+    # Schema: (widget_attr, section, key, setter_name, caster, default)
+    # Drives setinfo's widget population from SettingsStore sections.
+    _SETINFO_FIELDS = (
+        ("_ui_hidefollow", "filter", "hidefollow", "setChecked", bool, False),
+        ("_ui_nogif", "filter", "nogif", "setChecked", bool, False),
+        ("_ui_notag", "filter", "notag", "setChecked", bool, False),
+        ("_ui_notime", "filter", "notime", "setChecked", bool, False),
+        ("_ui_create_dir", "directory", "create_dir", "setChecked", bool, False),
+        ("_ui_no_R18G_dir", "directory", "no_R18G_dir", "setChecked", bool, False),
+        ("_ui_ai_gen_dir", "directory", "ai_gen_dir", "setChecked", bool, False),
+        ("_ui_single_thread_mode", "performance", "single_thread_mode", "setChecked", bool, False),
+        ("_ui_pid_wait_min", "performance", "pid_wait_min", "setValue", int, 10),
+        ("_ui_pid_wait_max", "performance", "pid_wait_max", "setValue", int, 60),
+        ("_ui_pid_wait_nocookie_min", "performance", "pid_wait_nocookie_min", "setValue", int, 1),
+        ("_ui_pid_wait_nocookie_max", "performance", "pid_wait_nocookie_max", "setValue", int, 6),
+        ("_ui_jxl_enable", "jxl", "enable", "setChecked", bool, False),
+        ("_ui_jxl_cjxl_path", "jxl", "cjxl_path", "setText", str, ""),
+        ("_ui_jxl_delete_original", "jxl", "delete_original", "setChecked", bool, False),
+        ("_ui_jxl_effort", "jxl", "effort", "setValue",
+            lambda v: max(1, min(9, int(v))), 7),
+    )
+
+    @staticmethod
+    def _apply_widget_value(widget, setter_name, value):
+        """Best-effort setter call: silently ignore when widget is None or call fails."""
+        if widget is None:
+            return
+        try:
+            getattr(widget, setter_name)(value)
+        except Exception:
+            pass
+
     def setinfo(self):
         try:
             store = SettingsStore(self.path)
             store.migrate_from_legacy()
-            f = store.get_section("filter")
-            d = store.get_section("directory")
-            p = store.get_section("performance")
-            j = store.get_section("jxl")
-
-            self._ui_hidefollow.setChecked(f.get("hidefollow", False))
-            self._ui_nogif.setChecked(f.get("nogif", False))
-            self._ui_notag.setChecked(f.get("notag", False))
-            self._ui_notime.setChecked(f.get("notime", False))
-            self._ui_create_dir.setChecked(d.get("create_dir", False))
-            self._ui_no_R18G_dir.setChecked(d.get("no_R18G_dir", False))
-            if self._ui_ai_gen_dir is not None:
+            sections = {
+                "filter": store.get_section("filter"),
+                "directory": store.get_section("directory"),
+                "performance": store.get_section("performance"),
+                "jxl": store.get_section("jxl"),
+            }
+            for attr, section, key, setter, caster, default in self._SETINFO_FIELDS:
+                widget = getattr(self, attr, None)
                 try:
-                    self._ui_ai_gen_dir.setChecked(bool(d.get("ai_gen_dir", False)))
+                    value = caster(sections[section].get(key, default))
                 except Exception:
-                    pass
-            if self._ui_single_thread_mode is not None:
-                try:
-                    self._ui_single_thread_mode.setChecked(bool(p.get("single_thread_mode", False)))
-                except Exception:
-                    pass
-            if self._ui_pid_wait_min is not None:
-                try:
-                    self._ui_pid_wait_min.setValue(int(p.get("pid_wait_min", 10)))
-                except Exception:
-                    pass
-            if self._ui_pid_wait_max is not None:
-                try:
-                    self._ui_pid_wait_max.setValue(int(p.get("pid_wait_max", 60)))
-                except Exception:
-                    pass
-            if self._ui_pid_wait_nocookie_min is not None:
-                try:
-                    self._ui_pid_wait_nocookie_min.setValue(int(p.get("pid_wait_nocookie_min", 1)))
-                except Exception:
-                    pass
-            if self._ui_pid_wait_nocookie_max is not None:
-                try:
-                    self._ui_pid_wait_nocookie_max.setValue(int(p.get("pid_wait_nocookie_max", 6)))
-                except Exception:
-                    pass
-            if self._ui_jxl_enable is not None:
-                try:
-                    self._ui_jxl_enable.setChecked(bool(j.get("enable", False)))
-                except Exception:
-                    pass
-            if self._ui_jxl_cjxl_path is not None:
-                try:
-                    self._ui_jxl_cjxl_path.setText(str(j.get("cjxl_path", "")))
-                except Exception:
-                    pass
-            if self._ui_jxl_delete_original is not None:
-                try:
-                    self._ui_jxl_delete_original.setChecked(bool(j.get("delete_original", False)))
-                except Exception:
-                    pass
-            if self._ui_jxl_effort is not None:
-                try:
-                    effort = max(1, min(9, int(j.get("effort", 7))))
-                    self._ui_jxl_effort.setValue(effort)
-                except Exception:
-                    pass
+                    value = default
+                self._apply_widget_value(widget, setter, value)
         except Exception:
             pass
 
