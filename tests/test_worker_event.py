@@ -1,5 +1,7 @@
 from pathlib import Path
 import sys
+import dataclasses
+import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -9,11 +11,8 @@ from app.core.worker_event import WorkerEvent
 
 def test_worker_event_is_frozen():
     ev = WorkerEvent("output", "hello")
-    try:
+    with pytest.raises(dataclasses.FrozenInstanceError):
         ev.type = "other"
-        assert False, "should be immutable"
-    except Exception:
-        pass
 
 
 def test_worker_event_fields():
