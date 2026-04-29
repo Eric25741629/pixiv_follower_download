@@ -35,8 +35,6 @@ def test_pixiv_info_normalizes_hashed_artwork_id_and_uses_numeric_ajax(monkeypat
         return DummyResponse(404, payload={"error": True}, text='{"error":true}')
 
     monkeypatch.setattr(pixiv_api.requests, "get", fake_get)
-    with pixiv_api._pixiv_info_cache_lock:
-        pixiv_api._pixiv_info_cache.clear()
 
     ret = pixiv_api.Pixiv_info(
         "https://www.pixiv.net/artworks/140234279-5e696ebeab5c07b269d3d2cdd620b201",
@@ -55,8 +53,6 @@ def test_pixiv_info_404_should_store_requires_cookie_none(monkeypatch, tmp_path)
         return DummyResponse(404, payload={"error": True}, text='{"error":true}')
 
     monkeypatch.setattr(pixiv_api.requests, "get", fake_get)
-    with pixiv_api._pixiv_info_cache_lock:
-        pixiv_api._pixiv_info_cache.clear()
 
     ret = pixiv_api.Pixiv_info(
         "https://www.pixiv.net/artworks/140234279-abcdef",

@@ -611,6 +611,42 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 
 **前置條件：必須先補 golden test**（mock requests + 一組已知輸入/輸出對照）才能動，否則無法驗證行為等價。同 Phase 29-B 風險模式。
 
+### Phase 31-B — 統一本地快取（移除 pixiv_info_cache.json） ✅
+**優先級: 🟡 IMPORTANT**  **動機:** 使用者觀察到兩份本地快取檔做同一件事
+
+**問題：** `Pixiv_info` 內部維護 `pixiv_info_cache.json`；step3 同時寫 `all_url_meta.json`。兩份 JSON 在 step3 完成後內容大致相同（後者是 superset，多 `requires_cookie`）。`download_thread` 在 Phase 31 已加 `_load_artwork_metadata` 把 `self.url_meta` 當第一層 cache → `pixiv_info_cache.json` 變成第二層多餘 fallback。
+
+**動作：**
+1. 刪除 `pixiv_api.py` 中：
+   - `_pixiv_info_cache` dict + locks
+   - `_pixiv_info_cache_path()` / `_load_pixiv_info_cache_from_disk()` / `_persist_pixiv_info_cache()`
+   - 模組載入時的 `_pixiv_info_cache.update(...)`（line 100-103）
+   - `Pixiv_info` 開頭的 cache check（line 572-594）
+   - `Pixiv_info` 結尾的 `_pixiv_info_cache[id] = ...` 與 `_persist_pixiv_info_cache(id, ...)` 寫入
+2. `Pixiv_info` 變成「純 HTTP fetch」，由呼叫端負責 cache（`download_thread._load_artwork_metadata` 已是這個模式）
+3. 既有的 `pixiv_info_cache.json` 在使用者磁碟上變成孤兒——加一次性 `trash_file()` 清理（或不動，自然失效）
+4. 不破壞 `Pixiv_info` 公開簽名
+
+**意涵：**
+- `all_url_meta.json` 變唯一 SoT
+- step3 的 `Pixiv_info` 呼叫不再寫 `pixiv_info_cache.json`，省一次 atomic_write
+- 若 `all_url_meta.json` 缺資料 → 直接 HTTP fetch（行為比之前更可預期）
+
+**驗證 ✅：**
+- `pytest -m "not integration"`: **119 passed**
+- `_pixiv_info_cache` / `pixiv_info_cache.json` 字串在 `app/` 全消
+- `Pixiv_info`: E (CC=31) → C (CC=19), −39%
+- `pixiv_api.py`: 890 → 802 行 (−88)
+
+**所有 `Pixiv_info` 呼叫點 cache-first 盤點：**
+- `thread_url_fetch.get_download_url:1412` (step3) ✅ 用 `self.url_meta`（line 1389-1397）
+- `thread_download` 三處 ✅ 用 `_load_artwork_metadata`（Phase 31）
+- `pixiv_api.get_download_url:458` ⚠️ 無 cache——但**不在主流程**（唯一外部 caller 是 `other/scripts/download_url.py` 孤兒腳本）
+
+**欄位無流失：** `all_url_meta.json` schema 是 `pixiv_info_cache.json` 的嚴格 superset（多 `requires_cookie`）。`tags ↔ tag`, `bookmarkCount ↔ like`, `pageCount ↔ pagecount`, `img_url ↔ img_url`，4 個欄位 1:1 對應。
+
+**孤兒檔自動清理：** `pixiv_info_cache.json` 加入 `settings_store.LEGACY_FILES`，下次啟動 SettingsStore 會 `trash_file()`。
+
 ### Phase 31 (P-β) — gif_download / jpg_download 抽共用 helper ✅
 **優先級: 🟡 IMPORTANT**
 

@@ -264,3 +264,16 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 
 ### 驗證
 - `pytest -m "not integration"`: **119 passed**（+10）
+
+### Phase 31-B ✅ — 統一本地快取
+- 使用者觀察：`Pixiv_info` 內部 `pixiv_info_cache.json` 與 step3 寫的 `all_url_meta.json` 是兩份做同樣事的本地檔
+- 動作：刪除 `pixiv_api.py` 中所有 `_pixiv_info_cache` / `_pixiv_info_cache_lock` / `_pixiv_info_cache_path` / `_load_pixiv_info_cache_from_disk` / `_persist_pixiv_info_cache` 共 ~70 行；`Pixiv_info` 開頭 cache check（22 行）+ 結尾 cache 寫入（5 行）也移除
+- 連帶移除 `import copy`（已無使用）
+- `Pixiv_info` 變純 HTTP fetch，cache 由呼叫端負責（download_thread 已是、step3 已是）
+- 孤兒檔 `pixiv_info_cache.json` 加進 `settings_store.LEGACY_FILES`，啟動時 trash
+- 修改 `tests/test_pixiv_api_cookie_requirement.py` 移除 `_pixiv_info_cache_lock` 引用
+- 量測：`Pixiv_info` E (31) → C (19), −39%；`pixiv_api.py` 890 → 802 行 (−88)
+- 欄位無流失（`all_url_meta.json` 是 `pixiv_info_cache.json` 的嚴格 superset）
+
+### 驗證（Phase 31-B）
+- `pytest -m "not integration"`: **119 passed**

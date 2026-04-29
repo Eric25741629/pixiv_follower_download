@@ -3,7 +3,6 @@ import os
 import random
 import threading
 import time
-import copy
 from random import random
 
 import bs4
@@ -44,63 +43,6 @@ else:
     option = None
 from pathlib import Path
 from app.core.pixiv_thread_utils import safe_json, safe_read_json
-
-# 快取同一程序內已查過的作品資訊，避免重複打 Pixiv API
-_pixiv_info_cache = {}
-_pixiv_info_cache_lock = threading.Lock()
-_pixiv_info_cache_file_lock = threading.Lock()
-
-
-def _pixiv_info_cache_path():
-    return os.path.join(os.getenv('APPDATA') + r'/pixiv_download/', 'pixiv_info_cache.json')
-
-
-def _load_pixiv_info_cache_from_disk():
-    cache = {}
-    try:
-        data = safe_read_json(_pixiv_info_cache_path(), {})
-        if isinstance(data, dict):
-            for pid, result in data.items():
-                if isinstance(result, list) and len(result) >= 4:
-                    cache[str(pid)] = copy.deepcopy(result)
-    except Exception:
-        cache = {}
-    return cache
-
-
-def _persist_pixiv_info_cache(pid, result):
-    try:
-        if not isinstance(result, list) or len(result) < 4:
-            return
-        cache_path = _pixiv_info_cache_path()
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with _pixiv_info_cache_file_lock:
-            cache = {}
-            if os.path.isfile(cache_path):
-                try:
-                    with open(cache_path, encoding='utf-8') as f:
-                        data = json.load(f)
-                    if isinstance(data, dict):
-                        cache = data
-                except Exception:
-                    cache = {}
-            cache[str(pid)] = copy.deepcopy(result)
-            try:
-                from safe_io import atomic_write_json
-                atomic_write_json(cache_path, cache, backup=True)
-            except Exception:
-                tmp = cache_path + '.tmp'
-                with open(tmp, 'w', encoding='utf-8') as f:
-                    json.dump(cache, f, ensure_ascii=False, indent=2)
-                os.replace(tmp, cache_path)
-    except Exception:
-        pass
-
-
-try:
-    _pixiv_info_cache.update(_load_pixiv_info_cache_from_disk())
-except Exception:
-    pass
 
 
 def _append_pixiv_info_history(trace_path, pid, trace_entry):
@@ -569,30 +511,6 @@ def Pixiv_info(url,
         if not str(id).isdigit():
             return [404]
 
-        # 先用 PID 快取，避免同一作品重複請求
-        try:
-            with _pixiv_info_cache_lock:
-                cached = _pixiv_info_cache.get(str(id))
-            if cached is not None:
-                cached_entry = {
-                    'artwork_url': 'https://www.pixiv.net/artworks/' + str(id),
-                    'pid': str(id),
-                    'source': 'cache',
-                    'checked_at': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                    'result_preview': {
-                        'tags_len': len(cached[0]) if isinstance(cached, list) and len(cached) >= 1 and isinstance(cached[0], list) else 0,
-                        'bookmarkCount': cached[1] if isinstance(cached, list) and len(cached) >= 2 else 0,
-                        'pageCount': cached[2] if isinstance(cached, list) and len(cached) >= 3 else 0,
-                        'img_url': cached[3] if isinstance(cached, list) and len(cached) >= 4 else None,
-                    },
-                }
-                trace_path = os.path.join(os.getenv('APPDATA')+r'/pixiv_download/', 'pixiv_cookie_requirement.json')
-                _append_pixiv_info_history(trace_path, id, cached_entry)
-                _persist_pixiv_info_cache(id, cached)
-                return copy.deepcopy(cached)
-        except Exception:
-            pass
-
         ajax_url='https://www.pixiv.net/ajax/illust/'+id
 
         def _parse_payload(payload):
@@ -725,12 +643,6 @@ def Pixiv_info(url,
         except Exception:
             pass
 
-        try:
-            with _pixiv_info_cache_lock:
-                _pixiv_info_cache[str(id)] = copy.deepcopy(final_result)
-        except Exception:
-            pass
-        _persist_pixiv_info_cache(id, final_result)
         return final_result
 
 def get_pixiv_cookie_requirement(pid):

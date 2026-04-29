@@ -69,6 +69,9 @@ LEGACY_FILES = [
     "othersettings.json",
     "cookies.json",
     "pass.json",
+    # Phase 31-B: pixiv_info_cache.json was a duplicate of all_url_meta.json.
+    # Trashed on next launch; all_url_meta.json is now the sole metadata cache.
+    "pixiv_info_cache.json",
 ]
 
 
