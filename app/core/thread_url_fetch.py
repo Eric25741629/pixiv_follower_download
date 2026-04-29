@@ -954,12 +954,21 @@ class get_img_url_thread(PauseableThread):
         return candidates[0]
 
     def _persist_pending_pid_file(self):
+        """Flush the pending-PID set to disk.
+
+        Phase 36: this used to be called per-PID with backup=True, costing
+        O(N^2) total disk I/O (sort + atomic_write_text + shutil.copy2 of the
+        whole file each time). It now runs only on the every-100-PID batch
+        flush in ``_run_processing_loop`` and on finalize, with backup=False
+        because pictures_id.txt is a runtime pending-list, not user data
+        worth keeping in history/.
+        """
         try:
             lines = sorted(
                 [str(x) for x in (self._pending_pid_remaining or set()) if str(x).strip()],
                 key=lambda s: int(s) if str(s).isdigit() else str(s),
             )
-            atomic_write_text(self._pending_pid_file_path, lines, backup=True)
+            atomic_write_text(self._pending_pid_file_path, lines, backup=False)
         except Exception:
             pass
 
@@ -978,15 +987,15 @@ class get_img_url_thread(PauseableThread):
         self._persist_pending_pid_file()
 
     def _mark_pid_processed(self, pid):
+        """Phase 36: only update the in-memory set; the disk flush happens
+        on the every-100-PID batch boundary in ``_run_processing_loop`` and
+        on finalize. Per-PID disk writes here were O(N^2)."""
         pid_key = normalize_pid(pid)
         if not pid_key:
             return
         try:
             with self._pending_pid_lock:
-                if pid_key not in self._pending_pid_remaining:
-                    return
-                self._pending_pid_remaining.remove(pid_key)
-                self._persist_pending_pid_file()
+                self._pending_pid_remaining.discard(pid_key)
         except Exception:
             pass
 
@@ -1220,6 +1229,7 @@ class get_img_url_thread(PauseableThread):
                 flat_results = [x for item in results if isinstance(item, list) for x in item]
                 old_urls, new_urls, merged = self._write_all_url_snapshot(flat_results)
                 self._flush_url_meta_snapshot()
+                self._persist_pending_pid_file()  # Phase 36: batch-aligned with all_url flush
                 self._diag(
                     "step3_batch_flush",
                     index=processed_count,
@@ -1244,6 +1254,7 @@ class get_img_url_thread(PauseableThread):
             flat_results = [x for item in results if isinstance(item, list) for x in item]
             old_urls, new_urls, merged = self._write_all_url_snapshot(flat_results)
             self._flush_url_meta_snapshot()
+            self._persist_pending_pid_file()  # Phase 36: ensure pending list is saved on stop
             self._flush_revoked_pid_file()
             self._emit_step3_filter_skip_final_summary()
             self._emit_step3_query_final_summary(final=True)
@@ -1265,6 +1276,7 @@ class get_img_url_thread(PauseableThread):
         error_pid = [i for i in results if 'https' not in i]
         results = [i for i in results if 'https' in i]
         old_urls, new_urls, merged = self._write_all_url_snapshot(results)
+        self._persist_pending_pid_file()  # Phase 36: flush remaining pending PIDs
         self._diag(
             "step3_completed",
             old_count=len(old_urls),

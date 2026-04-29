@@ -277,3 +277,34 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 
 ### 驗證（Phase 31-B）
 - `pytest -m "not integration"`: **119 passed**
+
+---
+
+## Session 8 — 2026-04-29 (UI bug + perf bug，兩個 agent 平行調查)
+
+兩個 Plan agent 平行跑：
+- Agent A：UI Frameless 進度區看不見
+- Agent B：Step 3 越跑越慢
+
+詳細根因與證據存在 `findings.md` Session 7 兩個區段。
+
+### Phase 35 ✅ — UI Frameless 白底進度區可見性
+**根因：** `WA_TranslucentBackground=True` + `QProgressBar` 完全不在 stylesheet 內 → native ProgressBar 透明繪製、文字看不見。
+
+**修法：**
+- 刪 `controller.py:640` `setAttribute(Qt.WA_TranslucentBackground, True)`（`qframelesswindow` 自己處理視窗形狀）
+- `controller.py:670` 補 `QProgressBar` / `QProgressBar::chunk` / `QTabBar::tab` / `QSplitter::handle` / `QStatusBar` 規則
+
+### Phase 36 ✅ — Step 3 O(N²) → O(N) 寫檔
+**根因：** `_mark_pid_processed:989` 對**每個 PID** 呼叫 `_persist_pending_pid_file:956`，內部 `sorted()` + `atomic_write_text(backup=True)` + `shutil.copy2` 整檔。N=10000 估算 300+ 秒純磁碟開銷。
+
+**修法：**
+- 移除 `_mark_pid_processed` 內的 disk write（只 `discard()` in-memory set）
+- `_run_processing_loop:1232` batch flush 區塊加 `_persist_pending_pid_file()`（與 100-PID 對齊）
+- `_finalize_on_complete:1279` 與 `_finalize_on_stop:1257` 也補一次 flush（中斷不丟資料）
+- `_persist_pending_pid_file` 改 `backup=False`（runtime pending 檔不需 history）
+
+**預期：** 寫檔次數 N → N/100，磁碟 I/O 降 ~100x。
+
+### 驗證
+- `pytest -m "not integration"`: **119 passed**
