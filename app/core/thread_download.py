@@ -1468,7 +1468,13 @@ class download_thread(PauseableThread):
                         failed_nested.append([])
         return failed_nested
 
-    def _finalize_downloads(self, failed_nested):
+    @staticmethod
+    def _classify_download_results(failed_nested):
+        """Flatten nested worker results into ``(url_text, info_text)`` fail records.
+
+        Filters out ``0`` sentinels and ``None`` entries; tolerates list/tuple/str
+        shapes returned by the per-PID workers.
+        """
         results = [i for item in failed_nested if isinstance(item, list) for i in item if i != 0]
         fail_records = []
         for item in results:
@@ -1483,12 +1489,10 @@ class download_thread(PauseableThread):
                 continue
             else:
                 fail_records.append((str(item), ""))
-        if fail_records:
-            err_lines = [f"{url_text} {info_text}" for url_text, info_text in fail_records]
-            atomic_write_text(self.path + "/err_url.txt", err_lines, backup=False)
-        self._diag("step4_fail_records", fail_record_count=len(fail_records))
-        stop_to_download = [self.q.get() for _ in range(self.q.qsize())]
-        failed_to_download = []
+        return fail_records
+
+    def _compute_remaining_urls(self, stop_to_download, fail_records):
+        """Merge stop-queue URLs, failed http URLs, and unattempted URLs (deduped)."""
         try:
             failed_to_download = [str(url_text) for (url_text, _info) in fail_records if str(url_text).startswith('http')]
         except Exception:
@@ -1514,11 +1518,10 @@ class download_thread(PauseableThread):
             remaining_count=len(remaining_urls),
             attempted_count=len(attempted_snapshot),
         )
-        self._write_all_url_file(remaining_urls, reason="step4_remaining")
-        try:
-            self._output.emit(f"<p><font color='gray'>已更新 all_url.txt，剩餘 {len(remaining_urls)} 筆待下載</font></p>")
-        except Exception:
-            pass
+        return remaining_urls
+
+    def _persist_url_meta(self):
+        """Best-effort save of ``self.url_meta`` (atomic with backup, raw fallback)."""
         try:
             try:
                 from safe_io import atomic_write_json
@@ -1528,6 +1531,21 @@ class download_thread(PauseableThread):
                     json.dump(self.url_meta, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    def _finalize_downloads(self, failed_nested):
+        fail_records = self._classify_download_results(failed_nested)
+        if fail_records:
+            err_lines = [f"{url_text} {info_text}" for url_text, info_text in fail_records]
+            atomic_write_text(self.path + "/err_url.txt", err_lines, backup=False)
+        self._diag("step4_fail_records", fail_record_count=len(fail_records))
+        stop_to_download = [self.q.get() for _ in range(self.q.qsize())]
+        remaining_urls = self._compute_remaining_urls(stop_to_download, fail_records)
+        self._write_all_url_file(remaining_urls, reason="step4_remaining")
+        try:
+            self._output.emit(f"<p><font color='gray'>已更新 all_url.txt，剩餘 {len(remaining_urls)} 筆待下載</font></p>")
+        except Exception:
+            pass
+        self._persist_url_meta()
         return remaining_urls
 
     def _refresh_and_write_exist_pid(self):
