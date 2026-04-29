@@ -410,6 +410,109 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         else:
             self._thenext.emit(3)
             self._finished.emit('抓取所有PID完成')
+    def _step2_fetch_artist_pid_list(self, author_pids, cookie, Agent):
+        '''發送單一畫師的 profile/all 請求並回傳 PID list（dict→keys / list→原值 / 其它→[]）'''
+        url = 'https://www.pixiv.net/ajax/user/' + author_pids + '/profile/all?lang=zh%27'
+        headers = {
+            'User-Agent': Agent,
+            'Cookie': cookie,
+            'referer': 'https://www.pixiv.net/users/' + author_pids,
+        }
+        res = requests.get(url, headers=headers, timeout=(10, 30))
+        resdicts = safe_json(res, 'body', 'illusts', default={})
+        if isinstance(resdicts, dict):
+            return [key for key in resdicts.keys()]
+        if isinstance(resdicts, list):
+            return list(resdicts)
+        return []
+
+    def _step2_emit_incremental_status(self, author_pids, pid_stats):
+        '''依 pid_stats 標記輸出截斷或回退提示（吞例外）'''
+        if pid_stats.get("used_cutoff"):
+            try:
+                self._output.emit(
+                    "<p><font color='gray'>[PID增量] 畫師 {} 命中既有 PID {}，提前截斷：保留最新 {} 筆，略過 {} 筆舊資料</font></p>".format(
+                        author_pids,
+                        pid_stats.get("boundary_pid", ""),
+                        pid_stats.get("kept_count", 0),
+                        pid_stats.get("truncated_count", 0),
+                    )
+                )
+            except Exception:
+                pass
+        elif pid_stats.get("fallback_full_scan"):
+            try:
+                self._output.emit(
+                    "<p><font color='gray'>[PID增量] 畫師 {} 偵測到非數字 PID，已回退為全量掃描（{} 筆）</font></p>".format(
+                        author_pids,
+                        pid_stats.get("input_count", 0),
+                    )
+                )
+            except Exception:
+                pass
+
+    def _step2_record_skipped_pids(self, step2_skipped_pid):
+        '''把增量略過的 PID 加進 _step2_early_skip_pids（線程安全，吞例外）'''
+        try:
+            if step2_skipped_pid:
+                with self._step2_skip_lock:
+                    for spid in step2_skipped_pid:
+                        text = str(spid).strip()
+                        if text:
+                            self._step2_early_skip_pids.add(text)
+        except Exception:
+            pass
+
+    def _step2_append_new_pids(self, pid):
+        '''把新 PID 追加到 _collected_pids，並更新 _seen_pids（避免跨 worker 重複，吞例外）'''
+        try:
+            new_pids = [p for p in pid if p not in getattr(self, '_seen_pids', set())]
+            if not new_pids:
+                return
+            try:
+                with self._collected_pids_lock:
+                    for npid in new_pids:
+                        if npid in self._seen_pids:
+                            continue
+                        self._collected_pids.append(npid)
+                        try:
+                            with self._pid_file_lock:
+                                self._seen_pids.add(npid)
+                        except Exception:
+                            try:
+                                self._seen_pids.add(npid)
+                            except Exception:
+                                pass
+            except Exception as e:
+                try:
+                    self._output.emit(f"<p><font color='red'>寫入 pictures_id 失敗：{e}</font></p>")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _step2_record_author_progress(self, author_pids):
+        '''記錄作者已完成抓取時間（線程安全，吞例外）'''
+        try:
+            ts = datetime.datetime.now().isoformat()
+            try:
+                with self._progress_updates_lock:
+                    self._progress_updates.append((str(author_pids), ts))
+            except Exception:
+                self._progress_updates.append((str(author_pids), ts))
+        except Exception:
+            try:
+                self._output.emit("<p><font color='red'>記錄作者進度失敗</font></p>")
+            except Exception:
+                pass
+
+    def _step2_record_artist_failure(self, author_pids, path, num, err):
+        '''發生例外時把作者 ID 寫入 authorPids_err{num}.txt'''
+        print(err)
+        f = open((path + "authorPids_err" + str(num) + ".txt"), "a+")
+        f.write(author_pids + '\n')
+        f.close()
+
     def thread_no_use_seleium_get_pid(self,cookie,Agent,path,num,author_pids):
         global pid_num
         global pid_len
@@ -423,99 +526,15 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         if(pid_num%10==0):
             self._output.emit(f"<p><font color='black'>PID progress: {pid_num}</font></p>")
         try:
-            url='https://www.pixiv.net/ajax/user/'+author_pids+'/profile/all?lang=zh%27'
-            headers = {
-            'User-Agent': Agent,
-            'Cookie':cookie
-            ,'referer': 'https://www.pixiv.net/users/'+author_pids,        
-            }
-            res = requests.get(url, headers=headers, timeout=(10, 30))
-            resdicts = safe_json(res, 'body', 'illusts', default={})
-            if isinstance(resdicts, dict):
-                pid = [key for key in resdicts.keys()]
-            elif isinstance(resdicts, list):
-                pid = list(resdicts)
-            else:
-                pid = []
-
+            pid = self._step2_fetch_artist_pid_list(author_pids, cookie, Agent)
             pid, step2_skipped_pid, pid_stats = self._collect_step2_incremental_pid(pid)
-            if pid_stats.get("used_cutoff"):
-                try:
-                    self._output.emit(
-                        "<p><font color='gray'>[PID增量] 畫師 {} 命中既有 PID {}，提前截斷：保留最新 {} 筆，略過 {} 筆舊資料</font></p>".format(
-                            author_pids,
-                            pid_stats.get("boundary_pid", ""),
-                            pid_stats.get("kept_count", 0),
-                            pid_stats.get("truncated_count", 0),
-                        )
-                    )
-                except Exception:
-                    pass
-            elif pid_stats.get("fallback_full_scan"):
-                try:
-                    self._output.emit(
-                        "<p><font color='gray'>[PID增量] 畫師 {} 偵測到非數字 PID，已回退為全量掃描（{} 筆）</font></p>".format(
-                            author_pids,
-                            pid_stats.get("input_count", 0),
-                        )
-                    )
-                except Exception:
-                    pass
-            try:
-                if step2_skipped_pid:
-                    with self._step2_skip_lock:
-                        for spid in step2_skipped_pid:
-                            text = str(spid).strip()
-                            if text:
-                                self._step2_early_skip_pids.add(text)
-            except Exception:
-                pass
-            # filter out existing and already-seen pids for incremental append
-            try:
-                # 只追加新的 PID，避免與既有資料重複
-                new_pids = [p for p in pid if p not in getattr(self, '_seen_pids', set())]
-                if new_pids:
-                    try:
-                        with self._collected_pids_lock:
-                            for npid in new_pids:
-                                # avoid duplicates across workers
-                                if npid in self._seen_pids:
-                                    continue
-                                self._collected_pids.append(npid)
-                                try:
-                                    with self._pid_file_lock:
-                                        self._seen_pids.add(npid)
-                                except Exception:
-                                    try:
-                                        self._seen_pids.add(npid)
-                                    except Exception:
-                                        pass
-                    except Exception as e:
-                        try:
-                            self._output.emit(f"<p><font color='red'>寫入 pictures_id 失敗：{e}</font></p>")
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            # 記錄作者已完成抓取時間，供下次增量判斷
-            try:
-                ts = datetime.datetime.now().isoformat()
-                try:
-                    with self._progress_updates_lock:
-                        self._progress_updates.append((str(author_pids), ts))
-                except Exception:
-                    # best-effort append
-                    self._progress_updates.append((str(author_pids), ts))
-            except Exception:
-                try:
-                    self._output.emit("<p><font color='red'>記錄作者進度失敗</font></p>")
-                except Exception:
-                    pass
+            self._step2_emit_incremental_status(author_pids, pid_stats)
+            self._step2_record_skipped_pids(step2_skipped_pid)
+            self._step2_append_new_pids(pid)
+            self._step2_record_author_progress(author_pids)
             return pid
         except Exception as err:
-            print(err)
-            f = open((path+"authorPids_err"+str(num)+".txt"), "a+")
-            f.write(author_pids+'\n')
-            f.close() 
-        
+            self._step2_record_artist_failure(author_pids, path, num, err)
+
+
 
