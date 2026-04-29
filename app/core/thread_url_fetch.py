@@ -1362,6 +1362,114 @@ class get_img_url_thread(PauseableThread):
             self._output.emit('Task failed')
             self._output.emit(output_err(e))
             self._thenext.emit(-1)
+
+    def _step3_advance_progress(self):
+        """Advance step 3 progress counter and emit progress signal unless stopped.
+
+        Mirrors the repeated `if self._isPause!=2: self.pid_now+=1; self._signal.emit(1,self.pid_max)`
+        pattern used at the end of every PID resolution branch in `get_download_url`.
+        """
+        if self._isPause != 2:
+            self.pid_now = self.pid_now + 1
+            self._signal.emit(1, self.pid_max)
+
+    def _step3_extract_meta_from_cache(self, cached):
+        """Unpack a cached url_meta entry into the (tag, like, pagecount, img_url, need_cookie)
+        tuple expected by `get_download_url`. Pure dict reads; no side effects."""
+        tag = cached.get('tag', [])
+        like = cached.get('like', 0)
+        pagecount = int(cached.get('pagecount', 1) or 1)
+        img_url = cached.get('img_url')
+        need_cookie = cached.get('requires_cookie', None)
+        return tag, like, pagecount, img_url, need_cookie
+
+    def _step3_safe_emit(self, html):
+        """Emit `html` on `_output`, swallowing any signal-emit exception.
+
+        Mirrors the inline `try: self._output.emit(...) except Exception: pass` blocks
+        that appear repeatedly inside `get_download_url`."""
+        try:
+            self._output.emit(html)
+        except Exception:
+            pass
+
+    def _step3_finalize_query(self, ret_value, query_source, need_cookie, wait_applied):
+        """Record the step 3 query outcome and return `ret_value`.
+
+        Extracted from the `_finalize` closure inside `get_download_url`. Wraps
+        `_record_step3_query_result` in try/except so any bookkeeping failure does not
+        propagate (matches original behavior).
+        """
+        try:
+            self._record_step3_query_result(
+                query_source,
+                need_cookie=need_cookie,
+                wait_applied=bool(wait_applied),
+            )
+        except Exception:
+            pass
+        return ret_value
+
+    def _step3_safe_cookie_requirement(self, pid_key):
+        """Return the persisted cookie-requirement fallback for pid_key (or None on any error).
+        Mirrors the inline try/except previously inside `get_download_url`."""
+        try:
+            return self._cookie_requirement_map.get(pid_key, None)
+        except Exception:
+            return None
+
+    def _step3_record_filter_result(self, pid_key, passed, reason):
+        """Annotate the url_meta entry for pid_key with the filter outcome.
+        Best-effort: any exception is swallowed (matches the original inline try/except)."""
+        try:
+            if isinstance(self.url_meta.get(pid_key), dict):
+                self.url_meta[pid_key]["filter_pass"] = bool(passed)
+                self.url_meta[pid_key]["filter_reason"] = str(reason)
+        except Exception:
+            pass
+
+    def _step3_build_pid_download_urls(self, img_url, pagecount):
+        """Construct the multi-page download URL list for a PID.
+
+        Returns a list[str] of per-page URLs on success, or None if the original
+        try/except in `get_download_url` would have caught an exception (caller then
+        takes the `[str(pid_key)]` skip-and-record-pid path).
+        """
+        try:
+            img = str(img_url).rsplit(".", 1)
+            page_total = int(pagecount) if int(pagecount) > 0 else 1
+            urls = []
+            for count in range(0, page_total):
+                urls.append(img[0] + str(count) + "." + img[1])
+            return urls
+        except Exception:
+            return None
+
+    def _step3_build_url_meta_entry(self, pid_key, tag, like, pagecount, img_url,
+                                     need_cookie, artwork_url, query_source):
+        """Write the url_meta entry for a successfully resolved PID. Wrapped in try/except
+        to preserve the original best-effort semantics (failures must not abort the workflow)."""
+        try:
+            self.url_meta[pid_key] = {
+                "tag": tag if isinstance(tag, list) else [],
+                "like": int(like) if str(like).isdigit() else like,
+                "pagecount": int(pagecount) if str(pagecount).isdigit() else pagecount,
+                "img_url": img_url,
+                "requires_cookie": need_cookie,
+                "artwork_url": artwork_url,
+                "pixiv_info": {
+                    "tag": tag if isinstance(tag, list) else [],
+                    "like": int(like) if str(like).isdigit() else like,
+                    "pagecount": int(pagecount) if str(pagecount).isdigit() else pagecount,
+                    "img_url": img_url,
+                    "requires_cookie": need_cookie,
+                    "queried_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "source": query_source,
+                },
+            }
+        except Exception:
+            pass
+
     def get_download_url(self,path,Agent,num,pid):    # 取得單一作品的下載 URL
         while (self._isPause==1):
             time.sleep(1)
@@ -1376,24 +1484,11 @@ class get_img_url_thread(PauseableThread):
         need_cookie = None
 
         def _finalize(ret_value, wait_applied=False):
-            try:
-                self._record_step3_query_result(
-                    query_source,
-                    need_cookie=need_cookie,
-                    wait_applied=bool(wait_applied),
-                )
-            except Exception:
-                pass
-            return ret_value
+            return self._step3_finalize_query(ret_value, query_source, need_cookie, wait_applied)
 
         if pid_key in self.exist_pid:
-            try:
-                self._output.emit(f"<p><font color='gray'>PID {pid_key} 已存在於 exist_pid，URL階段自動跳過</font></p>")
-            except Exception:
-                pass
-            if self._isPause!=2:
-                self.pid_now=self.pid_now+1
-                self._signal.emit(1,self.pid_max)
+            self._step3_safe_emit(f"<p><font color='gray'>PID {pid_key} 已存在於 exist_pid，URL階段自動跳過</font></p>")
+            self._step3_advance_progress()
             return _finalize([])
         download_url=[]
         url='https://www.pixiv.net/artworks/'+pid_key
@@ -1402,17 +1497,10 @@ class get_img_url_thread(PauseableThread):
         if isinstance(cached, dict) and cached.get('img_url') not in (None, 'None', '') and int(cached.get('pagecount', 0) or 0) > 0:
             self._pid_cache_hit[pid_key] = True
             query_source = "cache"
-            tag = cached.get('tag', [])
-            like = cached.get('like', 0)
-            pagecount = int(cached.get('pagecount', 1) or 1)
-            img_url = cached.get('img_url')
-            need_cookie = cached.get('requires_cookie', None)
+            tag, like, pagecount, img_url, need_cookie = self._step3_extract_meta_from_cache(cached)
             need_cookie = self._refresh_cookie_requirement(pid_key, fallback=need_cookie)
             if self.single_mode_flag and bool(getattr(self, "_log_step3_cache_detail", False)):
-                try:
-                    self._output.emit(f"<p><font color='gray'>[URL階段] PID {pid_key} 使用本地快取，跳過等待</font></p>")
-                except Exception:
-                    pass
+                self._step3_safe_emit(f"<p><font color='gray'>[URL階段] PID {pid_key} 使用本地快取，跳過等待</font></p>")
         else:
             self._pid_cache_hit[pid_key] = False
             should_wait = True
@@ -1425,100 +1513,55 @@ class get_img_url_thread(PauseableThread):
                 else:
                     info = Pixiv_info(url, Agent=Agent)
             except Exception as e:
-                try:
-                    self._output.emit(f"<p><font color='red'>PID {pid_key} 取得資訊失敗：{e}</font></p>")
-                except Exception:
-                    pass
+                self._step3_safe_emit(f"<p><font color='red'>PID {pid_key} 取得資訊失敗：{e}</font></p>")
                 if should_wait:
                     self._sleep_ultra_slow(pid_key, need_cookie=None)
-                if self._isPause!=2:
-                    self.pid_now=self.pid_now+1
-                    self._signal.emit(1,self.pid_max)
+                self._step3_advance_progress()
                 return _finalize([str(pid_key)], wait_applied=bool(should_wait))
             if info == [404]:
                 self._mark_revoked_pid(pid_key, reason="404")
                 if should_wait:
                     self._sleep_ultra_slow(pid_key, need_cookie=None)
-                if self._isPause!=2:
-                    self.pid_now=self.pid_now+1
-                    self._signal.emit(1,self.pid_max)
+                self._step3_advance_progress()
                 return _finalize([str(pid_key)], wait_applied=bool(should_wait))
             try:
                 tag,like,pagecount,img_url = info
             except Exception:
                 if should_wait:
                     self._sleep_ultra_slow(pid_key, need_cookie=None)
-                if self._isPause!=2:
-                    self.pid_now=self.pid_now+1
-                    self._signal.emit(1,self.pid_max)
+                self._step3_advance_progress()
                 return _finalize([str(pid_key)], wait_applied=bool(should_wait))
-            try:
-                fallback_req = self._cookie_requirement_map.get(pid_key, None)
-            except Exception:
-                fallback_req = None
+            fallback_req = self._step3_safe_cookie_requirement(pid_key)
             need_cookie = self._refresh_cookie_requirement(pid_key, fallback=fallback_req)
 
-        try:
-            query_source = "cache" if bool(self._pid_cache_hit.get(pid_key, False)) else "network"
-            self.url_meta[pid_key] = {
-                "tag": tag if isinstance(tag, list) else [],
-                "like": int(like) if str(like).isdigit() else like,
-                "pagecount": int(pagecount) if str(pagecount).isdigit() else pagecount,
-                "img_url": img_url,
-                "requires_cookie": need_cookie,
-                "artwork_url": url,
-                "pixiv_info": {
-                    "tag": tag if isinstance(tag, list) else [],
-                    "like": int(like) if str(like).isdigit() else like,
-                    "pagecount": int(pagecount) if str(pagecount).isdigit() else pagecount,
-                    "img_url": img_url,
-                    "requires_cookie": need_cookie,
-                    "queried_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "source": query_source,
-                },
-            }
-        except Exception:
-            pass
+        query_source = "cache" if bool(self._pid_cache_hit.get(pid_key, False)) else "network"
+        self._step3_build_url_meta_entry(
+            pid_key, tag, like, pagecount, img_url, need_cookie, url, query_source,
+        )
 
         passed, reason = self._passes_artwork_filters(pid_key, tag, like)
-        try:
-            if isinstance(self.url_meta.get(pid_key), dict):
-                self.url_meta[pid_key]["filter_pass"] = bool(passed)
-                self.url_meta[pid_key]["filter_reason"] = str(reason)
-        except Exception:
-            pass
+        self._step3_record_filter_result(pid_key, passed, reason)
         if not passed:
             if should_wait:
                 self._sleep_ultra_slow(pid_key, need_cookie=need_cookie)
-            if self._isPause!=2:
-                self.pid_now=self.pid_now+1
-                self._signal.emit(1,self.pid_max)
+            self._step3_advance_progress()
             return _finalize([], wait_applied=bool(should_wait))
 
         if not img_url or str(img_url) == 'None':
             if should_wait:
                 self._sleep_ultra_slow(pid_key, need_cookie=need_cookie)
-            if self._isPause!=2:
-                self.pid_now=self.pid_now+1
-                self._signal.emit(1,self.pid_max)
+            self._step3_advance_progress()
             return _finalize([str(pid_key)], wait_applied=bool(should_wait))
-        try:
-            img = str(img_url).rsplit(".",1)
-            page_total = int(pagecount) if int(pagecount) > 0 else 1
-            for count in range(0, page_total):
-                download_url.append(img[0]+str(count)+"."+img[1])
-        except Exception:
+        built_urls = self._step3_build_pid_download_urls(img_url, pagecount)
+        if built_urls is None:
             if should_wait:
                 self._sleep_ultra_slow(pid_key, need_cookie=need_cookie)
-            if self._isPause!=2:
-                self.pid_now=self.pid_now+1
-                self._signal.emit(1,self.pid_max)
+            self._step3_advance_progress()
             return _finalize([str(pid_key)], wait_applied=bool(should_wait))
+        download_url.extend(built_urls)
         if should_wait:
             self._sleep_ultra_slow(pid_key, need_cookie=need_cookie)
-        if self._isPause!=2:
-            self.pid_now=self.pid_now+1
-            self._signal.emit(1,self.pid_max)
+        self._step3_advance_progress()
 
         # for x in range(0,2):
         #     try:
