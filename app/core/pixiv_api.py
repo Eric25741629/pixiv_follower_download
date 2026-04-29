@@ -45,6 +45,104 @@ from pathlib import Path
 from app.core.pixiv_thread_utils import safe_json, safe_read_json
 
 
+def _extract_artwork_body(payload):
+    """從 Pixiv ajax 回傳的 payload 中萃取 body dict。
+
+    payload['body'] 可能是 dict、list 或缺失；統一回傳 dict（最差情況為空 dict）。
+    """
+    if not isinstance(payload, dict):
+        return {}
+    body = payload.get('body', {})
+    if isinstance(body, list):
+        body = body[0] if (len(body) > 0 and isinstance(body[0], dict)) else {}
+    if not isinstance(body, dict):
+        body = {}
+    return body
+
+
+def _ai_type_label(body):
+    """aiType==2 時回傳 'AI生成'，否則回傳 None。"""
+    ai_type = body.get('aiType', None)
+    if ai_type is None:
+        return None
+    try:
+        if int(ai_type) == 2:
+            return 'AI生成'
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _normalize_raw_tags_field(body):
+    """把 body['tags'] 統一成 list；可能來源是 list、含 'tags' 子鍵的 dict、或單一值。"""
+    raw_tags = body.get('tags', [])
+    if isinstance(raw_tags, dict):
+        raw_tags = raw_tags.get('tags', [])
+    if isinstance(raw_tags, list):
+        return raw_tags
+    return [raw_tags] if raw_tags else []
+
+
+def _tag_entry_to_str(entry):
+    """把單一 tag entry 轉為字串；entry 可能是 str、dict（多種命名）或其他原值。"""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict):
+        tag_name = entry.get('tag') or entry.get('name') or entry.get('translated_name')
+        if not tag_name and isinstance(entry.get('translation'), dict):
+            tag_name = entry['translation'].get('en')
+        return str(tag_name) if tag_name else None
+    if entry is not None:
+        return str(entry)
+    return None
+
+
+def _extract_artwork_tags(body):
+    """抽取作品標籤清單，並在 aiType==2 時於最前面加上 'AI生成' 標籤。"""
+    normalized_tags = []
+
+    ai_label = _ai_type_label(body)
+    if ai_label:
+        normalized_tags.append(ai_label)
+
+    for entry in _normalize_raw_tags_field(body):
+        tag_str = _tag_entry_to_str(entry)
+        if tag_str:
+            normalized_tags.append(tag_str)
+
+    return normalized_tags
+
+
+def _extract_artwork_pagecount(body, artwork_id):
+    """取得 pageCount；本層 body 缺少時退而從 userIllusts[pid] 撈，最終預設為 1。"""
+    page_count = body.get('pageCount')
+    if page_count is None:
+        user_illusts = body.get('userIllusts', {})
+        if isinstance(user_illusts, dict):
+            illust_info = user_illusts.get(str(artwork_id)) or user_illusts.get(artwork_id) or {}
+            if isinstance(illust_info, dict):
+                page_count = illust_info.get('pageCount')
+    try:
+        return int(page_count or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _extract_artwork_img_url(body):
+    """從 body['urls'] 取出原圖 URL；對 multi-page / ugoira 路徑做 p0→p 與 ugoira0→ugoira 修正。"""
+    try:
+        urls_obj = body.get('urls', {})
+        if isinstance(urls_obj, dict):
+            original_url = urls_obj.get('original') or urls_obj.get('regular')
+        else:
+            original_url = None
+        if not original_url:
+            return None
+        return str(original_url).replace("p0", "p", 1).replace("ugoira0", "ugoira", 1)
+    except Exception:
+        return None
+
+
 def _append_pixiv_info_history(trace_path, pid, trace_entry):
     try:
         history = safe_read_json(trace_path, {})
@@ -514,59 +612,16 @@ def Pixiv_info(url,
         ajax_url='https://www.pixiv.net/ajax/illust/'+id
 
         def _parse_payload(payload):
-            o = payload.get('body', {}) if isinstance(payload, dict) else {}
-            if isinstance(o, list):
-                o = o[0] if (len(o) > 0 and isinstance(o[0], dict)) else {}
-            if not isinstance(o, dict):
-                o = {}
-
-            bookmarkCount = int(o.get('bookmarkCount', 0) or 0)
-
-            pageCount = o.get('pageCount')
-            if pageCount is None:
-                user_illusts = o.get('userIllusts', {})
-                if isinstance(user_illusts, dict):
-                    illust_info = user_illusts.get(str(id)) or user_illusts.get(id) or {}
-                    if isinstance(illust_info, dict):
-                        pageCount = illust_info.get('pageCount')
-            pageCount = int(pageCount or 1)
-
-            normalized_tags = []
-            
-            # 先提取 aiType 並轉換為標籤（放在最前面）
-            ai_type = o.get('aiType', None)
-            if ai_type is not None:
-                ai_type = int(ai_type)
-                if ai_type == 2:
-                    normalized_tags.append('AI生成')
-            raw_tags = o.get('tags', [])
-            if isinstance(raw_tags, dict):
-                raw_tags = raw_tags.get('tags', [])
-            if not isinstance(raw_tags, list):
-                raw_tags = [raw_tags] if raw_tags else []
-            for t in raw_tags:
-                if isinstance(t, str):
-                    normalized_tags.append(t)
-                elif isinstance(t, dict):
-                    tag_name = t.get('tag') or t.get('name') or t.get('translated_name')
-                    if not tag_name and isinstance(t.get('translation'), dict):
-                        tag_name = t['translation'].get('en')
-                    if tag_name:
-                        normalized_tags.append(str(tag_name))
-                elif t is not None:
-                    normalized_tags.append(str(t))
-
-            resdicts = tag_edit.Tag(normalized_tags)
+            body = _extract_artwork_body(payload)
             try:
-                urls_obj = o.get('urls', {})
-                if isinstance(urls_obj, dict):
-                    original_url = urls_obj.get('original') or urls_obj.get('regular')
-                else:
-                    original_url = None
-                img_url = str(original_url).replace("p0","p",1).replace("ugoira0","ugoira",1) if original_url else None
-            except Exception:
-                img_url=None
-            result = [list(resdicts), int(bookmarkCount), int(pageCount), str(img_url)]
+                bookmark_count = int(body.get('bookmarkCount', 0) or 0)
+            except (TypeError, ValueError):
+                bookmark_count = 0
+            page_count = _extract_artwork_pagecount(body, id)
+            normalized_tags = _extract_artwork_tags(body)
+            resdicts = tag_edit.Tag(normalized_tags)
+            img_url = _extract_artwork_img_url(body)
+            result = [list(resdicts), int(bookmark_count), int(page_count), str(img_url)]
             valid = bool(img_url) and str(img_url) != 'None'
             return result, valid
 
