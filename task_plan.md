@@ -604,6 +604,48 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 - `gif_download` 增加 retry wrapper（已用 `fetch_with_cookie_retry` 處理 ugoira_meta 階段，下載階段尚無 retry）
 - `err_url.txt` 寫入 status code / exception 類別
 
+### Phase 30 (P-α) — get_download_url F→D ⏸ blocked-on-test
+**優先級: 🔴 (HIGH ROI but BLOCKED)**  **位置:** `thread_url_fetch.py:1353`（CC=52，142 行）
+
+**問題：** 同時做 5 件事 — fetch URL / 解析 response / cookie retry / diag log / 寫檔。
+
+**前置條件：必須先補 golden test**（mock requests + 一組已知輸入/輸出對照）才能動，否則無法驗證行為等價。同 Phase 29-B 風險模式。
+
+### Phase 31 (P-β) — gif_download / jpg_download 抽共用 helper ✅
+**優先級: 🟡 IMPORTANT**
+
+**抽出 4 個 helper（thread_download.py:488-560）：**
+1. `_resolve_pid_and_cookie(url, *, source)` — PID 解析 + cookie 選擇 + need_cookie 解析
+2. `_load_artwork_metadata(pid, pid_cookie)` — 優先 `self.url_meta` 快取，fallback 到 `Pixiv_info`
+3. `_build_artwork_headers(pid, pid_cookie, need_cookie, *, honour_pid_used=False)` — headers + cookie 注入
+4. `_log_ugoira_meta_failure(pid, htmlfile, meta_trace, first_try_resp)` — gif 專用 diag dump
+
+**統一行為（解 code drift）：** gif 原本永遠呼叫 `Pixiv_info`、jpg 優先用 `url_meta` 快取——其實是 code drift 而非設計分歧（`url_meta` 是 step3 同樣寫入的、形狀也相同）。改 gif 也吃 cache，cache hit 時省一次 Pixiv_info HTTP 呼叫。
+
+**結果：**
+- `gif_download`: **E (CC=37) → D (CC=22)** −40%
+- `jpg_download`: **D (CC=25) → C (CC=13)** −48%
+- thread_download.py 唯一剩下的 E 級：`_convert_file_to_jxl` (CC=34) → Phase 32
+
+**驗證：** `pytest -m "not integration"`: **119 passed**（+10 helper tests）
+
+### Phase 32 — _convert_file_to_jxl 三段拆 ⏸ pending
+**優先級: 🟢 LOW**  **位置:** `thread_download.py:736`（CC=34, 86 行）
+
+職責：副檔名 gating + 重試 + 成功/失敗計數 + log。拆 `_jxl_should_convert(path)` / `_jxl_run_conversion(path)` / `_jxl_record_outcome(...)`。
+
+### Phase 33 — download_thread.__init__ 21-param → DownloadConfig dataclass ⏸ pending
+**優先級: 🟡 IMPORTANT**  **位置:** `thread_download.py:55`（144 行，21 params）
+
+`__init__` 經 Phase 21 抽過 legacy args 後仍 21 個 named params。建立 `@dataclass DownloadConfig` 一次傳入；同步改 `app/gui/run_actions.py` call site。**風險中-高**：影響跨檔 call site，需先 grep 所有實例化點並準備一次性遷移。
+
+### Phase 34 (P-γ) — Pixiv_info._parse_payload 拆 ⏸ pending
+**優先級: 🟢 LOW**  **位置:** `pixiv_api.py:562`（Pixiv_info CC=31）/ `:598`（_parse_payload CC=32）
+
+把 `_parse_payload` 56 行拆成 3 個小 parser：`_parse_normal_artwork(payload)` / `_parse_manga_payload(payload)` / `_parse_ugoira_payload(payload)`，各自回傳 `(tag, like, pagecount, img_url)` tuple。
+
+---
+
 ### Phase 29-B — _isPause: int → threading.Event 🔒 deferred
 **優先級: 🟢 LOW（風險高、收益小於 28-B/C）**
 

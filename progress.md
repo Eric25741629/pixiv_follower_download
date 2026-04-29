@@ -239,3 +239,28 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 
 ### 驗證（Phase 28-B + 28-C）
 - `pytest -m "not integration"`: **109 passed**（+7 safe_json tests）
+
+---
+
+## Session 7 — 2026-04-29 (Phase 31)
+
+### Phase 31 ✅ — gif_download / jpg_download 抽共用 helper
+- 抽出 4 個 instance method：
+  - `_resolve_pid_and_cookie(url, *, source)` — PID + cookie + need_cookie
+  - `_load_artwork_metadata(pid, pid_cookie)` — cache-first metadata loading
+  - `_build_artwork_headers(...)` — headers + cookie injection（含 `honour_pid_used` 旗標）
+  - `_log_ugoira_meta_failure(...)` — gif diag dump
+- 使用者點出：gif 永遠呼叫 `Pixiv_info`、jpg 優先用 cache 是 code drift。統一 gif 也吃 cache。
+- `_load_artwork_metadata` cache hit 時跳過 `Pixiv_info` HTTP 呼叫
+- `tests/test_download_artwork_helpers.py` +10 unit tests（含 mock `pixiv_api.Pixiv_info` 驗證 cache miss 才打網路）
+
+### 量測（radon cc）
+| 函式 | 改前 | 改後 | Delta |
+|---|---|---|---|
+| `gif_download` | E (37) | D (22) | −40% |
+| `jpg_download` | D (25) | C (13) | −48% |
+
+`thread_download.py` 唯一剩下的 E 級函式：`_convert_file_to_jxl` (CC=34)，下個 phase（32）目標。
+
+### 驗證
+- `pytest -m "not integration"`: **119 passed**（+10）

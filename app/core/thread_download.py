@@ -485,6 +485,91 @@ class download_thread(PauseableThread):
             return True
         return bool(self.cookies and str(self.cookies).strip())
 
+    def _resolve_pid_and_cookie(self, url, *, source="step4"):
+        """Extract PID, pick a cookie, resolve cookie requirement.
+
+        Shared head of ``gif_download`` / ``jpg_download``. Records cookie
+        usage under ``source`` and consults ``self.url_meta`` then
+        ``pixiv_api.get_pixiv_cookie_requirement`` to decide ``need_cookie``.
+        Returns ``(pid, pid_cookie, need_cookie)``.
+        """
+        pid_candidate = str(url).rsplit('/', 1)[1]
+        m = re.match(r"^(\d+)", pid_candidate)
+        pid = m.group(1) if m else pid_candidate.rsplit('_', 1)[0]
+        pid_cookie = self._select_cookie_for_pid(pid)
+        self._record_cookie_usage(source, pid, pid_cookie)
+        need_cookie = None
+        try:
+            meta = self.url_meta.get(str(pid), {}) if isinstance(self.url_meta, dict) else {}
+            if isinstance(meta, dict) and meta:
+                need_cookie = meta.get('requires_cookie', None)
+            if need_cookie is None:
+                need_cookie = pixiv_api.get_pixiv_cookie_requirement(pid)
+        except Exception:
+            need_cookie = None
+        return pid, pid_cookie, need_cookie
+
+    def _load_artwork_metadata(self, pid, pid_cookie):
+        """Return ``(tag, like, pagecount, img_url)`` or ``None``.
+
+        Prefers ``self.url_meta`` (populated in step 3) so we skip the heavy
+        ``Pixiv_info`` HTTP call on cache hit. Falls back to ``Pixiv_info``
+        when the cache is empty or lacks the artwork shape (no ``tag`` key).
+        Both ``gif_download`` and ``jpg_download`` share this lookup.
+        """
+        meta = self.url_meta.get(str(pid), {}) if isinstance(self.url_meta, dict) else {}
+        if isinstance(meta, dict) and meta and 'tag' in meta:
+            return (
+                meta.get('tag', []),
+                meta.get('like', 0),
+                meta.get('pagecount', 1),
+                meta.get('img_url', None),
+            )
+        if pid_cookie:
+            info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/' + pid, self.agent, cookie=pid_cookie)
+        else:
+            info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/' + pid, self.agent)
+        return self._normalize_pixiv_info(info)
+
+    def _build_artwork_headers(self, pid, pid_cookie, need_cookie, *, honour_pid_used=False):
+        """Compose request headers for an artwork download.
+
+        ``honour_pid_used=True`` (gif's second fetch) also injects the cookie
+        when ``self._pid_cookie_used`` already records a cookied attempt for
+        this PID.
+        """
+        headers = {
+            'User-Agent': self.agent,
+            'Referer': 'http://www.pixiv.net/' + str(pid),
+        }
+        used_pid = self._pid_cookie_used.get(str(pid), False) if honour_pid_used else False
+        if (need_cookie is True or used_pid) and pid_cookie:
+            headers['Cookie'] = pid_cookie
+        return headers
+
+    def _log_ugoira_meta_failure(self, pid, htmlfile, meta_trace, first_try_resp):
+        """Diagnostic dump when ugoira_meta returns non-200.
+
+        Extracted from ``gif_download`` to keep the main flow flat.
+        """
+        print(
+            f"[pixiv_thread] PID {pid} failed ugoira_meta, "
+            f"first_try_status={meta_trace.get('first_try_status')}, "
+            f"retry_used={meta_trace.get('retry_used')}, "
+            f"retry_with_cookie_status={meta_trace.get('retry_with_cookie_status')}, "
+            f"final_status={htmlfile.status_code}"
+        )
+        if first_try_resp is not None:
+            try:
+                print(f"[pixiv_thread] response preview (first): {first_try_resp.text[:500]}")
+            except Exception:
+                pass
+        try:
+            stage = "retry" if meta_trace.get("retry_used") else "first"
+            print(f"[pixiv_thread] response preview ({stage}): {htmlfile.text[:500]}")
+        except Exception:
+            pass
+
     def _fetch_meta_for_filter(self, pid, allow_network=False):
         pid_key = normalize_pid(pid)
         if not pid_key:
@@ -1610,25 +1695,8 @@ class download_thread(PauseableThread):
     def gif_download(self,url, session=None):
         my_time = self.download_time
         try:
-            pid_candidate = url.rsplit('/',1)[1].rsplit('_')[0]
-            m = re.match(r"^(\d+)", pid_candidate)
-            pid = m.group(1) if m else pid_candidate
-            pid_cookie = self._select_cookie_for_pid(pid)
-            self._record_cookie_usage("step4", pid, pid_cookie)
-            need_cookie = None
-            try:
-                meta = self.url_meta.get(str(pid), {}) if isinstance(self.url_meta, dict) else {}
-                if isinstance(meta, dict) and meta:
-                    need_cookie = meta.get('requires_cookie', None)
-                if need_cookie is None:
-                    need_cookie = pixiv_api.get_pixiv_cookie_requirement(pid)
-            except Exception:
-                need_cookie = None
-            if pid_cookie:
-                info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/'+pid, self.agent, cookie=pid_cookie)
-            else:
-                info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/'+pid, self.agent)
-            normalized = self._normalize_pixiv_info(info)
+            pid, pid_cookie, need_cookie = self._resolve_pid_and_cookie(url, source="step4")
+            normalized = self._load_artwork_metadata(pid, pid_cookie)
             if not normalized:
                 try:
                     self._output.emit(f"<p><font color='orange'>PID {pid} 取得 ugoira 資訊失敗，已標記為失敗任務</font></p>")
@@ -1637,13 +1705,12 @@ class download_thread(PauseableThread):
                 return [url, my_time.strftime('%Y%m%d_%H%M%S')]
             tag,like,pagecount,img_url = normalized
             url='https://www.pixiv.net/ajax/illust/%s/ugoira_meta?lang=zh_tw'%pid
-            headers = { 'User-Agent':self.agent,
-                        'Referer':('http://www.pixiv.net/'+str(pid))}
-            if need_cookie is True and pid_cookie:
-                headers['Cookie'] = pid_cookie
-                self._mark_gif_cookie_usage(pid, True, source="ugoira_meta_initial")
-            else:
-                self._mark_gif_cookie_usage(pid, False, source="ugoira_meta_initial")
+            headers = self._build_artwork_headers(pid, pid_cookie, need_cookie)
+            self._mark_gif_cookie_usage(
+                pid,
+                bool(need_cookie is True and pid_cookie),
+                source="ugoira_meta_initial",
+            )
             http = session if session is not None else requests
             htmlfile, meta_trace, first_try_resp = fetch_with_cookie_retry(
                 http_get=http.get,
@@ -1670,23 +1737,7 @@ class download_thread(PauseableThread):
             except Exception:
                 pass
             if htmlfile.status_code != 200:
-                print(
-                    f"[pixiv_thread] PID {pid} failed ugoira_meta, "
-                    f"first_try_status={meta_trace.get('first_try_status')}, "
-                    f"retry_used={meta_trace.get('retry_used')}, "
-                    f"retry_with_cookie_status={meta_trace.get('retry_with_cookie_status')}, "
-                    f"final_status={htmlfile.status_code}"
-                )
-                if first_try_resp is not None:
-                    try:
-                        print(f"[pixiv_thread] response preview (first): {first_try_resp.text[:500]}")
-                    except Exception:
-                        pass
-                try:
-                    stage = "retry" if meta_trace.get("retry_used") else "first"
-                    print(f"[pixiv_thread] response preview ({stage}): {htmlfile.text[:500]}")
-                except Exception:
-                    pass
+                self._log_ugoira_meta_failure(pid, htmlfile, meta_trace, first_try_resp)
                 return None
             htmlfile.raise_for_status()
             try:
@@ -1698,10 +1749,7 @@ class download_thread(PauseableThread):
                 print(f"[pixiv_thread] PID {pid} JSON parse failed: {e}")
                 print(f"[pixiv_thread] response preview: {htmlfile.text[:500]}")
                 return None
-            headers = { 'User-Agent':self.agent,
-                        'Referer':('http://www.pixiv.net/'+str(pid))}
-            if (need_cookie is True or self._pid_cookie_used.get(str(pid), False)) and pid_cookie:
-                headers['Cookie'] = pid_cookie
+            headers = self._build_artwork_headers(pid, pid_cookie, need_cookie, honour_pid_used=True)
             htmlfile = http.get(url,headers=headers,stream=True)
             my_time=self.download_time
             zip_bytes = None
@@ -1757,57 +1805,19 @@ class download_thread(PauseableThread):
         last_err = None
         for i in range (0,5): # 最多重試 5 次，失敗就回傳錯誤
             try:
-                pid_candidate = str(url).rsplit('/',1)[1].rsplit('_',1)[0]  # 從 URL 解析 PID
-                m = re.match(r"^(\d+)", pid_candidate)
-                pid = m.group(1) if m else pid_candidate
-                pid_cookie = self._select_cookie_for_pid(pid)
-                self._record_cookie_usage("step4", pid, pid_cookie)
-                need_cookie = None
-                meta = self.url_meta.get(str(pid), {}) if isinstance(self.url_meta, dict) else {}
-                if isinstance(meta, dict) and meta:
-                    tag = meta.get('tag', [])
-                    like = meta.get('like', 0)
-                    pagecount = meta.get('pagecount', 1)
-                    img_url = meta.get('img_url', None)
-                    need_cookie = meta.get('requires_cookie', None)
-                else:
-                    try:
-                        need_cookie = pixiv_api.get_pixiv_cookie_requirement(pid)
-                    except Exception:
-                        need_cookie = None
-
-                    if need_cookie is True:
-                        if pid_cookie:
-                            info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/'+pid,self.agent,cookie=pid_cookie)
-                        else:
-                            info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/'+pid,self.agent)
-                    elif need_cookie is False:
-                        info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/'+pid,self.agent)
-                    else:
-                        # Cookie 需求未知時，優先嘗試帶 Cookie 以提高成功率
-                        if pid_cookie:
-                            info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/'+pid,self.agent,cookie=pid_cookie)
-                        else:
-                            info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/'+pid,self.agent)
-                        try:
-                            need_cookie = pixiv_api.get_pixiv_cookie_requirement(pid)
-                        except Exception:
-                            need_cookie = None
-                    normalized = self._normalize_pixiv_info(info)
-                    if not normalized:
-                        raise ValueError("Pixiv_info 回傳格式異常")
-                    tag,like,pagecount,img_url = normalized
+                pid, pid_cookie, need_cookie = self._resolve_pid_and_cookie(url, source="step4")
+                normalized = self._load_artwork_metadata(pid, pid_cookie)
+                if not normalized:
+                    raise ValueError("Pixiv_info 回傳格式異常")
+                tag, like, pagecount, img_url = normalized
 
                 if(like==404 and tag ==404):
                     return
                 p=str(url).rsplit('_',1)[1].rsplit('.',1)[0]    # 作品頁碼
                 picture_format = url.rsplit('.',1)[1]
-                headers = {
-                        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.82 Safari/537.36',
-                        'Referer':('http://www.pixiv.net/'+str(pid))
-                        }
-                if need_cookie is True and pid_cookie:
-                    headers['Cookie'] = pid_cookie
+                headers = self._build_artwork_headers(pid, pid_cookie, need_cookie)
+                # jpg uses a different User-Agent than gif
+                headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.82 Safari/537.36'
                 try:
                     self._pid_cookie_used[str(pid)] = bool(need_cookie is True and pid_cookie)
                 except Exception:
