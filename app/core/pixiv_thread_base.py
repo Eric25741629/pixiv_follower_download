@@ -1,5 +1,7 @@
-from PyQt5.QtCore import *
+import threading
+import queue as _queue
 import time
+from app.core.worker_event import WorkerEvent
 from pixiv_api import *
 from app.core.pixiv_thread_utils import (
     cookie_usage_label,
@@ -84,27 +86,29 @@ def _is_ai_artwork_tagged(artwork_tags, tag_hit):
             return True
     return False
 
-class PauseableThread(QThread):
-    """Base class adding pause / resume / stop with optional flush hooks."""
-    _output = pyqtSignal(str)
-    _countdown = pyqtSignal(int)
+class PauseableThread(threading.Thread):
+    """Base class: pause/resume/stop with countdown support via queue.Queue."""
 
-    def __init__(self):
-        super().__init__()
-        self._isPause = 0
+    def __init__(self, q: _queue.Queue):
+        super().__init__(daemon=True)
+        self._q = q
+        self._pause_event = threading.Event()
+        self._pause_event.set()   # not paused by default
+        self._stop_event = threading.Event()
 
     def pause(self):
-        self._output.emit("<p><font color='red'>已暫停</font></p>")
-        self._isPause = 1
+        self._pause_event.clear()
+        self._q.put(WorkerEvent("output", "<p><font color='red'>已暫停</font></p>"))
         self._on_pause_hook()
 
     def resume(self):
-        self._output.emit("<p><font color='red'>已繼續</font></p>")
-        self._isPause = 0
+        self._pause_event.set()
+        self._q.put(WorkerEvent("output", "<p><font color='red'>已繼續</font></p>"))
 
     def stop(self):
-        self._output.emit("<p><font color='red'>已停止</font></p>")
-        self._isPause = 2
+        self._stop_event.set()
+        self._pause_event.set()   # unblock any waiting pause
+        self._q.put(WorkerEvent("output", "<p><font color='red'>已停止</font></p>"))
         self._on_stop_hook()
 
     def _on_pause_hook(self):
@@ -114,21 +118,20 @@ class PauseableThread(QThread):
         pass
 
     def _sleep_with_countdown(self, delay):
-        """Sleep with pause/stop support and emit countdown ticks."""
+        """Sleep with pause/stop support; emits countdown ticks."""
         if delay <= 0:
             return
         for remaining in range(int(delay), 0, -1):
-            if self._isPause == 2:
+            if self._stop_event.is_set():
                 break
-            while self._isPause == 1:
-                time.sleep(1)
+            self._pause_event.wait()
             try:
-                self._countdown.emit(remaining)
+                self._q.put(WorkerEvent("countdown", remaining))
             except Exception:
                 pass
             time.sleep(1)
         try:
-            self._countdown.emit(0)
+            self._q.put(WorkerEvent("countdown", 0))
         except Exception:
             pass
 
