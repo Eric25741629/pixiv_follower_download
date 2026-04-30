@@ -15,8 +15,9 @@ class SettingsView:
 
     def __init__(self, page: ft.Page):
         self._page = page
-        self._file_picker = ft.FilePicker(on_result=self._on_folder_picked)
-        self._jxl_picker = ft.FilePicker(on_result=self._on_jxl_picked)
+        # Flet 0.84+: FilePicker is async — no on_result callback; await the method instead
+        self._file_picker = ft.FilePicker()
+        self._jxl_picker = ft.FilePicker()
         page.overlay.extend([self._file_picker, self._jxl_picker])
 
         store = _store()
@@ -57,14 +58,16 @@ class SettingsView:
         self._tf_dl_wait_max = ft.TextField(label="等待最大秒數", value=str(perf.get("pid_wait_max", 60)), width=120, keyboard_type=ft.KeyboardType.NUMBER)
         self._sw_single_thread = ft.Switch(label="單執行緒 PID 模式", value=bool(perf.get("single_thread_mode", False)))
 
-    def _on_folder_picked(self, e: ft.FilePickerResultEvent) -> None:
-        if e.path:
-            self._tf_path.value = e.path + "/"
+    async def _pick_folder(self, e: ft.ControlEvent) -> None:
+        path = await self._file_picker.get_directory_path()
+        if path:
+            self._tf_path.value = path + "/"
             self._tf_path.update()
 
-    def _on_jxl_picked(self, e: ft.FilePickerResultEvent) -> None:
-        if e.files:
-            self._tf_jxl_path.value = e.files[0].path
+    async def _pick_jxl_exe(self, e: ft.ControlEvent) -> None:
+        files = await self._jxl_picker.pick_files(allowed_extensions=["exe"])
+        if files:
+            self._tf_jxl_path.value = files[0].path
             self._tf_jxl_path.update()
 
     def _add_ban_tag(self, e: ft.ControlEvent) -> None:
@@ -171,7 +174,7 @@ class SettingsView:
                     self._tf_userid,
                     ft.Row([self._tf_path, ft.IconButton(
                         icon=ft.Icons.FOLDER_OPEN,
-                        on_click=lambda e: self._file_picker.get_directory_path(),
+                        on_click=self._pick_folder,
                     )]),
                 ]),
                 _tile("過濾規則", [
@@ -190,7 +193,7 @@ class SettingsView:
                     self._sw_jxl,
                     ft.Row([self._tf_jxl_path, ft.IconButton(
                         icon=ft.Icons.FILE_OPEN,
-                        on_click=lambda e: self._jxl_picker.pick_files(allowed_extensions=["exe"]),
+                        on_click=self._pick_jxl_exe,
                     )]),
                     self._sw_jxl_delete,
                     ft.Row([ft.Text("Effort（1-9）"), self._sl_jxl_effort]),
