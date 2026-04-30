@@ -100,20 +100,21 @@ class CookiesView:
                 self._entries[idx] = new_entry
             self._save_entries()
             self._refresh_table()
-            dialog.open = False
+            self._page.pop_dialog()
             self._page.update()
+
+        def cancel_dialog(e: ft.ControlEvent) -> None:
+            self._page.pop_dialog()
 
         dialog = ft.AlertDialog(
             title=ft.Text("編輯 Cookie" if idx is not None else "新增 Cookie"),
             content=ft.Column([tf_alias, tf_cookie], tight=True, spacing=12),
             actions=[
-                ft.TextButton("取消", on_click=lambda e: setattr(dialog, "open", False) or self._page.update()),
+                ft.TextButton("取消", on_click=cancel_dialog),
                 ft.FilledButton("儲存", on_click=save_dialog),
             ],
         )
-        self._page.dialog = dialog
-        dialog.open = True
-        self._page.update()
+        self._page.show_dialog(dialog)
 
     def _remove_entry(self, idx: int) -> None:
         self._entries.pop(idx)

@@ -148,20 +148,15 @@ class SettingsView:
         def _tile(title: str, controls: list) -> ft.ExpansionTile:
             return ft.ExpansionTile(
                 title=ft.Text(title),
-                initially_expanded=False,
                 controls=[ft.Container(
                     content=ft.Column(controls, spacing=8),
                     padding=ft.padding.only(left=16, bottom=12),
                 )],
             )
 
-        snack = ft.SnackBar(ft.Text("設定已儲存"), duration=1500)
-        self._page.overlay.append(snack)
-
         def _save_and_notify(e):
             self.save()
-            snack.open = True
-            self._page.update()
+            self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
 
         save_btn = ft.FilledButton("儲存設定", icon=ft.Icons.SAVE, on_click=_save_and_notify)
 
