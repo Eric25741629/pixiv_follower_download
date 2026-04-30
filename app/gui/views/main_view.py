@@ -56,7 +56,7 @@ class MainView:
             bgcolor=_STATE_COLORS["idle"],
             border_radius=8,
             width=110,
-            alignment=ft.alignment.center,
+            alignment=ft.Alignment(x=0, y=0),
         )
         self._step_card_containers.append(container)
         return ft.Card(content=container)
