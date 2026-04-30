@@ -1,4 +1,3 @@
-from PyQt5.QtCore import *
 import time
 import json
 import os
@@ -8,6 +7,7 @@ import requests
 import random as pyrandom
 import threading
 from pixiv_api import *
+from app.core.worker_event import WorkerEvent
 from app.core.pixiv_thread_utils import (
     apply_cookie_pool_speedup,
     atomic_write_text,
@@ -31,13 +31,8 @@ pid_len = 0
 
 class get_pixiv_author_imgID_Thread(PauseableThread):
     '''抓取畫師作品下所有圖片的 Pixiv ID'''
-    _signal = pyqtSignal(int,int)
-    _output=pyqtSignal(str)
-    _countdown = pyqtSignal(int)
-    _finished = pyqtSignal(str)
-    _thenext = pyqtSignal(int)
-    def __init__(self,Author_list,Agent,path,cookies,exist_pid, single_thread_mode=False, pid_wait_min=10, pid_wait_max=60):
-        super().__init__()
+    def __init__(self, q, Author_list, Agent, path, cookies, exist_pid, single_thread_mode=False, pid_wait_min=10, pid_wait_max=60):
+        super().__init__(q)
         self.Author_list=Author_list
         self.Agent=Agent
         self.path=path
@@ -91,7 +86,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
     def _emit_step2_cookie_usage_summary(self):
         try:
             summary = _format_cookie_usage_summary(self._step2_cookie_usage_counts, self.cookie_pool, self._cookie_alias_map)
-            self._output.emit(f"<p><font color='gray'>[PID Cookie統計] {summary}</font></p>")
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[PID Cookie統計] {summary}</font></p>"))
         except Exception:
             pass
 
@@ -220,12 +215,12 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             if do_process:
                 work_list.append(aid)
         try:
-            self._output.emit(f"<p><font color='black'>畫師總數：{len(self.Author_list)}，待處理：{len(work_list)}</font></p>")
+            self._q.put(WorkerEvent("output",f"<p><font color='black'>畫師總數：{len(self.Author_list)}，待處理：{len(work_list)}</font></p>"))
         except Exception:
             pass
         if len(work_list) == 0 and len(self.Author_list) > 0:
             try:
-                self._output.emit("<p><font color='gray'>[PID增量] 近 30 天內皆已處理，步驟 2 本次不重抓</font></p>")
+                self._q.put(WorkerEvent("output","<p><font color='gray'>[PID增量] 近 30 天內皆已處理，步驟 2 本次不重抓</font></p>"))
             except Exception:
                 pass
         return work_list
@@ -236,16 +231,16 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         results = []
         if self.single_mode_flag:
             try:
-                self._output.emit("<p><font color='green'>已啟用單執行緒 PID 模式</font></p>")
-                self._output.emit(f"<p><font color='green'>PID 等待區間：{self.pid_wait_min} ~ {self.pid_wait_max} 秒</font></p>")
-                self._output.emit(
+                self._q.put(WorkerEvent("output","<p><font color='green'>已啟用單執行緒 PID 模式</font></p>"))
+                self._q.put(WorkerEvent("output",f"<p><font color='green'>PID 等待區間：{self.pid_wait_min} ~ {self.pid_wait_max} 秒</font></p>"))
+                self._q.put(WorkerEvent("output",
                     f"<p><font color='green'>PID 多Cookie加速：{len(self.cookie_pool or [])} 組 cookies，等待加速係數 x{cookie_speed_divisor(self.cookie_pool):.2f}</font></p>"
-                )
-                self._output.emit("<p><font color='green'>PID cookies 已啟用隨機輪選</font></p>")
+                ))
+                self._q.put(WorkerEvent("output","<p><font color='green'>PID cookies 已啟用隨機輪選</font></p>"))
             except Exception:
                 pass
             for aid in work_list:
-                if self._isPause == 2:
+                if self._stop_event.is_set():
                     break
                 try:
                     res = self._run_step2_with_random_cookie(aid)
@@ -253,24 +248,24 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                         results.append(res)
                 except Exception as e:
                     try:
-                        self._output.emit(f"<p><font color='red'>畫師 {aid} 取得 PID 失敗：{e}</font></p>")
+                        self._q.put(WorkerEvent("output",f"<p><font color='red'>畫師 {aid} 取得 PID 失敗：{e}</font></p>"))
                     except Exception:
                         pass
-                if self._isPause == 2:
+                if self._stop_event.is_set():
                     break
                 raw_delay = pyrandom.randint(self.pid_wait_min, self.pid_wait_max)
                 delay = apply_cookie_pool_speedup(raw_delay, self.cookie_pool)
                 try:
                     cookie_label = self._last_step2_cookie_label or "未提供Cookie"
-                    self._output.emit(
+                    self._q.put(WorkerEvent("output",
                         f"<p><font color='green'>[PID等待] 使用 {cookie_label}，等待 {delay} 秒 (畫師 {aid}, 多Cookie加速x{cookie_speed_divisor(self.cookie_pool):.2f}, 原始{raw_delay}秒)</font></p>"
-                    )
+                    ))
                 except Exception:
                     pass
                 self._sleep_with_countdown(delay)
                 try:
                     cookie_label = self._last_step2_cookie_label or "未提供Cookie"
-                    self._output.emit(f"<p><font color='green'>[PID等待] 等待結束 (畫師 {aid}，cookie={cookie_label})</font></p>")
+                    self._q.put(WorkerEvent("output",f"<p><font color='green'>[PID等待] 等待結束 (畫師 {aid}，cookie={cookie_label})</font></p>"))
                 except Exception:
                     pass
         else:
@@ -301,7 +296,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                 os.replace(tmpfile, progress_file)
             except Exception as e:
                 try:
-                    self._output.emit(f"<p><font color='red'>寫入 author_progress 失敗：{e}</font></p>")
+                    self._q.put(WorkerEvent("output",f"<p><font color='red'>寫入 author_progress 失敗：{e}</font></p>"))
                 except Exception:
                     pass
         except Exception:
@@ -356,13 +351,13 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                         pf.write(str(text) + '\n')
             except Exception as e2:
                 try:
-                    self._output.emit(f"<p><font color='red'>寫入 pictures_id 失敗：{e2}</font></p>")
+                    self._q.put(WorkerEvent("output",f"<p><font color='red'>寫入 pictures_id 失敗：{e2}</font></p>"))
                 except Exception:
                     pass
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>pictures_id 既有 {len(existing_list)} 筆，新增 {len(new_candidates)} 筆，合計 {len(existing_list) + len(new_candidates)} 筆</font></p>"
-            )
+            ))
         except Exception:
             pass
 
@@ -376,9 +371,9 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             )
         atomic_write_text(skip_file, skip_lines, backup=True)
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[PID增量] 已寫入步驟2提前跳過清單：{skip_file}（{len(skip_lines)} 筆）</font></p>"
-            )
+            ))
         except Exception:
             pass
 
@@ -404,12 +399,12 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         end = [i for item in results for i in item]
         end = [i for i in end if i not in self.exist_pid]
         self._commit_step2_outputs(end)
-        if self._isPause == 2:
-            self._finished.emit('Task finished')
-            self._thenext.emit(-1)
+        if self._stop_event.is_set():
+            self._q.put(WorkerEvent("finished", 'Task finished'))
+            self._q.put(WorkerEvent("next", -1))
         else:
-            self._thenext.emit(3)
-            self._finished.emit('抓取所有PID完成')
+            self._q.put(WorkerEvent("next", 3))
+            self._q.put(WorkerEvent("finished", '抓取所有PID完成'))
     def _step2_fetch_artist_pid_list(self, author_pids, cookie, Agent):
         '''發送單一畫師的 profile/all 請求並回傳 PID list（dict→keys / list→原值 / 其它→[]）'''
         url = 'https://www.pixiv.net/ajax/user/' + author_pids + '/profile/all?lang=zh%27'
@@ -430,24 +425,24 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         '''依 pid_stats 標記輸出截斷或回退提示（吞例外）'''
         if pid_stats.get("used_cutoff"):
             try:
-                self._output.emit(
+                self._q.put(WorkerEvent("output",
                     "<p><font color='gray'>[PID增量] 畫師 {} 命中既有 PID {}，提前截斷：保留最新 {} 筆，略過 {} 筆舊資料</font></p>".format(
                         author_pids,
                         pid_stats.get("boundary_pid", ""),
                         pid_stats.get("kept_count", 0),
                         pid_stats.get("truncated_count", 0),
                     )
-                )
+                ))
             except Exception:
                 pass
         elif pid_stats.get("fallback_full_scan"):
             try:
-                self._output.emit(
+                self._q.put(WorkerEvent("output",
                     "<p><font color='gray'>[PID增量] 畫師 {} 偵測到非數字 PID，已回退為全量掃描（{} 筆）</font></p>".format(
                         author_pids,
                         pid_stats.get("input_count", 0),
                     )
-                )
+                ))
             except Exception:
                 pass
 
@@ -485,7 +480,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                                 pass
             except Exception as e:
                 try:
-                    self._output.emit(f"<p><font color='red'>寫入 pictures_id 失敗：{e}</font></p>")
+                    self._q.put(WorkerEvent("output",f"<p><font color='red'>寫入 pictures_id 失敗：{e}</font></p>"))
                 except Exception:
                     pass
         except Exception:
@@ -502,7 +497,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                 self._progress_updates.append((str(author_pids), ts))
         except Exception:
             try:
-                self._output.emit("<p><font color='red'>記錄作者進度失敗</font></p>")
+                self._q.put(WorkerEvent("output","<p><font color='red'>記錄作者進度失敗</font></p>"))
             except Exception:
                 pass
 
@@ -517,14 +512,13 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         global pid_num
         global pid_len
         pid_num=pid_num+1
-        if self._isPause!=2:
-            self._signal.emit(1,pid_len-1)
-        while (self._isPause==1):
-            time.sleep(1)
-        if self._isPause==2:
+        if not self._stop_event.is_set():
+            self._q.put(WorkerEvent("progress", (1, pid_len - 1)))
+        self._pause_event.wait()
+        if self._stop_event.is_set():
             return 'stop'
         if(pid_num%10==0):
-            self._output.emit(f"<p><font color='black'>PID progress: {pid_num}</font></p>")
+            self._q.put(WorkerEvent("output",f"<p><font color='black'>PID progress: {pid_num}</font></p>"))
         try:
             pid = self._step2_fetch_artist_pid_list(author_pids, cookie, Agent)
             pid, step2_skipped_pid, pid_stats = self._collect_step2_incremental_pid(pid)

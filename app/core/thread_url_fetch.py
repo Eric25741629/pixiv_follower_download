@@ -1,4 +1,3 @@
-from PyQt5.QtCore import *
 import time
 import json
 import os
@@ -9,6 +8,7 @@ import random as pyrandom
 import threading
 from queue import Queue
 from pixiv_api import *
+from app.core.worker_event import WorkerEvent
 import tag_edit
 import pixiv_api
 from app.core.pixiv_thread_utils import (
@@ -35,16 +35,12 @@ from app.core.pixiv_thread_base import (
 )
 
 class get_img_url_thread(PauseableThread):
-    _signal = pyqtSignal(int,int)
-    _output=pyqtSignal(str)
-    _countdown = pyqtSignal(int)
-    _finished = pyqtSignal(str)
-    _thenext = pyqtSignal(int)
     pid_max=0
     pid_now=0
     path=os.getenv('APPDATA')+r'/pixiv_download/'
     def __init__(
         self,
+        q,
         Author_list,
         Agent,
         cookies,
@@ -61,14 +57,13 @@ class get_img_url_thread(PauseableThread):
         pid_wait_nocookie_max=6,
         special_like_rules=None,
     ):
-        super().__init__()
+        super().__init__(q)
         self.Author_list=Author_list
         self.Agent=Agent
         self.cookie_entries, self.cookie_pool, self._cookie_alias_map, self.cookies = init_cookie_fields(cookies)
         self._pid_cookie_selection = {}
         self._pid_cookie_alias_selection = {}
         self.exist_pid = normalize_pid_set(exist_pid)
-        self.cond = QWaitCondition()
         self.ban_tag=ban_tag
         self.must_tag=must_tag
         self.like_num=like_num
@@ -359,18 +354,18 @@ class get_img_url_thread(PauseableThread):
         try:
             if not self._step3_filter_skip_notice_emitted:
                 self._step3_filter_skip_notice_emitted = True
-                self._output.emit(
+                self._q.put(WorkerEvent("output",
                     "<p><font color='gray'>[Step3過濾] 已啟用精簡輸出；詳細 PID 可查看 tag_ban_pid.txt 與 pid_num_pid.txt</font></p>"
-                )
+                ))
             if total > 0 and total % int(self._step3_filter_skip_every) == 0:
-                self._output.emit(
+                self._q.put(WorkerEvent("output",
                     "<p><font color='gray'>[Step3過濾摘要] 已略過 {} 筆（標籤={}、必含標籤={}、低愛心={}）</font></p>".format(
                         total,
                         int(self._step3_filter_skip_counts.get("ban_tag", 0)),
                         int(self._step3_filter_skip_counts.get("must_tag", 0)),
                         int(self._step3_filter_skip_counts.get("like", 0)),
                     )
-                )
+                ))
         except Exception:
             pass
 
@@ -382,14 +377,14 @@ class get_img_url_thread(PauseableThread):
         if total <= 0:
             return
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 "<p><font color='gray'>[Step3過濾完成] 共略過 {} 筆（標籤={}、必含標籤={}、低愛心={}）</font></p>".format(
                     total,
                     int(self._step3_filter_skip_counts.get("ban_tag", 0)),
                     int(self._step3_filter_skip_counts.get("must_tag", 0)),
                     int(self._step3_filter_skip_counts.get("like", 0)),
                 )
-            )
+            ))
         except Exception:
             pass
 
@@ -441,7 +436,7 @@ class get_img_url_thread(PauseableThread):
         color = "gray" if final else "black"
         label = "Step3查詢完成" if final else "Step3查詢摘要"
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 "<p><font color='{}'>[{}] 已處理 {} 筆（網路查詢={}、快取={}、未查詢={}、等待執行={}；requires_cookie: 需要={}、不需要={}、未知={}）</font></p>".format(
                     color,
                     label,
@@ -454,7 +449,7 @@ class get_img_url_thread(PauseableThread):
                     int(self._step3_cookie_req_counts.get("free", 0)),
                     int(self._step3_cookie_req_counts.get("unknown", 0)),
                 )
-            )
+            ))
         except Exception:
             pass
 
@@ -511,9 +506,9 @@ class get_img_url_thread(PauseableThread):
         self._revoked_pid_set.add(pid_key)
         self._revoked_pid_new.add(pid_key)
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 f"<p><font color='orange'>PID {pid_key} 已標記為失效（{reason}），後續會自動略過</font></p>"
-            )
+            ))
         except Exception:
             pass
 
@@ -547,17 +542,16 @@ class get_img_url_thread(PauseableThread):
             delay = pyrandom.randint(self.pid_wait_min, self.pid_wait_max)
         delay = apply_cookie_pool_speedup(delay, self.cookie_pool)
         for _ in range(delay):
-            if self._isPause == 2:
+            if self._stop_event.is_set():
                 break
-            while self._isPause == 1:
-                time.sleep(1)
+            self._pause_event.wait()
             try:
-                self._countdown.emit(delay - _)
+                self._q.put(WorkerEvent("countdown", delay - _))
             except Exception:
                 pass
             time.sleep(1)
         try:
-            self._countdown.emit(0)
+            self._q.put(WorkerEvent("countdown", 0))
         except Exception:
             pass
 
@@ -640,7 +634,7 @@ class get_img_url_thread(PauseableThread):
             stage_key = str(stage or "").strip().lower()
             counts = self._cookie_usage_counts.get(stage_key, {}) if isinstance(self._cookie_usage_counts, dict) else {}
             summary = _format_cookie_usage_summary(counts, self.cookie_pool, self._cookie_alias_map)
-            self._output.emit(f"<p><font color='gray'>[{title}] {summary}</font></p>")
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[{title}] {summary}</font></p>"))
         except Exception:
             pass
 
@@ -906,13 +900,13 @@ class get_img_url_thread(PauseableThread):
                                 continue
                             pictures_id.append(text)
                 try:
-                    self._output.emit(f"<p><font color='gray'>pictures_id 來源: {pic_path}</font></p>")
-                    self._output.emit(
+                    self._q.put(WorkerEvent("output", f"<p><font color='gray'>pictures_id 來源: {pic_path}</font></p>"))
+                    self._q.put(WorkerEvent("output",
                         f"<p><font color='gray'>[TaskFilter][Step3-Pre] pictures_id原始={raw_count}, skip_file排除={excluded_by_skip_file}, 待去重={len(pictures_id)}</font></p>"
-                    )
-                    self._output.emit(
+                    ))
+                    self._q.put(WorkerEvent("output",
                         f"<p><font color='gray'>[TaskFilter][Step3-Pre] 這次從 step2_skip_pid.txt 排除 {excluded_by_step2_skip} 筆（步驟2提前跳過，所以之前沒有存下來）</font></p>"
-                    )
+                    ))
                 except Exception:
                     pass
                 self._diag(
@@ -929,12 +923,12 @@ class get_img_url_thread(PauseableThread):
 
         try:
             detail = "" if last_err is None else f" ({last_err})"
-            self._output.emit("<p><font color='red'>找不到 pictures_id.txt: {}</font></p>".format(' | '.join(file_candidates)))
-            self._output.emit(f"<p><font color='red'>讀取失敗: {detail}</font></p>")
+            self._q.put(WorkerEvent("output", "<p><font color='red'>找不到 pictures_id.txt: {}</font></p>".format(' | '.join(file_candidates))))
+            self._q.put(WorkerEvent("output", f"<p><font color='red'>讀取失敗: {detail}</font></p>"))
         except Exception:
             pass
-        self._finished.emit('Task finished')
-        self._thenext.emit(-1)
+        self._q.put(WorkerEvent("finished", 'Task finished'))
+        self._q.put(WorkerEvent("next", -1))
         return 0
 
     def _resolve_pictures_id_file_path(self):
@@ -1134,16 +1128,16 @@ class get_img_url_thread(PauseableThread):
     def _load_and_filter_pid_list(self):
         pictures_id = self.check_exist()
         if not isinstance(pictures_id, list):
-            self._output.emit("<p><font color='red'>pictures_id 讀取失敗，無法開始 URL 階段</font></p>")
+            self._q.put(WorkerEvent("output", "<p><font color='red'>pictures_id 讀取失敗，無法開始 URL 階段</font></p>"))
             self._diag("step3_abort_no_pictures_id")
-            self._thenext.emit(-1)
+            self._q.put(WorkerEvent("next", -1))
             return None
         raw_pid_count = len(pictures_id)
         pictures_id, skipped_no_to_check, skipped_exist, skipped_revoked, duplicate_count, invalid_count = self._prepare_pending_pid_tasks(pictures_id)
         self._init_pending_pid_tracker(pictures_id, reset_with_fallback=True)
         self.pid_max = len(pictures_id)
         try:
-            self._signal.emit(0, self.pid_max)
+            self._q.put(WorkerEvent("progress", (0, self.pid_max)))
         except Exception:
             pass
         self._diag(
@@ -1161,35 +1155,35 @@ class get_img_url_thread(PauseableThread):
             pending_count=self.pid_max,
         )
         try:
-            self._output.emit(f"<p><font color='gray'>[TaskFilter][Step3] input={raw_pid_count}, skipped_no_to_check={skipped_no_to_check}, skipped_exist={skipped_exist}, skipped_revoked={skipped_revoked}, duplicate={duplicate_count}, invalid={invalid_count}, cached_hit_pid={0}, cached_generated_url={0}, cached_filtered={0}, cached_fallback_network={0}, pending_network={self.pid_max}</font></p>")
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[TaskFilter][Step3] input={raw_pid_count}, skipped_no_to_check={skipped_no_to_check}, skipped_exist={skipped_exist}, skipped_revoked={skipped_revoked}, duplicate={duplicate_count}, invalid={invalid_count}, cached_hit_pid={0}, cached_generated_url={0}, cached_filtered={0}, cached_fallback_network={0}, pending_network={self.pid_max}</font></p>"))
         except Exception:
             pass
-        self._output.emit(f"<p><font color='red'>Total pending network PID: {self.pid_max}</font></p>")
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>Total pending network PID: {self.pid_max}</font></p>"))
         try:
-            self._output.emit("<p><font color='gray'>URL 輸出檔案: {}</font></p>".format(os.path.join(self.path, "all_url.txt")))
+            self._q.put(WorkerEvent("output", "<p><font color='gray'>URL 輸出檔案: {}</font></p>".format(os.path.join(self.path, "all_url.txt"))))
         except Exception:
             pass
         if self.pid_max == 0:
-            self._output.emit("<p><font color='orange'>pictures_id.txt 目前為空，沒有可處理 PID</font></p>")
+            self._q.put(WorkerEvent("output", "<p><font color='orange'>pictures_id.txt 目前為空，沒有可處理 PID</font></p>"))
             self._emit_cookie_usage_summary("step3", "Step3 Cookie統計")
-            self._thenext.emit(4)
+            self._q.put(WorkerEvent("next", 4))
             return None
         return pictures_id
 
     def _build_and_emit_task_queue(self, pictures_id):
-        self._output.emit(
+        self._q.put(WorkerEvent("output",
             f"<p><font color='green'>URL階段等待策略：僅網路查詢PID等待；快取PID不等待（需Cookie {self.pid_wait_min}~{self.pid_wait_max} 秒；免Cookie {self.pid_wait_nocookie_min}~{self.pid_wait_nocookie_max} 秒）</font></p>"
-        )
+        ))
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>URL階段多Cookie加速：{len(self.cookie_pool or [])} 組 cookies，等待加速係數 x{cookie_speed_divisor(self.cookie_pool):.2f}</font></p>"
-            )
+            ))
         except Exception:
             pass
         task_queue = Queue()
         for pid in pictures_id:
             task_queue.put(pid)
-        self._output.emit("<p><font color='green'>URL階段採用消費者隊列模式，PID 會在查詢後自動從 pictures_id.txt 移除</font></p>")
+        self._q.put(WorkerEvent("output", "<p><font color='green'>URL階段採用消費者隊列模式，PID 會在查詢後自動從 pictures_id.txt 移除</font></p>"))
         return task_queue
 
     def _run_processing_loop(self, task_queue):
@@ -1198,7 +1192,7 @@ class get_img_url_thread(PauseableThread):
         progress_every = 100
         flush_every = 100
 
-        while (not task_queue.empty()) and self._isPause != 2:
+        while (not task_queue.empty()) and not self._stop_event.is_set():
             try:
                 pid = task_queue.get_nowait()
             except Exception:
@@ -1206,7 +1200,7 @@ class get_img_url_thread(PauseableThread):
 
             if processed_count % progress_every == 0:
                 try:
-                    self._output.emit(f"<p><font color='black'>URL階段進度：{processed_count + 1}/{self.pid_max} (PID {pid})</font></p>")
+                    self._q.put(WorkerEvent("output", f"<p><font color='black'>URL階段進度：{processed_count + 1}/{self.pid_max} (PID {pid})</font></p>"))
                 except Exception:
                     pass
 
@@ -1219,7 +1213,7 @@ class get_img_url_thread(PauseableThread):
                 else:
                     results.append([])
 
-            if self._isPause != 2:
+            if not self._stop_event.is_set():
                 self._mark_pid_processed(pid)
 
             processed_count += 1
@@ -1243,7 +1237,7 @@ class get_img_url_thread(PauseableThread):
                 except Exception:
                     remain = 0
                 try:
-                    self._output.emit(f"<p><font color='gray'>[分批寫入] 已處理 {processed_count}/{self.pid_max}，all_url 目前 {len(merged)} 筆（本批新增 {len(new_urls)}），pictures_id 剩餘 {remain}</font></p>")
+                    self._q.put(WorkerEvent("output", f"<p><font color='gray'>[分批寫入] 已處理 {processed_count}/{self.pid_max}，all_url 目前 {len(merged)} 筆（本批新增 {len(new_urls)}），pictures_id 剩餘 {remain}</font></p>"))
                 except Exception:
                     pass
 
@@ -1265,11 +1259,11 @@ class get_img_url_thread(PauseableThread):
                 merged_count=len(merged),
                 added_count=len(new_urls),
             )
-            self._output.emit(f"<p><font color='orange'>已停止，已暫存 all_url {len(merged)} 筆（新增 {len(new_urls)}）</font></p>")
+            self._q.put(WorkerEvent("output", f"<p><font color='orange'>已停止，已暫存 all_url {len(merged)} 筆（新增 {len(new_urls)}）</font></p>"))
         except Exception:
             pass
-        self._finished.emit('Task finished')
-        self._thenext.emit(-1)
+        self._q.put(WorkerEvent("finished", 'Task finished'))
+        self._q.put(WorkerEvent("next", -1))
 
     def _finalize_on_complete(self, results):
         results = [i for item in results if isinstance(item, list) for i in item]
@@ -1285,11 +1279,11 @@ class get_img_url_thread(PauseableThread):
             error_pid_count=len(error_pid),
         )
         try:
-            self._output.emit(f"<p><font color='green'>all_url 寫入完成：舊URL {len(old_urls)} 筆、新URL {len(new_urls)} 筆、合併後 {len(merged)} 筆</font></p>")
+            self._q.put(WorkerEvent("output", f"<p><font color='green'>all_url 寫入完成：舊URL {len(old_urls)} 筆、新URL {len(new_urls)} 筆、合併後 {len(merged)} 筆</font></p>"))
         except Exception:
             pass
         if len(new_urls) == 0:
-            self._output.emit("<p><font color='gray'>沒有新的 URL，已保留原 all_url.txt</font></p>")
+            self._q.put(WorkerEvent("output", "<p><font color='gray'>沒有新的 URL，已保留原 all_url.txt</font></p>"))
         try:
             try:
                 atomic_write_json(self.url_meta_path, self.url_meta)
@@ -1297,7 +1291,7 @@ class get_img_url_thread(PauseableThread):
                 with open(self.url_meta_path, 'w', encoding='utf-8') as f:
                     json.dump(self.url_meta, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            self._output.emit(f"<p><font color='red'>寫入 all_url_meta.json 失敗: {e}</font></p>")
+            self._q.put(WorkerEvent("output", f"<p><font color='red'>寫入 all_url_meta.json 失敗: {e}</font></p>"))
         file_path = self.path
         tag_err = [self.tag_queue.get() for _ in range(self.tag_queue.qsize())]
         try:
@@ -1335,33 +1329,33 @@ class get_img_url_thread(PauseableThread):
         self._emit_cookie_usage_summary("step3", "Step3 Cookie統計")
         try:
             if self._revoked_pid_new:
-                self._output.emit(
+                self._q.put(WorkerEvent("output",
                     f"<p><font color='orange'>本次新增失效 PID {len(self._revoked_pid_new)} 筆，已寫入 revoked_pid.txt</font></p>"
-                )
+                ))
         except Exception:
             pass
-        self._finished.emit('抓取所有PID完成')
-        self._thenext.emit(4)
-        self._output.emit(f"<p><font color='red'>Total URL count: {len(merged)}</font></p>")
+        self._q.put(WorkerEvent("finished", '抓取所有PID完成'))
+        self._q.put(WorkerEvent("next", 4))
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>Total URL count: {len(merged)}</font></p>"))
 
     def run(self):
         try:
-            self._output.emit("URL階段開始")
+            self._q.put(WorkerEvent("output", "URL階段開始"))
             self._reset_run_counters()
             pictures_id = self._load_and_filter_pid_list()
             if pictures_id is None:
                 return
             task_queue = self._build_and_emit_task_queue(pictures_id)
             results = self._run_processing_loop(task_queue)
-            if self._isPause == 2:
+            if self._stop_event.is_set():
                 self._finalize_on_stop(results)
             else:
                 self._finalize_on_complete(results)
         except Exception as e:
             self._diag("step3_exception", error=output_err(e))
-            self._output.emit('Task failed')
-            self._output.emit(output_err(e))
-            self._thenext.emit(-1)
+            self._q.put(WorkerEvent("output", 'Task failed'))
+            self._q.put(WorkerEvent("output", output_err(e)))
+            self._q.put(WorkerEvent("next", -1))
 
     def _step3_advance_progress(self):
         """Advance step 3 progress counter and emit progress signal unless stopped.
@@ -1369,9 +1363,9 @@ class get_img_url_thread(PauseableThread):
         Mirrors the repeated `if self._isPause!=2: self.pid_now+=1; self._signal.emit(1,self.pid_max)`
         pattern used at the end of every PID resolution branch in `get_download_url`.
         """
-        if self._isPause != 2:
+        if not self._stop_event.is_set():
             self.pid_now = self.pid_now + 1
-            self._signal.emit(1, self.pid_max)
+            self._q.put(WorkerEvent("progress", (1, self.pid_max)))
 
     def _step3_extract_meta_from_cache(self, cached):
         """Unpack a cached url_meta entry into the (tag, like, pagecount, img_url, need_cookie)
@@ -1386,10 +1380,10 @@ class get_img_url_thread(PauseableThread):
     def _step3_safe_emit(self, html):
         """Emit `html` on `_output`, swallowing any signal-emit exception.
 
-        Mirrors the inline `try: self._output.emit(...) except Exception: pass` blocks
+        Mirrors the inline `try: self._q.put(WorkerEvent("output", ...) except Exception: pass` blocks)
         that appear repeatedly inside `get_download_url`."""
         try:
-            self._output.emit(html)
+            self._q.put(WorkerEvent("output", html))
         except Exception:
             pass
 
@@ -1471,10 +1465,8 @@ class get_img_url_thread(PauseableThread):
             pass
 
     def get_download_url(self,path,Agent,num,pid):    # 取得單一作品的下載 URL
-        while (self._isPause==1):
-            time.sleep(1)
-            #print('wait for singal')
-        if self._isPause==2:
+        self._pause_event.wait()
+        if self._stop_event.is_set():
             return []
         pid_key = normalize_pid(pid)
         if not pid_key:
@@ -1586,7 +1578,7 @@ class get_img_url_thread(PauseableThread):
         #         for i in self.ban_tag:
         #             if i in tag:
         #                 info="<p><font color='black'>因封鎖標籤 {}，已略過 TAG PID：{}</font></p>"
-        #                 self._output.emit(info.format(i, pid))
+        #                 self._q.put(WorkerEvent("output", info.format(i, pid)))
         #                 self.tag_queue.put(pid)
         #                 return ['0']
         #         self.must_tag=tag_edit.Tag(self.must_tag)
@@ -1597,12 +1589,12 @@ class get_img_url_thread(PauseableThread):
         #                     ok_status=1
         #                     break
         #             if ok_status==0:
-        #                 self._output.emit("<p><font color='black'>TAG 過濾略過 PID：" + pid + "</font></p>")
+        #                 self._q.put(WorkerEvent("output", "<p><font color='black'>TAG 過濾略過 PID：" + pid + "</font></p>"))
         #                 self.tag_queue.put(pid)
         #                 return ['0']
         #         if like <self.like_num:
         #             #print('讚數不足：' + str(like) + '，略過 PID：' + pid)
-        #             self._output.emit("<p><font color='black'>讚數不足："+str(like)+"，略過 PID："+pid+"</font></p>")
+        #             self._q.put(WorkerEvent("output", "<p><font color='black'>讚數不足："+str(like)+"，略過 PID："+pid+"</font></p>"))
         #             if int(pid)<94006000:
         #                 self.like_queue.put(pid)
         #             return ['0']     

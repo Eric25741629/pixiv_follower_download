@@ -1,4 +1,3 @@
-from PyQt5.QtCore import *
 import time
 import json
 import os
@@ -17,6 +16,7 @@ import tempfile
 from queue import Queue
 from PIL import Image
 from pixiv_api import *
+from app.core.worker_event import WorkerEvent
 import tag_edit
 import pixiv_api
 from app.core.pixiv_thread_utils import (
@@ -42,18 +42,13 @@ from app.core.pixiv_thread_base import (
 )
 
 class download_thread(PauseableThread):
-    _signal = pyqtSignal(int,int)
-    _output=pyqtSignal(str)
-    _countdown = pyqtSignal(int)
-    _finished = pyqtSignal(str)
-    _timechanged=pyqtSignal(str)
-    _thenext = pyqtSignal(int)
     pid_max=0
     pid_now=0
     path=os.getenv('APPDATA')+r'/pixiv_download/'
-    timelock = QMutex()
+    timelock = threading.Lock()
     def __init__(
         self,
+        q,
         nogif,
         notag,
         notime,
@@ -75,7 +70,7 @@ class download_thread(PauseableThread):
         *legacy_args,
         **legacy_kwargs,
     ):
-        super().__init__()
+        super().__init__(q)
         self.nogif=nogif
         self.notime=notime
         self.notag=notag
@@ -183,7 +178,7 @@ class download_thread(PauseableThread):
             print(f"all_url.txt 讀取完成，URL數量：{len(self.allurl)}")
             print("正在過濾已存在的 PID...")
         except Exception:
-            self._finished.emit('Task finished')
+            self._q.put(WorkerEvent("finished", 'Task finished'))
         raw_allurl_count = len(self.allurl)
         self.allurl, self._task_filter_stats = self._prepare_download_tasks(self.allurl)
         self.pid_max=len(self.allurl)
@@ -228,7 +223,7 @@ class download_thread(PauseableThread):
             stage_key = str(stage or "").strip().lower()
             counts = self._cookie_usage_counts.get(stage_key, {}) if isinstance(self._cookie_usage_counts, dict) else {}
             summary = _format_cookie_usage_summary(counts, self.cookie_pool, self._cookie_alias_map)
-            self._output.emit(f"<p><font color='gray'>[{title}] {summary}</font></p>")
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[{title}] {summary}</font></p>"))
         except Exception:
             pass
 
@@ -406,16 +401,17 @@ class download_thread(PauseableThread):
         try:
             if not self._step4_filter_skip_notice_emitted:
                 self._step4_filter_skip_notice_emitted = True
-                self._output.emit("<p><font color='gray'>[Step4過濾] 已啟用精簡輸出，將改為摘要顯示</font></p>")
+                self._q.put(WorkerEvent("output", "<p><font color='gray'>[Step4過濾] 已啟用精簡輸出，將改為摘要顯示</font></p>"))
             if total > 0 and total % int(self._step4_filter_skip_every) == 0:
-                self._output.emit(
+                self._q.put(WorkerEvent("output",
                     "<p><font color='gray'>[Step4過濾摘要] 已略過 {} 筆（標籤={}、低愛心={}、無meta={}）</font></p>".format(
                         total,
                         int(self._step4_filter_skip_counts.get("tag", 0)),
                         int(self._step4_filter_skip_counts.get("like", 0)),
                         int(self._step4_filter_skip_counts.get("no_meta", 0)),
                     )
-                )
+                ))
+
         except Exception:
             pass
 
@@ -427,14 +423,15 @@ class download_thread(PauseableThread):
         if total <= 0:
             return
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 "<p><font color='gray'>[Step4過濾完成] 共略過 {} 筆（標籤={}、低愛心={}、無meta={}）</font></p>".format(
                     total,
                     int(self._step4_filter_skip_counts.get("tag", 0)),
                     int(self._step4_filter_skip_counts.get("like", 0)),
                     int(self._step4_filter_skip_counts.get("no_meta", 0)),
                 )
-            )
+            ))
+
         except Exception:
             pass
 
@@ -837,9 +834,9 @@ class download_thread(PauseableThread):
             if not self._jxl_path_warned:
                 self._jxl_path_warned = True
                 try:
-                    self._output.emit(
+                    self._q.put(WorkerEvent("output",
                         f"<p><font color='orange'>JXL 已啟用，但找不到 cjxl：{self.jxl_cjxl_path}</font></p>"
-                    )
+                    ))
                 except Exception:
                     pass
             return False, None, None
@@ -896,9 +893,9 @@ class download_thread(PauseableThread):
             try:
                 if saved_bytes is not None and src_size and src_size > 0:
                     saved_ratio = (saved_bytes / float(src_size)) * 100.0
-                    self._output.emit(
+                    self._q.put(WorkerEvent("output",
                         f"<p><font color='gray'>JXL 對比：{os.path.basename(src_path)} {self._format_size_human(src_size)} → {self._format_size_human(dst_size)}（省下 {self._format_size_human(saved_bytes)}, {saved_ratio:.2f}%）</font></p>"
-                    )
+                    ))
             except Exception:
                 pass
             if self.jxl_delete_original:
@@ -913,9 +910,9 @@ class download_thread(PauseableThread):
         if not reason:
             reason = "cjxl conversion failed"
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 f"<p><font color='orange'>JXL 轉檔失敗：{os.path.basename(src_path)} ({reason})</font></p>"
-            )
+            ))
         except Exception:
             pass
 
@@ -1068,25 +1065,24 @@ class download_thread(PauseableThread):
         cookie_used = self._is_cookie_used_for_pid(pid)
         ratio_text = '1.0x' if cookie_used else '0.5x'
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 f"<p><font color='{color}'>[下載等待][{label}] 等待 {delay} 秒 (PID {pid}, 倍率 {ratio_text}, cookie_used={cookie_used}, 多Cookie加速x{cookie_speed_divisor(self.cookie_pool):.2f})</font></p>"
-            )
+            ))
         except Exception:
             pass
         for remaining in range(int(delay), 0, -1):
-            if self._isPause == 2:
+            if self._stop_event.is_set():
                 break
             if respect_group_stop and self._stop_after_group:
                 break
-            while self._isPause == 1:
-                time.sleep(1)
+            self._pause_event.wait()
             try:
-                self._countdown.emit(remaining)
+                self._q.put(WorkerEvent("countdown", remaining))
             except Exception:
                 pass
             time.sleep(1)
         try:
-            self._countdown.emit(0)
+            self._q.put(WorkerEvent("countdown", 0))
         except Exception:
             pass
 
@@ -1304,7 +1300,7 @@ class download_thread(PauseableThread):
                     # 同一 PID 多頁時，頁面間做短暫休眠
                     if idx < len(urls) - 1:
                         self._sleep_within_pid(pid)
-                if self._isPause == 2:
+                if self._stop_event.is_set():
                     break
         finally:
             try:
@@ -1381,21 +1377,21 @@ class download_thread(PauseableThread):
         return file_list
     
     def _emit_step4_header(self):
-        self._output.emit("<p><font color='red'>下載階段開始...</font></p>")
-        self._output.emit(f"<p><font color='red'>Pending URL: {len(self.allurl)}</font></p>")
+        self._q.put(WorkerEvent("output", "<p><font color='red'>下載階段開始...</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>Pending URL: {len(self.allurl)}</font></p>"))
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4過濾設定] like_min={self.like_num}, special_rules={len(self.special_like_rules)}, ban_tag={len(self._ban_tag_norm)}, must_tag={len(self._must_tag_norm)}, ai_dir={bool(self.ai_gen_dir)}</font></p>"
-            )
+            ))
         except Exception:
             pass
         if self.jxl_enable:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>JXL 轉檔啟用：cjxl='{self.jxl_cjxl_path}' effort={self.jxl_effort} delete_original={self.jxl_delete_original}</font></p>"
-            )
+            ))
         try:
             stats = self._task_filter_stats if isinstance(self._task_filter_stats, dict) else {}
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 "<p><font color='gray'>[TaskFilter][Step4] input={}, skipped_exist={}, skipped_like={}, skipped_tag={}, skipped_no_meta={}, duplicate={}, invalid={}, pending={}</font></p>".format(
                     stats.get('input_count', len(self.allurl)),
                     stats.get('skipped_exist_count', 0),
@@ -1406,7 +1402,7 @@ class download_thread(PauseableThread):
                     stats.get('invalid_count', 0),
                     stats.get('output_count', len(self.allurl)),
                 )
-            )
+            ))
         except Exception:
             pass
 
@@ -1419,45 +1415,45 @@ class download_thread(PauseableThread):
         self._emit_step4_filter_skip_final_summary()
         self._emit_cookie_usage_summary("step4", "Step4 Cookie統計")
         try:
-            self._output.emit("<p><font color='orange'>Step4 無待下載 URL，保留現有 all_url.txt 不改寫</font></p>")
+            self._q.put(WorkerEvent("output", "<p><font color='orange'>Step4 無待下載 URL，保留現有 all_url.txt 不改寫</font></p>"))
         except Exception:
             pass
-        if self._stopped_by_request or (self._isPause == 2):
-            self._finished.emit('Task finished')
-            self._thenext.emit(-1)
+        if self._stopped_by_request or self._stop_event.is_set():
+            self._q.put(WorkerEvent("finished", 'Task finished'))
+            self._q.put(WorkerEvent("next", -1))
         else:
-            self._finished.emit('下載完成')
+            self._q.put(WorkerEvent("finished", '下載完成'))
 
     def _execute_downloads(self, pid_order, pid_groups):
         failed_nested = []
         if self.single_mode_flag:
-            self._output.emit("<p><font color='green'>下載模式：單執行緒 + 每個 PID 共用單一 Session</font></p>")
-            self._output.emit(f"<p><font color='green'>同PID等待: {self.intra_pid_wait_min}~{self.intra_pid_wait_max} 秒；PID間等待: {self.download_wait_min}~{self.download_wait_max} 秒</font></p>")
+            self._q.put(WorkerEvent("output", "<p><font color='green'>下載模式：單執行緒 + 每個 PID 共用單一 Session</font></p>"))
+            self._q.put(WorkerEvent("output", f"<p><font color='green'>同PID等待: {self.intra_pid_wait_min}~{self.intra_pid_wait_max} 秒；PID間等待: {self.download_wait_min}~{self.download_wait_max} 秒</font></p>"))
             try:
-                self._output.emit(
+                self._q.put(WorkerEvent("output",
                     f"<p><font color='gray'>下載階段多Cookie加速：{len(self.cookie_pool or [])} 組 cookies，等待加速係數 x{cookie_speed_divisor(self.cookie_pool):.2f}</font></p>"
-                )
+                ))
             except Exception:
                 pass
             for idx, pid in enumerate(pid_order, start=1):
                 if self._stop_after_group:
                     try:
-                        self._output.emit("<p><font color='orange'>收到中止要求：已在上一個 PID 組完成後停止</font></p>")
+                        self._q.put(WorkerEvent("output", "<p><font color='orange'>收到中止要求：已在上一個 PID 組完成後停止</font></p>"))
                     except Exception:
                         pass
                     break
-                if self._isPause == 2:
+                if self._stop_event.is_set():
                     break
                 self._active_group_pid = pid
-                self._output.emit(f"<p><font color='black'>處理 PID {idx}/{len(pid_order)}：{pid}（{len(pid_groups.get(pid, []))} 張）</font></p>")
+                self._q.put(WorkerEvent("output", f"<p><font color='black'>處理 PID {idx}/{len(pid_order)}：{pid}（{len(pid_groups.get(pid, []))} 張）</font></p>"))
                 failed_nested.append(self._download_pid_group(pid, pid_groups.get(pid, [])))
                 self._active_group_pid = None
-                if self._isPause == 2:
+                if self._stop_event.is_set():
                     break
                 if idx < len(pid_order):
                     self._sleep_between_downloads(pid)
         else:
-            self._output.emit("<p><font color='gray'>下載模式：多執行緒（以 PID 為單位分派；每個 PID 仍共用單一 Session）</font></p>")
+            self._q.put(WorkerEvent("output", "<p><font color='gray'>下載模式：多執行緒（以 PID 為單位分派；每個 PID 仍共用單一 Session）</font></p>"))
             max_workers = 4
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as self.executor:
                 futures = [self.executor.submit(self._download_pid_group, pid, pid_groups.get(pid, [])) for pid in pid_order]
@@ -1542,7 +1538,7 @@ class download_thread(PauseableThread):
         remaining_urls = self._compute_remaining_urls(stop_to_download, fail_records)
         self._write_all_url_file(remaining_urls, reason="step4_remaining")
         try:
-            self._output.emit(f"<p><font color='gray'>已更新 all_url.txt，剩餘 {len(remaining_urls)} 筆待下載</font></p>")
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>已更新 all_url.txt，剩餘 {len(remaining_urls)} 筆待下載</font></p>"))
         except Exception:
             pass
         self._persist_url_meta()
@@ -1575,23 +1571,23 @@ class download_thread(PauseableThread):
                 total_ratio = 0.0
                 if int(self._jxl_src_total_bytes) > 0:
                     total_ratio = (float(total_saved) / float(self._jxl_src_total_bytes)) * 100.0
-                self._output.emit(
+                self._q.put(WorkerEvent("output",
                     f"<p><font color='gray'>JXL 結果：成功 {self._jxl_ok_count}、失敗 {self._jxl_fail_count}、總容量 {self._format_size_human(self._jxl_src_total_bytes)} → {self._format_size_human(self._jxl_dst_total_bytes)}（省下 {self._format_size_human(total_saved)}, {total_ratio:.2f}%）</font></p>"
-                )
+                ))
             except Exception:
                 pass
-        self._timechanged.emit(datetime.datetime.strftime(self.download_time, '%Y-%m-%d %H:%M:%S'))
+        self._q.put(WorkerEvent("timechanged", datetime.datetime.strftime(self.download_time, '%Y-%m-%d %H:%M:%S')))
         self._emit_step4_filter_skip_final_summary()
         self._emit_cookie_usage_summary("step4", "Step4 Cookie統計")
-        if self._stopped_by_request or (self._isPause == 2):
+        if self._stopped_by_request or self._stop_event.is_set():
             self._diag(
                 "step4_finished",
                 status="stopped",
                 remaining_count=len(remaining_urls),
                 exist_pid_count=len(self.exist_pid),
             )
-            self._finished.emit('Task finished')
-            self._thenext.emit(-1)
+            self._q.put(WorkerEvent("finished", 'Task finished'))
+            self._q.put(WorkerEvent("next", -1))
         else:
             self._diag(
                 "step4_finished",
@@ -1599,7 +1595,7 @@ class download_thread(PauseableThread):
                 remaining_count=len(remaining_urls),
                 exist_pid_count=len(self.exist_pid),
             )
-            self._finished.emit('下載完成')
+            self._q.put(WorkerEvent("finished", '下載完成'))
 
     def run(self):
         try:
@@ -1618,16 +1614,16 @@ class download_thread(PauseableThread):
                 return
             pid_order, pid_groups = self._group_urls_by_pid(self.allurl)
             self._diag("step4_grouped", pid_count=len(pid_order), url_count=len(self.allurl))
-            self._output.emit(f"<p><font color='gray'>PID 分組完成：{len(pid_order)} 個 PID、{len(self.allurl)} 個 URL</font></p>")
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>PID 分組完成：{len(pid_order)} 個 PID、{len(self.allurl)} 個 URL</font></p>"))
             failed_nested = self._execute_downloads(pid_order, pid_groups)
             remaining_urls = self._finalize_downloads(failed_nested)
             self._refresh_and_write_exist_pid()
             self._emit_step4_summary_and_finalize(remaining_urls)
         except Exception as e:
             self._diag("step4_exception", error=output_err(e))
-            self._output.emit('Task failed')
-            self._output.emit(output_err(e))
-            self._thenext.emit(-1)
+            self._q.put(WorkerEvent("output", 'Task failed'))
+            self._q.put(WorkerEvent("output", output_err(e)))
+            self._q.put(WorkerEvent("next", -1))
     def gif_or_jpg(self,url, session=None):
         original_url = str(url)
         resolved_url = self._resolve_download_url(original_url)
@@ -1640,22 +1636,21 @@ class download_thread(PauseableThread):
                 page = self._extract_page_from_download_url(original_url)
             media = "ugoira" if "ugoira" in str(resolved_url).lower() else "image"
             if page is None:
-                self._output.emit(f"<p><font color='black'>[下載] PID {pid_for_log} ({media})</font></p>")
+                self._q.put(WorkerEvent("output", f"<p><font color='black'>[下載] PID {pid_for_log} ({media})</font></p>"))
             else:
-                self._output.emit(f"<p><font color='black'>[下載] PID {pid_for_log} 第 {int(page) + 1} 張 ({media})</font></p>")
+                self._q.put(WorkerEvent("output", f"<p><font color='black'>[下載] PID {pid_for_log} 第 {int(page) + 1} 張 ({media})</font></p>"))
         except Exception:
             pass
-        while(self._isPause==1):
-            time.sleep(1)
+        self._pause_event.wait()
         try:
             with self._attempted_urls_lock:
                 self._attempted_urls.add(original_url)
         except Exception:
             pass
-        if self._isPause!=2:
+        if not self._stop_event.is_set():
             self.pid_now=self.pid_now+1
-            self._signal.emit(1,self.pid_max)
-        if self._isPause==2:
+            self._q.put(WorkerEvent("progress", (1, self.pid_max)))
+        if self._stop_event.is_set():
             self.q.put(original_url)
             return 0
         if 'ugoira' in resolved_url:
@@ -1723,9 +1718,9 @@ class download_thread(PauseableThread):
                 pass
 
         try:
-            self._output.emit(
+            self._q.put(WorkerEvent("output",
                 f"<p><font color='blue'>[GIF][Cookie] PID {pid_key} 使用 cookies（來源：{source}），已更新 all_url_meta 暫存</font></p>"
-            )
+            ))
         except Exception:
             pass
 
@@ -1736,7 +1731,7 @@ class download_thread(PauseableThread):
             normalized = self._load_artwork_metadata(pid, pid_cookie)
             if not normalized:
                 try:
-                    self._output.emit(f"<p><font color='orange'>PID {pid} 取得 ugoira 資訊失敗，已標記為失敗任務</font></p>")
+                    self._q.put(WorkerEvent("output", f"<p><font color='orange'>PID {pid} 取得 ugoira 資訊失敗，已標記為失敗任務</font></p>"))
                 except Exception:
                     pass
                 return [url, my_time.strftime('%Y%m%d_%H%M%S')]
@@ -1792,11 +1787,11 @@ class download_thread(PauseableThread):
             zip_bytes = None
             if htmlfile.status_code == 200: # 請求成功才開始下載資料
                     #print('Start download,[File size]:{size:.2f} MB'.format(size = content_size / chunk_size /1024)) # 偵錯用：可印出檔案大小
-                    self.timelock.lock()
+                    self.timelock.acquire()
                     
                     self.download_time= self.download_time+datetime.timedelta(seconds=1)
                     print(datetime.datetime.strftime(self.download_time,'%Y-%m-%d %H:%M:%S'))
-                    self.timelock.unlock()
+                    self.timelock.release()
                     chunks = []
                     for data in htmlfile.iter_content(chunk_size=65536):
                         if data:
@@ -1835,10 +1830,10 @@ class download_thread(PauseableThread):
         return [url,my_time.strftime('%Y%m%d_%H%M%S')]          
     
     def jpg_download(self,url, session=None):
-        self.timelock.lock()
+        self.timelock.acquire()
         timetag=self.download_time.strftime('%Y%m%d_%H%M%S')
         self.download_time += datetime.timedelta(seconds=1)
-        self.timelock.unlock()
+        self.timelock.release()
         last_err = None
         for i in range (0,5): # 最多重試 5 次，失敗就回傳錯誤
             try:
@@ -1901,26 +1896,26 @@ class download_thread(PauseableThread):
             self._stop_after_group = True
             self._stopped_by_request = True
             # 若目前在暫停中，先解除暫停，才能在當前 PID 組完成後停下
-            if self._isPause == 1:
-                self._isPause = 0
+            if not self._pause_event.is_set():
+                self._pause_event.set()
                 try:
-                    self._output.emit("<p><font color='orange'>收到中止要求：已解除暫停，將在當前 PID 組完成後停止</font></p>")
+                    self._q.put(WorkerEvent("output", "<p><font color='orange'>收到中止要求：已解除暫停，將在當前 PID 組完成後停止</font></p>"))
                 except Exception:
                     pass
             try:
                 if self._active_group_pid is not None:
-                    self._output.emit(f"<p><font color='orange'>收到中止要求：目前正在處理 PID {self._active_group_pid}，將在此組完成後停止</font></p>")
+                    self._q.put(WorkerEvent("output", f"<p><font color='orange'>收到中止要求：目前正在處理 PID {self._active_group_pid}，將在此組完成後停止</font></p>"))
                 else:
-                    self._output.emit("<p><font color='orange'>收到中止要求：目前無活動 PID，將立即停止</font></p>")
-                    self._isPause = 2
+                    self._q.put(WorkerEvent("output", "<p><font color='orange'>收到中止要求：目前無活動 PID，將立即停止</font></p>"))
+                    self._stop_event.set()
+                    self._pause_event.set()
             except Exception:
                 pass
             return
         self._stopped_by_request = True
-        if self._isPause == 1:
-            self._isPause = 0
-        self._output.emit("<p><font color='red'>已停止</font></p>")
-        self._isPause = 2 
+        self._pause_event.set()
+        self._q.put(WorkerEvent("output", "<p><font color='red'>已停止</font></p>"))
+        self._stop_event.set()
 
 
 

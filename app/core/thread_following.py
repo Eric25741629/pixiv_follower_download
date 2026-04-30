@@ -1,4 +1,3 @@
-from PyQt5.QtCore import *
 import time
 import os
 import concurrent.futures
@@ -7,6 +6,7 @@ import numpy as np
 import threading
 from functools import partial
 from pixiv_api import *
+from app.core.worker_event import WorkerEvent
 from app.core.pixiv_thread_utils import (
     atomic_write_json,
     atomic_write_text,
@@ -19,12 +19,8 @@ from app.core.pixiv_thread_base import (
 
 class get_following(PauseableThread):
     '''抓取使用者關注的畫師清單'''
-    _signal = pyqtSignal(int,int)
-    _output=pyqtSignal(str)
-    _finished = pyqtSignal(str)
-    _thenext = pyqtSignal(int)
-    def __init__(self,userid,cookies,Agent,hide_mode):
-        super().__init__()
+    def __init__(self, q, userid, cookies, Agent, hide_mode):
+        super().__init__(q)
         self.userid=userid
         self.cookies=cookies
         self.Agent=Agent
@@ -60,16 +56,15 @@ class get_following(PauseableThread):
 
     def get_follow_illust(self,id,headers,state,times):
         '''取得指定分頁的關注畫師（公開或私人）'''
-        while self._isPause == 1:
-            time.sleep(1)
-        if self._isPause == 2:
+        self._pause_event.wait()
+        if self._stop_event.is_set():
             return []
         global pid_num
         pid_num=pid_num+100
         url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
         res = requests.get(url.format(id), headers=headers, timeout=(10, 30))
         resdicts = safe_json(res, 'body', 'users', default=[])
-        self._signal.emit(100,self.max)
+        self._q.put(WorkerEvent("progress", (100, self.max)))
         i=[]
         try:
             for resdict in resdicts:
@@ -107,7 +102,7 @@ class get_following(PauseableThread):
             self.max=int(hide_total_num+show_total_num)
         else:
             self.max=int(show_total_num)
-        self._output.emit(f'total following: {self.max}')
+        self._q.put(WorkerEvent("output", f'total following: {self.max}'))
         with concurrent.futures.ThreadPoolExecutor(max_workers=16) as self.executor:
             func=partial(self.get_follow_illust,self.userid,headers,'show')
             pixiv_following = list(self.executor.map(func,show_list))
@@ -127,14 +122,14 @@ class get_following(PauseableThread):
         try:
             all_pixiv_ids = self.illusts()
             texts = np.unique(all_pixiv_ids).tolist()
-            self._output.emit('抓取 following 完成')
+            self._q.put(WorkerEvent("output", '抓取 following 完成'))
             atomic_write_text(os.path.join(self.path, "following.txt"), texts, backup=True)
             atomic_write_json(os.path.join(self.path, "following.json"), texts, backup=True)
-            self._output.emit("<p><font color='red'>抓取關注畫師完成</font></p>")
-            self._thenext.emit(2)
-            self._finished.emit('抓取關注畫師完成')
+            self._q.put(WorkerEvent("output", "<p><font color='red'>抓取關注畫師完成</font></p>"))
+            self._q.put(WorkerEvent("next", 2))
+            self._q.put(WorkerEvent("finished", '抓取關注畫師完成'))
         except Exception as e:
-            self._output.emit('Task failed')
-            self._output.emit(output_err(e))
-            self._thenext.emit(-1)
+            self._q.put(WorkerEvent("output", 'Task failed'))
+            self._q.put(WorkerEvent("output", output_err(e)))
+            self._q.put(WorkerEvent("next", -1))
 
