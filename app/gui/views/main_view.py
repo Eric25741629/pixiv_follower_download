@@ -37,6 +37,8 @@ class MainView:
         self._progress_bar = ft.ProgressBar(value=0, expand=True)
         self._progress_text = ft.Text("", size=12, color=ft.Colors.GREY_600)
         self._countdown_text = ft.Text("", size=12, color=ft.Colors.ORANGE_600)
+        self._progress_value = 0
+        self._progress_total = 0
 
         self._log_lines: list[ft.Text] = []
         self._log_list = ft.ListView(
@@ -76,12 +78,42 @@ class MainView:
         if len(self._log_lines) > _MAX_LOG_LINES:
             self._log_lines.pop(0)
 
-    def update_progress(self, current: int, total: int) -> None:
-        self._progress_bar.value = current / total if total else 0
-        self._progress_text.value = f"{current}/{total}"
+    def update_progress(self, delta: int, total: int) -> None:
+        # Workers emit (delta, total) per step, with delta == 0 marking a reset
+        # at the start of a phase. We accumulate locally so the bar grows.
+        try:
+            d = int(delta)
+            t = int(total)
+        except (TypeError, ValueError):
+            return
+        if d <= 0:
+            self._progress_value = 0
+        else:
+            self._progress_value += d
+        self._progress_total = t
+        if t > 0:
+            ratio = self._progress_value / t
+            self._progress_bar.value = max(0.0, min(1.0, ratio))
+            self._progress_text.value = f"{self._progress_value}/{t}"
+        else:
+            self._progress_bar.value = 0
+            self._progress_text.value = ""
+        try:
+            self._progress_bar.update()
+            self._progress_text.update()
+        except Exception:
+            pass
 
     def update_countdown(self, remaining: int) -> None:
-        self._countdown_text.value = f"倒數：{remaining} 秒" if remaining > 0 else ""
+        try:
+            r = int(remaining)
+        except (TypeError, ValueError):
+            r = 0
+        self._countdown_text.value = f"倒數：{r} 秒" if r > 0 else ""
+        try:
+            self._countdown_text.update()
+        except Exception:
+            pass
 
     def set_running(self, is_running: bool) -> None:
         self._btn_pause.disabled = not is_running

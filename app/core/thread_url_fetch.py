@@ -114,10 +114,22 @@ class get_img_url_thread(PauseableThread):
         self._pending_pid_file_path = os.path.join(self.path, "pictures_id.txt")
         self._pending_pid_lock = threading.Lock()
         self._pending_pid_remaining = set()
+        try:
+            self._q.put(WorkerEvent("output", "<p><font color='gray'>[Step3初始化] 載入 URL 中繼資料快取...</font></p>"))
+        except Exception:
+            pass
         meta = safe_read_json(self.url_meta_path, {})
         self.url_meta = meta if isinstance(meta, dict) else {}
+        try:
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[Step3初始化] all_url_meta.json 載入 {len(self.url_meta)} 筆，開始 schema 遷移檢查...</font></p>"))
+        except Exception:
+            pass
         self._migrate_url_meta_schema()
         self._revoked_pid_set = set(read_pid_lines(self.revoked_pid_path))
+        try:
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[Step3初始化] 失效 PID 名單 {len(self._revoked_pid_set)} 筆</font></p>"))
+        except Exception:
+            pass
         try:
             req_path = os.path.join(self.path, 'pixiv_cookie_requirement.json')
             req_data = safe_read_json(req_path, {})
@@ -127,6 +139,10 @@ class get_img_url_thread(PauseableThread):
                         self._cookie_requirement_map[str(_pid)] = _entry.get('requires_cookie')
         except Exception:
             self._cookie_requirement_map = {}
+        try:
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[Step3初始化] Cookie 需求快取 {len(self._cookie_requirement_map)} 筆，初始化完成</font></p>"))
+        except Exception:
+            pass
         #print(self.no_to_check)
         self._diag(
             "step3_init",
@@ -1126,6 +1142,10 @@ class get_img_url_thread(PauseableThread):
         self._step3_wait_applied_count = 0
 
     def _load_and_filter_pid_list(self):
+        try:
+            self._q.put(WorkerEvent("output", "<p><font color='gray'>[Step3] 讀取 pictures_id.txt 並比對既有檔案...</font></p>"))
+        except Exception:
+            pass
         pictures_id = self.check_exist()
         if not isinstance(pictures_id, list):
             self._q.put(WorkerEvent("output", "<p><font color='red'>pictures_id 讀取失敗，無法開始 URL 階段</font></p>"))
@@ -1266,10 +1286,18 @@ class get_img_url_thread(PauseableThread):
         self._q.put(WorkerEvent("next", -1))
 
     def _finalize_on_complete(self, results):
+        try:
+            self._q.put(WorkerEvent("output", "<p><font color='gray'>[Step3完成] 整理結果並寫入 all_url.txt...</font></p>"))
+        except Exception:
+            pass
         results = [i for item in results if isinstance(item, list) for i in item]
         error_pid = [i for i in results if 'https' not in i]
         results = [i for i in results if 'https' in i]
         old_urls, new_urls, merged = self._write_all_url_snapshot(results)
+        try:
+            self._q.put(WorkerEvent("output", "<p><font color='gray'>[Step3完成] 持久化剩餘 pending PID...</font></p>"))
+        except Exception:
+            pass
         self._persist_pending_pid_file()  # Phase 36: flush remaining pending PIDs
         self._diag(
             "step3_completed",
@@ -1285,6 +1313,10 @@ class get_img_url_thread(PauseableThread):
         if len(new_urls) == 0:
             self._q.put(WorkerEvent("output", "<p><font color='gray'>沒有新的 URL，已保留原 all_url.txt</font></p>"))
         try:
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[Step3完成] 寫入 all_url_meta.json（{len(self.url_meta)} 筆）...</font></p>"))
+        except Exception:
+            pass
+        try:
             try:
                 atomic_write_json(self.url_meta_path, self.url_meta)
             except Exception:
@@ -1293,6 +1325,10 @@ class get_img_url_thread(PauseableThread):
         except Exception as e:
             self._q.put(WorkerEvent("output", f"<p><font color='red'>寫入 all_url_meta.json 失敗: {e}</font></p>"))
         file_path = self.path
+        try:
+            self._q.put(WorkerEvent("output", "<p><font color='gray'>[Step3完成] 附加 tag_ban / pid_num / net_err 紀錄...</font></p>"))
+        except Exception:
+            pass
         tag_err = [self.tag_queue.get() for _ in range(self.tag_queue.qsize())]
         try:
             from safe_io import atomic_append_text
