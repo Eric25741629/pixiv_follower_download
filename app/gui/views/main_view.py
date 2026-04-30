@@ -182,10 +182,10 @@ class MainView:
         # active worker to resume.
         if not is_running:
             self._is_paused = False
-            self._btn_pause.text = "⏸ 暫停"
+            self._btn_pause.content = "⏸ 暫停"
         else:
             self._is_paused = False
-            self._btn_pause.text = "⏸ 暫停"
+            self._btn_pause.content = "⏸ 暫停"
 
     def _on_run_all(self, e: ft.ControlEvent) -> None:
         if self._run_controller is None:
@@ -228,7 +228,7 @@ class MainView:
                 except Exception:
                     pass
             self._is_paused = False
-            self._btn_pause.text = "⏸ 暫停"
+            self._btn_pause.content = "⏸ 暫停"
         else:
             if hasattr(t, "pause"):
                 try:
@@ -236,7 +236,7 @@ class MainView:
                 except Exception:
                     pass
             self._is_paused = True
-            self._btn_pause.text = "▶ 繼續"
+            self._btn_pause.content = "▶ 繼續"
         try:
             self._btn_pause.update()
         except Exception:

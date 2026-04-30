@@ -99,7 +99,9 @@ class PauseableThread(threading.Thread):
     def pause(self):
         self._pause_event.clear()
         self._q.put(WorkerEvent("output", "<p><font color='red'>已暫停</font></p>"))
-        self._on_pause_hook()
+        # Hooks may do disk I/O (e.g. flushing partial-progress JSON). Run
+        # them off the caller's thread so a UI click handler isn't blocked.
+        threading.Thread(target=self._on_pause_hook, daemon=True).start()
 
     def resume(self):
         self._pause_event.set()
@@ -109,7 +111,7 @@ class PauseableThread(threading.Thread):
         self._stop_event.set()
         self._pause_event.set()   # unblock any waiting pause
         self._q.put(WorkerEvent("output", "<p><font color='red'>已停止</font></p>"))
-        self._on_stop_hook()
+        threading.Thread(target=self._on_stop_hook, daemon=True).start()
 
     def _on_pause_hook(self):
         pass
