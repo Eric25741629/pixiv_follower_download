@@ -124,12 +124,20 @@ class PauseableThread(threading.Thread):
         for remaining in range(int(delay), 0, -1):
             if self._stop_event.is_set():
                 break
-            self._pause_event.wait()
+            # Poll pause every 0.5s so stop() wakes us promptly even mid-pause.
+            while not self._pause_event.is_set():
+                if self._stop_event.is_set():
+                    break
+                self._pause_event.wait(timeout=0.5)
+            if self._stop_event.is_set():
+                break
             try:
                 self._q.put(WorkerEvent("countdown", remaining))
             except Exception:
                 pass
-            time.sleep(1)
+            # _stop_event.wait returns True if set; lets us break out instantly.
+            if self._stop_event.wait(timeout=1.0):
+                break
         try:
             self._q.put(WorkerEvent("countdown", 0))
         except Exception:

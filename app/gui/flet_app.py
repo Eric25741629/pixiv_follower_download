@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import queue
 import flet as ft
 
@@ -126,6 +127,41 @@ def main(page: ft.Page) -> None:
         )
     )
     page.run_thread(disp.run)
+
+    # ── shutdown handling ───────────────────────────────────────────────────
+    # Without this, closing the window leaves the dispatcher polling and any
+    # in-flight worker thread (incl. its concurrent.futures pool with 30 s
+    # request timeouts) blocking interpreter exit via atexit hooks.
+    async def _shutdown_and_destroy() -> None:
+        try:
+            t = getattr(main_view, "_active_thread", None)
+            if t is not None and hasattr(t, "stop"):
+                try:
+                    t.stop()
+                except Exception:
+                    pass
+        finally:
+            disp.stop()
+            try:
+                await page.window.destroy()
+            except Exception:
+                pass
+            # concurrent.futures registers an atexit hook that joins its
+            # daemon workers; an in-flight requests.get with a 30 s timeout
+            # would otherwise block the process from exiting.
+            os._exit(0)
+
+    async def on_window_event(e) -> None:
+        if getattr(e, "type", None) == ft.WindowEventType.CLOSE:
+            await _shutdown_and_destroy()
+
+    async def on_disconnect(e) -> None:
+        # Web mode: tab/window closed.
+        await _shutdown_and_destroy()
+
+    page.window.prevent_close = True
+    page.window.on_event = on_window_event
+    page.on_disconnect = on_disconnect
 
 
 if __name__ == "__main__":
