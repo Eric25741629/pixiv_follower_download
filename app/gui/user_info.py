@@ -1,5 +1,4 @@
-from PyQt5.QtWidgets import QFileDialog
-from PyQt5.QtCore import QDateTime
+import datetime
 import os
 import json
 import pixiv_api
@@ -100,11 +99,10 @@ class Userdata_controller:
                 value = fallback
             self._apply_field(widget, setter, value, fallback)
 
-        if self.last_download_time == "":
-            self._ui_download_time.setDateTime(QDateTime.currentDateTime())
-        else:
-            self._ui_download_time.setDateTime(
-                QDateTime.fromString(self.last_download_time, "yyyy-MM-dd hh:mm:ss"))
+        if self._ui_download_time is not None:
+            dt_str = self.last_download_time or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if hasattr(self._ui_download_time, "value"):
+                self._ui_download_time.value = dt_str
         self._ui_ban_tag_list.addItems(self.ban_tag)
         self._ui_must_tag_list.addItems(self.must_tag)
 
@@ -127,15 +125,16 @@ class Userdata_controller:
             print(err)
             self.download_path = os.path.expanduser("~/Pixiv_download/")
             self._ui_user_path1.setText(self.download_path)
-            self._ui_download_time.setDateTime(QDateTime.currentDateTime())
+            if self._ui_download_time is not None and hasattr(self._ui_download_time, "value"):
+                self._ui_download_time.value = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.write_data()
 
         return (self.path, self.download_path, self.exist_pid,
                 self._ui_user_path1, self.Author_list, self.ban_tag, self.must_tag)
 
     def open_folder(self):
-        folder_path = QFileDialog.getExistingDirectory(None, "Open folder", "./")
-        return folder_path
+        # FilePicker is handled by the Flet view layer; return None as sentinel
+        return None
 
     def set_downloaa_path(self):
         self.download_path = self.open_folder() + '/'
@@ -161,7 +160,11 @@ class Userdata_controller:
             "r18_like_num": _spin(self._ui_r18_like_num),
             "ban_tag": self.ban_tag,
             "must_tag": self.must_tag,
-            "download_time": self._ui_download_time.dateTime().toString("yyyy-MM-dd hh:mm:ss"),
+            "download_time": (
+                self._ui_download_time.value
+                if self._ui_download_time is not None and hasattr(self._ui_download_time, "value")
+                else ""
+            ),
             "rule_tag_1": _text(self._ui_rule_tag_1),
             "rule_like_1": _spin(self._ui_rule_like_1),
             "rule_tag_2": _text(self._ui_rule_tag_2),
