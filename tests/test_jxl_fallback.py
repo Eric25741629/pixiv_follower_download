@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import queue
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -8,13 +9,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.core.pixiv_thread import download_thread
 
 
-class DummySignal:
-    def emit(self, _msg):
-        return None
-
-
 def _build_thread_stub(tmp_path: Path):
     t = download_thread.__new__(download_thread)
+    t._q = queue.Queue()
     t.jxl_enable = True
     t.jxl_delete_original = False
     t.jxl_effort = 7
@@ -22,7 +19,6 @@ def _build_thread_stub(tmp_path: Path):
     t._jxl_ok_count = 0
     t._jxl_fail_count = 0
     t._jxl_gif_skip_warned = False
-    t._output = DummySignal()
     cjxl = tmp_path / "cjxl.exe"
     cjxl.write_bytes(b"")
     t.jxl_cjxl_path = str(cjxl)
