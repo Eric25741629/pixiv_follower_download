@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import queue
 import threading
 from typing import Any, Callable
@@ -9,9 +10,12 @@ from app.core.worker_event import WorkerEvent
 class EventDispatcher:
     """Polls a WorkerEvent queue and dispatches events to Flet UI handlers.
 
-    Designed to run in a background thread via page.run_thread(dispatcher.run).
-    Uses an Event for stop so close-time wake-up is instant rather than
-    waiting for the current 50 ms tick to expire.
+    Must run as an async coroutine via page.run_task(dispatcher.run) so the
+    handlers (and therefore control.update() / page.update()) execute on the
+    asyncio event-loop thread. Running it via page.run_thread() instead lets
+    update() enqueue patches via asyncio.Queue.put_nowait from the wrong
+    thread — the consumer task isn't woken, so the UI only repaints when
+    *any* user event (drag, click) finally pumps the loop.
     """
 
     def __init__(self, page: Any, q: queue.Queue, handlers: dict[str, Callable]):
@@ -27,7 +31,10 @@ class EventDispatcher:
                 ev: WorkerEvent = self._q.get_nowait()
                 handler = self._handlers.get(ev.type)
                 if handler is not None:
-                    handler(ev.data)
+                    try:
+                        handler(ev.data)
+                    except Exception:
+                        pass
                 updated = True
         except queue.Empty:
             pass
@@ -37,11 +44,12 @@ class EventDispatcher:
             except Exception:
                 pass
 
-    def run(self) -> None:
+    async def run(self) -> None:
         while not self._stop_event.is_set():
             self._poll_once()
-            # wait() returns True when stop is set -> exit immediately
-            if self._stop_event.wait(timeout=0.05):
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
                 break
 
     def stop(self) -> None:

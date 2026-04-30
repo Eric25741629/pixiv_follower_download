@@ -91,12 +91,20 @@ def main(page: ft.Page) -> None:
                 main_view.set_step_state(i, "done")
         run_controller.on_next(data)
 
+    def handle_loading(data) -> None:
+        if isinstance(data, tuple) and len(data) == 2:
+            busy, message = data
+            main_view.set_loading(bool(busy), str(message) if message else "正在啟動...")
+        else:
+            main_view.set_loading(bool(data))
+
     disp = EventDispatcher(page, event_q, {
         "output":    handle_output,
         "progress":  handle_progress,
         "countdown": handle_countdown,
         "finished":  handle_finished,
         "next":      handle_next,
+        "loading":   handle_loading,
     })
 
     def toggle_theme(e: ft.ControlEvent) -> None:
@@ -126,7 +134,11 @@ def main(page: ft.Page) -> None:
             expand=True,
         )
     )
-    page.run_thread(disp.run)
+    # IMPORTANT: dispatcher must run as a task on the asyncio event loop so
+    # control.update() and page.update() actually flush to the client. With
+    # page.run_thread() patches end up on an asyncio.Queue from the wrong
+    # thread and only flush when the user pokes the UI (drag, click).
+    page.run_task(disp.run)
 
     # ── shutdown handling ───────────────────────────────────────────────────
     # Without this, closing the window leaves the dispatcher polling and any

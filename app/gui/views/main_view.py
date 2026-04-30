@@ -3,6 +3,8 @@ import queue
 import threading
 import flet as ft
 
+from app.core.worker_event import WorkerEvent
+
 
 STEP_LABELS = ["步驟 1\n抓追蹤", "步驟 2\n抓 PID", "步驟 3\n抓 URL", "步驟 4\n下載"]
 _STATE_COLORS = {
@@ -178,7 +180,7 @@ class MainView:
     def _on_run_all(self, e: ft.ControlEvent) -> None:
         if self._run_controller is None:
             return
-        self.set_loading(True, "正在啟動 一鍵執行...")
+        self._event_q.put(WorkerEvent("loading", (True, "正在啟動 一鍵執行...")))
         threading.Thread(
             target=self._run_in_background,
             args=(self._run_controller.run_all,),
@@ -188,7 +190,7 @@ class MainView:
     def _on_run_step(self, step: int) -> None:
         if self._run_controller is None:
             return
-        self.set_loading(True, f"正在啟動 步驟 {step}...")
+        self._event_q.put(WorkerEvent("loading", (True, f"正在啟動 步驟 {step}...")))
         threading.Thread(
             target=self._run_in_background,
             args=(self._run_controller.run_step, step),
@@ -197,11 +199,13 @@ class MainView:
 
     def _run_in_background(self, fn, *args) -> None:
         """Run a RunController call off the UI thread so the loading overlay
-        actually renders before the slow worker __init__ blocks the caller."""
+        actually renders before the slow worker __init__ blocks the caller.
+        Both loading toggles go through the queue so the actual show/pop_dialog
+        happens on the event loop thread (where Flet patches actually flush)."""
         try:
             fn(*args)
         finally:
-            self.set_loading(False)
+            self._event_q.put(WorkerEvent("loading", (False, "")))
 
     def _on_pause(self, e: ft.ControlEvent) -> None:
         if self._active_thread and hasattr(self._active_thread, "pause"):
