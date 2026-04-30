@@ -15,10 +15,11 @@ class SettingsView:
 
     def __init__(self, page: ft.Page):
         self._page = page
-        # Flet 0.84+: FilePicker is async — no on_result callback; await the method instead
+        # Flet 0.84: FilePicker is a Service (not a Control) and is registered
+        # via page.services; methods are async and return values directly.
         self._file_picker = ft.FilePicker()
         self._jxl_picker = ft.FilePicker()
-        page.overlay.extend([self._file_picker, self._jxl_picker])
+        page.services.extend([self._file_picker, self._jxl_picker])
 
         store = _store()
         store.migrate_from_legacy()
