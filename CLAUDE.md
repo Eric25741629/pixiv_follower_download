@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Before touching `app/gui/`, `app/core/thread_*.py`, or anything Flet-related,
+> read `.claude/skills/flet-0-84-pitfalls/SKILL.md`.** It documents every API
+> rename, threading hazard, and dialog-system change that bit during the
+> PyQt5 → Flet 0.84 migration.
+
 ## Commands
 
 Run the app (desktop):
