@@ -27,10 +27,13 @@ class get_following(PauseableThread):
         self.path=os.getenv('APPDATA')+r'/pixiv_download/'
         self._partial_following = []
         self._partial_lock = threading.Lock()
-        try:
-            self.hide = hide_mode.isChecked()
-        except Exception:
-            self.hide = False
+        if hasattr(hide_mode, "isChecked"):
+            try:
+                self.hide = bool(hide_mode.isChecked())
+            except Exception:
+                self.hide = False
+        else:
+            self.hide = bool(hide_mode)
         self.max=0
 
     def _flush_following_snapshot(self):

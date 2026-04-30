@@ -20,6 +20,7 @@ class MainView:
         self._page = page
         self._event_q = event_q
         self._active_thread = None
+        self._run_controller = None  # injected by flet_app after construction
         self._step_states: list[str] = ["idle", "idle", "idle", "idle"]
 
         self._step_card_containers: list[ft.Container] = []
@@ -90,10 +91,12 @@ class MainView:
             b.disabled = is_running
 
     def _on_run_all(self, e: ft.ControlEvent) -> None:
-        pass  # wired in flet_app.py Task 11
+        if self._run_controller is not None:
+            self._run_controller.run_all()
 
     def _on_run_step(self, step: int) -> None:
-        pass  # wired in flet_app.py Task 11
+        if self._run_controller is not None:
+            self._run_controller.run_step(step)
 
     def _on_pause(self, e: ft.ControlEvent) -> None:
         if self._active_thread and hasattr(self._active_thread, "pause"):

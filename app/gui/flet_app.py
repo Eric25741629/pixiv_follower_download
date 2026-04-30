@@ -3,6 +3,7 @@ import queue
 import flet as ft
 
 from app.gui.dispatcher import EventDispatcher
+from app.gui.run_actions import RunController
 from app.gui.views.main_view import MainView
 from app.gui.views.settings_view import SettingsView
 from app.gui.views.cookies_view import CookiesView
@@ -21,6 +22,9 @@ def main(page: ft.Page) -> None:
     main_view = MainView(page, event_q)
     settings_view = SettingsView(page)
     cookies_view = CookiesView(page)
+
+    run_controller = RunController(main_view, event_q)
+    main_view._run_controller = run_controller
 
     views_built = [main_view.build(), settings_view.build(), cookies_view.build()]
 
@@ -69,11 +73,22 @@ def main(page: ft.Page) -> None:
 
     def handle_finished(data: str) -> None:
         main_view.append_log(f"<p><font color='green'>{data}</font></p>")
+        for i, st in enumerate(main_view._step_states):
+            if st == "running":
+                main_view.set_step_state(i, "done")
         main_view.set_running(False)
 
     def handle_next(data: int) -> None:
         if data == -1:
+            for i, st in enumerate(main_view._step_states):
+                if st == "running":
+                    main_view.set_step_state(i, "error")
             main_view.set_running(False)
+            return
+        for i, st in enumerate(main_view._step_states):
+            if st == "running":
+                main_view.set_step_state(i, "done")
+        run_controller.on_next(data)
 
     disp = EventDispatcher(page, event_q, {
         "output":    handle_output,
