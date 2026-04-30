@@ -34,8 +34,9 @@ class MainView:
             ft.OutlinedButton(f"步驟 {i+1}", on_click=lambda e, n=i+1: self._on_run_step(n))
             for i in range(4)
         ]
-        self._btn_pause = ft.OutlinedButton("⏸ 暫停", on_click=self._on_pause, disabled=True)
+        self._btn_pause = ft.OutlinedButton("⏸ 暫停", on_click=self._on_pause_toggle, disabled=True)
         self._btn_stop = ft.OutlinedButton("⏹ 停止", on_click=self._on_stop, disabled=True)
+        self._is_paused = False
 
         self._progress_bar = ft.ProgressBar(value=0, expand=True)
         self._progress_text = ft.Text("", size=12, color=ft.Colors.GREY_600, width=120)
@@ -49,7 +50,7 @@ class MainView:
         self._progress_value = 0
         self._progress_total = 0
 
-        # Modal "preparing..." overlay shown while a step is being launched.
+        # Modal overlay shown while a step is launching or stopping.
         self._loading_msg = ft.Text("正在啟動...", size=15, weight=ft.FontWeight.BOLD)
         self._loading_dialog = ft.AlertDialog(
             modal=True,
@@ -57,7 +58,7 @@ class MainView:
                 controls=[
                     ft.ProgressRing(width=56, height=56, stroke_width=4),
                     self._loading_msg,
-                    ft.Text("請稍候，前置作業進行中...", size=12, color=ft.Colors.GREY_600),
+                    ft.Text("請勿關閉視窗", size=12, color=ft.Colors.GREY_600),
                 ],
                 tight=True,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -176,6 +177,15 @@ class MainView:
         self._btn_run_all.disabled = is_running
         for b in self._btn_step:
             b.disabled = is_running
+        # Reset pause toggle to "暫停" whenever the worker stops or a fresh
+        # run starts, otherwise the button could keep saying "繼續" with no
+        # active worker to resume.
+        if not is_running:
+            self._is_paused = False
+            self._btn_pause.text = "⏸ 暫停"
+        else:
+            self._is_paused = False
+            self._btn_pause.text = "⏸ 暫停"
 
     def _on_run_all(self, e: ft.ControlEvent) -> None:
         if self._run_controller is None:
@@ -207,9 +217,30 @@ class MainView:
         finally:
             self._event_q.put(WorkerEvent("loading", (False, "")))
 
-    def _on_pause(self, e: ft.ControlEvent) -> None:
-        if self._active_thread and hasattr(self._active_thread, "pause"):
-            self._active_thread.pause()
+    def _on_pause_toggle(self, e: ft.ControlEvent) -> None:
+        t = self._active_thread
+        if not t:
+            return
+        if self._is_paused:
+            if hasattr(t, "resume"):
+                try:
+                    t.resume()
+                except Exception:
+                    pass
+            self._is_paused = False
+            self._btn_pause.text = "⏸ 暫停"
+        else:
+            if hasattr(t, "pause"):
+                try:
+                    t.pause()
+                except Exception:
+                    pass
+            self._is_paused = True
+            self._btn_pause.text = "▶ 繼續"
+        try:
+            self._btn_pause.update()
+        except Exception:
+            pass
 
     def _on_stop(self, e: ft.ControlEvent) -> None:
         t = self._active_thread
