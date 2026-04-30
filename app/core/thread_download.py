@@ -1075,12 +1075,18 @@ class download_thread(PauseableThread):
                 break
             if respect_group_stop and self._stop_after_group:
                 break
-            self._pause_event.wait()
+            while not self._pause_event.is_set():
+                if self._stop_event.is_set():
+                    break
+                self._pause_event.wait(timeout=0.5)
+            if self._stop_event.is_set():
+                break
             try:
                 self._q.put(WorkerEvent("countdown", remaining))
             except Exception:
                 pass
-            time.sleep(1)
+            if self._stop_event.wait(timeout=1.0):
+                break
         try:
             self._q.put(WorkerEvent("countdown", 0))
         except Exception:

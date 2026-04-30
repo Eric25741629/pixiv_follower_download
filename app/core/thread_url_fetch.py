@@ -560,12 +560,20 @@ class get_img_url_thread(PauseableThread):
         for _ in range(delay):
             if self._stop_event.is_set():
                 break
-            self._pause_event.wait()
+            # Poll pause every 0.5s so stop wakes us promptly during pause.
+            while not self._pause_event.is_set():
+                if self._stop_event.is_set():
+                    break
+                self._pause_event.wait(timeout=0.5)
+            if self._stop_event.is_set():
+                break
             try:
                 self._q.put(WorkerEvent("countdown", delay - _))
             except Exception:
                 pass
-            time.sleep(1)
+            # _stop_event.wait returns True when set -> exit immediately.
+            if self._stop_event.wait(timeout=1.0):
+                break
         try:
             self._q.put(WorkerEvent("countdown", 0))
         except Exception:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import queue
+import threading
 import flet as ft
 
 
@@ -35,10 +36,34 @@ class MainView:
         self._btn_stop = ft.OutlinedButton("⏹ 停止", on_click=self._on_stop, disabled=True)
 
         self._progress_bar = ft.ProgressBar(value=0, expand=True)
-        self._progress_text = ft.Text("", size=12, color=ft.Colors.GREY_600)
-        self._countdown_text = ft.Text("", size=12, color=ft.Colors.ORANGE_600)
+        self._progress_text = ft.Text("", size=12, color=ft.Colors.GREY_600, width=120)
+        self._countdown_text = ft.Text(
+            "",
+            size=13,
+            color=ft.Colors.ORANGE_600,
+            weight=ft.FontWeight.BOLD,
+            width=140,
+        )
         self._progress_value = 0
         self._progress_total = 0
+
+        # Modal "preparing..." overlay shown while a step is being launched.
+        self._loading_msg = ft.Text("正在啟動...", size=15, weight=ft.FontWeight.BOLD)
+        self._loading_dialog = ft.AlertDialog(
+            modal=True,
+            content=ft.Column(
+                controls=[
+                    ft.ProgressRing(width=56, height=56, stroke_width=4),
+                    self._loading_msg,
+                    ft.Text("請稍候，前置作業進行中...", size=12, color=ft.Colors.GREY_600),
+                ],
+                tight=True,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=14,
+            ),
+        )
+        self._loading_open = False
+        self._loading_lock = threading.Lock()
 
         self._log_lines: list[ft.Text] = []
         self._log_list = ft.ListView(
@@ -114,6 +139,34 @@ class MainView:
             self._countdown_text.update()
         except Exception:
             pass
+        # Defensive belt-and-suspenders: ensure the change is flushed even if
+        # the dispatcher's batched page.update() is racing with this control's
+        # own update from a background thread.
+        try:
+            self._page.update()
+        except Exception:
+            pass
+
+    def set_loading(self, busy: bool, message: str = "正在啟動...") -> None:
+        """Show / hide the modal preparing overlay (dim + spinner + message)."""
+        with self._loading_lock:
+            if busy and not self._loading_open:
+                self._loading_msg.value = message
+                try:
+                    self._page.show_dialog(self._loading_dialog)
+                except Exception:
+                    pass
+                self._loading_open = True
+            elif (not busy) and self._loading_open:
+                try:
+                    self._page.pop_dialog()
+                except Exception:
+                    pass
+                self._loading_open = False
+        try:
+            self._page.update()
+        except Exception:
+            pass
 
     def set_running(self, is_running: bool) -> None:
         self._btn_pause.disabled = not is_running
@@ -123,12 +176,32 @@ class MainView:
             b.disabled = is_running
 
     def _on_run_all(self, e: ft.ControlEvent) -> None:
-        if self._run_controller is not None:
-            self._run_controller.run_all()
+        if self._run_controller is None:
+            return
+        self.set_loading(True, "正在啟動 一鍵執行...")
+        threading.Thread(
+            target=self._run_in_background,
+            args=(self._run_controller.run_all,),
+            daemon=True,
+        ).start()
 
     def _on_run_step(self, step: int) -> None:
-        if self._run_controller is not None:
-            self._run_controller.run_step(step)
+        if self._run_controller is None:
+            return
+        self.set_loading(True, f"正在啟動 步驟 {step}...")
+        threading.Thread(
+            target=self._run_in_background,
+            args=(self._run_controller.run_step, step),
+            daemon=True,
+        ).start()
+
+    def _run_in_background(self, fn, *args) -> None:
+        """Run a RunController call off the UI thread so the loading overlay
+        actually renders before the slow worker __init__ blocks the caller."""
+        try:
+            fn(*args)
+        finally:
+            self.set_loading(False)
 
     def _on_pause(self, e: ft.ControlEvent) -> None:
         if self._active_thread and hasattr(self._active_thread, "pause"):
