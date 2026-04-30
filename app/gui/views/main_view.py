@@ -212,8 +212,33 @@ class MainView:
             self._active_thread.pause()
 
     def _on_stop(self, e: ft.ControlEvent) -> None:
-        if self._active_thread and hasattr(self._active_thread, "stop"):
-            self._active_thread.stop()
+        t = self._active_thread
+        if not (t and hasattr(t, "stop")):
+            return
+        # Disable stop button immediately so the user can't double-trigger;
+        # show modal spinner until the worker finishes its finalize/cleanup
+        # (writing pending PIDs, all_url snapshots, etc.).
+        try:
+            self._btn_stop.disabled = True
+            self._btn_stop.update()
+        except Exception:
+            pass
+        self._event_q.put(WorkerEvent("loading", (True, "正在停止，等待清理完成...")))
+        try:
+            t.stop()
+        except Exception:
+            pass
+        threading.Thread(
+            target=self._wait_for_stop, args=(t,), daemon=True,
+        ).start()
+
+    def _wait_for_stop(self, t) -> None:
+        # Wait for the worker thread to actually terminate so finalize-on-stop
+        # (atomic_write_text/json calls) is done before we release the UI.
+        try:
+            t.join(timeout=60)
+        finally:
+            self._event_q.put(WorkerEvent("loading", (False, "")))
 
     def build(self) -> ft.Column:
         step_row = ft.Row(
