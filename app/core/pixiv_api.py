@@ -12,7 +12,25 @@ from bs4 import BeautifulSoup
 
 import tag_edit
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)                                                                                                                                                                                                                                                                                                             
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from app.core.proxy_utils import to_requests_proxies
+
+
+def make_session(proxy_url: "str | None" = None) -> requests.Session:
+    """Create a requests.Session pre-configured with proxy and SSL settings.
+
+    The caller is expected to pass a URL that has been validated by
+    ``proxy_utils.parse_proxy_url`` (or ``None`` for direct connection).
+    """
+    sess = requests.Session()
+    proxies = to_requests_proxies(proxy_url)
+    if proxies:
+        sess.proxies.update(proxies)
+    sess.verify = False
+    return sess
+
+
 # 子執行緒的工作函數
 import re
 from queue import Queue
@@ -601,7 +619,7 @@ def get_download_url(path,cookie,Agent,num,pid):    #回傳下載連結
     return(download_url)
 def Pixiv_info(url,
     Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50'
-    ,cookie=None,ip=None):                                                #回傳標籤
+    ,cookie=None,ip=None, *, session: "requests.Session | None" = None):                                                #回傳標籤
         url = _clean_request_text(url)
         Agent = _clean_request_text(Agent)
         cookie = _clean_request_text(cookie) if cookie is not None else None
@@ -634,7 +652,7 @@ def Pixiv_info(url,
                 headers['Cookie'] = cookie
             headers = _clean_headers(headers)
             try:
-                res = requests.get(ajax_url, headers=headers, timeout=20)
+                res = (session or requests).get(ajax_url, headers=headers, timeout=20)
             except Exception as e:
                 print(f"Pixiv_info request error pid={id}: {e}")
                 return [404], False, -1
@@ -700,7 +718,7 @@ def Pixiv_info(url,
 
         return final_result
 
-def get_pixiv_cookie_requirement(pid):
+def get_pixiv_cookie_requirement(pid, *, session: "requests.Session | None" = None):
     """回傳指定 PID 最近一次是否需要 cookie，找不到時回傳 None。"""
     try:
         trace_path = os.path.join(os.getenv('APPDATA')+r'/pixiv_download/', 'pixiv_cookie_requirement.json')
