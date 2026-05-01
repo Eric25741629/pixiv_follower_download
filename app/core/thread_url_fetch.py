@@ -547,8 +547,18 @@ class get_img_url_thread(PauseableThread):
         if need_cookie is False:
             delay = pyrandom.randint(self.pid_wait_nocookie_min, self.pid_wait_nocookie_max)
         else:
-            # Without scheduler, fall back to a small fixed delay (legacy single-cookie path)
-            delay = pyrandom.randint(self.pid_wait_nocookie_min, self.pid_wait_nocookie_max)
+            # No-scheduler fallback for cookie-required PIDs: live-read pid_cooldown_avg
+            # from settings and apply ±30% jitter (same model as AccountScheduler.release).
+            try:
+                from app.core.settings_store import SettingsStore
+                import os
+                store_path = os.getenv("APPDATA") + r"/pixiv_download/"
+                avg = int(SettingsStore(store_path).get_section("performance").get("pid_cooldown_avg", 35))
+            except Exception:
+                avg = 35
+            low = max(1, int(avg * 0.7))
+            high = max(low, int(avg * 1.3))
+            delay = pyrandom.randint(low, high)
         for _ in range(delay):
             if self._stop_event.is_set():
                 break

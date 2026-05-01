@@ -653,6 +653,11 @@ def Pixiv_info(url,
             headers = _clean_headers(headers)
             try:
                 res = (session or requests).get(ajax_url, headers=headers, timeout=20)
+            except (requests.exceptions.ProxyError,
+                    requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ConnectionError):
+                # Propagate so the scheduler-aware caller can disable the cookie/proxy.
+                raise
             except Exception as e:
                 print(f"Pixiv_info request error pid={id}: {e}")
                 return [404], False, -1

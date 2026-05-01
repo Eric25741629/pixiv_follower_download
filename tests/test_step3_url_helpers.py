@@ -228,3 +228,24 @@ def test_step3_get_download_url_uses_cookie_override(monkeypatch):
 
     assert captured["cookie"] == "OVERRIDE_COOKIE"
     assert captured["session"] is sentinel_session
+
+
+def test_pixiv_info_propagates_proxy_error():
+    """Pixiv_info must propagate ProxyError so scheduler can disable account."""
+    import pytest
+    import requests
+    from app.core import pixiv_api
+
+    class FailSession:
+        def __init__(self):
+            pass
+        def get(self, *a, **kw):
+            raise requests.exceptions.ProxyError("simulated dead proxy")
+
+    with pytest.raises(requests.exceptions.ProxyError):
+        pixiv_api.Pixiv_info(
+            "https://www.pixiv.net/artworks/777",
+            "agent",
+            cookie="c",
+            session=FailSession(),
+        )
