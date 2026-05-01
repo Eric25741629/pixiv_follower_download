@@ -169,8 +169,27 @@ class download_thread(PauseableThread):
         except Exception:
             self.exist_pid = set(self.splitID(self.get_filelist(self.download_path)))
 
-        meta = safe_read_json(self.url_meta_path, {})
+        from app.core.pixiv_thread_utils import read_json_with_recovery
+        meta, meta_status = read_json_with_recovery(
+            self.url_meta_path, default={},
+            emit=lambda html: self._q.put(WorkerEvent("output", html)),
+        )
         self.url_meta = meta if isinstance(meta, dict) else {}
+        # Surface a clear warning when meta is missing/empty AND a like
+        # filter is configured — otherwise step 4 silently flags every
+        # PID as "no_meta" and the user sees an empty download phase.
+        if (
+            not self.url_meta
+            and (int(self.like_num or 0) > 0 or bool(self.special_like_rules))
+        ):
+            try:
+                self._q.put(WorkerEvent("output",
+                    "<p><font color='red'>[警告] all_url_meta.json 為空，"
+                    "且設定了愛心過濾門檻；步驟 4 將嘗試即時補抓 meta，"
+                    "若仍失敗會被全部標為「無meta」跳過。建議先重跑步驟 3。</font></p>"
+                ))
+            except Exception:
+                pass
 
         try:
             print("正在讀取 all_url.txt...",self.path+r"/all_url.txt")
@@ -579,25 +598,46 @@ class download_thread(PauseableThread):
         if not allow_network:
             return None
         need_cookie = self._refresh_cookie_requirement(pid_key, fallback=None)
-        info = None
         url = "https://www.pixiv.net/artworks/" + pid_key
-        pid_cookie = self._select_cookie_for_pid(pid_key)
-        self._record_cookie_usage("step3", pid_key, pid_cookie)
-        try:
-            if need_cookie is True:
-                if pid_cookie:
+        # Route the network fallback through the scheduler when present so
+        # the bound proxy + per-account cooldown applies (otherwise this
+        # path bypasses proxies and hammers pixiv unthrottled — every PID
+        # rate-limits and then the whole step 4 ends up "no_meta").
+        info = None
+        if self._scheduler is not None:
+            acc = self._acquire_account()
+            if acc is None:
+                return None
+            self._record_cookie_usage("step3", pid_key, acc.cookie)
+            session = pixiv_api.make_session(acc.proxy_url)
+
+            def _do_fetch():
+                if need_cookie is False:
+                    return pixiv_api.Pixiv_info(url, self.agent, session=session)
+                return pixiv_api.Pixiv_info(
+                    url, self.agent, cookie=acc.cookie, session=session,
+                )
+
+            try:
+                ok, info, _ = self._run_with_network_retry(
+                    f"PID {pid_key}", _do_fetch,
+                )
+            except Exception:
+                ok = True
+                info = None
+            self._release_account(acc, ok=ok)
+        else:
+            pid_cookie = self._select_cookie_for_pid(pid_key)
+            self._record_cookie_usage("step3", pid_key, pid_cookie)
+            try:
+                if need_cookie is False:
+                    info = pixiv_api.Pixiv_info(url, self.agent)
+                elif pid_cookie:
                     info = pixiv_api.Pixiv_info(url, self.agent, cookie=pid_cookie)
                 else:
                     info = pixiv_api.Pixiv_info(url, self.agent)
-            elif need_cookie is False:
-                info = pixiv_api.Pixiv_info(url, self.agent)
-            else:
-                if pid_cookie:
-                    info = pixiv_api.Pixiv_info(url, self.agent, cookie=pid_cookie)
-                else:
-                    info = pixiv_api.Pixiv_info(url, self.agent)
-        except Exception:
-            info = None
+            except Exception:
+                info = None
         normalized = self._normalize_pixiv_info(info)
         if not normalized:
             return None
@@ -1222,6 +1262,7 @@ class download_thread(PauseableThread):
     def _prepare_download_tasks(self, urls, allow_network=False):
         pending = []
         seen_url = set()
+        no_meta_pids = set()  # PIDs that fell through filter for lack of meta
         stats = {
             "input_count": 0,
             "duplicate_count": 0,
@@ -1260,17 +1301,60 @@ class download_thread(PauseableThread):
                     stats["skipped_tag_count"] += 1
                 elif reason == "no_meta":
                     stats["skipped_no_meta_count"] += 1
+                    no_meta_pids.add(pid)
                 else:
                     stats["invalid_count"] += 1
                 continue
             pending.append(u)
         stats["output_count"] = len(pending)
+        # On the network-enabled pass, queue PIDs that still failed for
+        # lack of meta back into pictures_id.txt so the next step 3 run
+        # picks them up. Also log a clear message so the user knows what
+        # to do next.
+        if allow_network and no_meta_pids:
+            self._requeue_no_meta_pids(no_meta_pids)
         self._diag(
             "step4_filter_pass",
             allow_network=bool(allow_network),
             stats=stats,
+            no_meta_pid_count=len(no_meta_pids),
         )
         return pending, stats
+
+    def _requeue_no_meta_pids(self, pids: set) -> None:
+        """Append PIDs that step 4 couldn't resolve meta for back into
+        pictures_id.txt (step 3's pending queue) so the user's next step
+        3 run picks them up. Merges with whatever is already there."""
+        try:
+            pending_path = os.path.join(self.path, "pictures_id.txt")
+            existing = set()
+            if os.path.isfile(pending_path):
+                try:
+                    with open(pending_path, encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            s = line.strip()
+                            if s:
+                                existing.add(s)
+                except Exception:
+                    pass
+            new = {str(p).strip() for p in pids if str(p).strip()}
+            merged = existing | new
+            added = len(new - existing)
+            if added <= 0:
+                return
+            from app.core.safe_io import atomic_write_text
+            ordered = sorted(merged, key=lambda s: int(s) if s.isdigit() else s)
+            atomic_write_text(pending_path, ordered, backup=False)
+            try:
+                self._q.put(WorkerEvent("output",
+                    f"<p><font color='orange'>[補meta] {added} 個缺 meta 的 PID "
+                    f"已加回 pictures_id.txt（共 {len(merged)} 筆待辦），"
+                    f"請再跑一次步驟 3 補抓資料</font></p>"
+                ))
+            except Exception:
+                pass
+        except Exception:
+            pass
     def _group_urls_by_pid(self, urls):
         groups = {}
         order = []
