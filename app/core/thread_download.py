@@ -65,6 +65,7 @@ class download_thread(PauseableThread):
         jxl_delete_original=False,
         jxl_effort=7,
         scheduler=None,
+        stats_collector=None,
         *legacy_args,
         **legacy_kwargs,
     ):
@@ -82,6 +83,7 @@ class download_thread(PauseableThread):
         self.no_R18G_dir=no_R18G_dir
         self.single_thread_mode = single_thread_mode
         self.ai_gen_dir = False
+        self._stats_collector = stats_collector
         # explicit local flag for clarity elsewhere in code
         self.single_mode_flag = bool(single_thread_mode)
         try:
@@ -1614,6 +1616,8 @@ class download_thread(PauseableThread):
         self._q.put(WorkerEvent("timechanged", datetime.datetime.strftime(self.download_time, '%Y-%m-%d %H:%M:%S')))
         self._emit_step4_filter_skip_final_summary()
         self._emit_cookie_usage_summary("step4", "Step4 Cookie統計")
+        if self._stats_collector is not None:
+            self._stats_collector.save()
         if self._stopped_by_request or self._stop_event.is_set():
             self._diag(
                 "step4_finished",
@@ -1634,6 +1638,8 @@ class download_thread(PauseableThread):
 
     def run(self):
         try:
+            if self._stats_collector is not None:
+                self._stats_collector.reset_session()
             # Re-check filters in worker thread so Step4 can validate like/tag once
             # without blocking the GUI thread during object construction.
             self.allurl, self._task_filter_stats = self._prepare_download_tasks(self.allurl, allow_network=True)

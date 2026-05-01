@@ -40,16 +40,6 @@ def _agent(auth: dict) -> str:
     return str(auth.get("agent") or "").strip() or DEFAULT_AGENT
 
 
-def _cookie_payload(auth: dict):
-    entries = auth.get("cookies_entries") or []
-    if isinstance(entries, list) and entries:
-        return entries
-    pool = auth.get("cookies_pool") or []
-    if isinstance(pool, list) and pool:
-        return pool
-    return str(auth.get("cookies", "") or "")
-
-
 def _load_author_list() -> list[str]:
     path = _data_path()
     j = safe_read_json(os.path.join(path, "following.json"), None)
@@ -65,10 +55,11 @@ def _load_author_list() -> list[str]:
 class RunController:
     """Wires step buttons to worker threads and chains them in Run-All mode."""
 
-    def __init__(self, main_view, event_q: Queue):
+    def __init__(self, main_view, event_q: Queue, stats_collector=None):
         self._main_view = main_view
         self._event_q = event_q
         self._run_all_mode = False
+        self._stats_collector = stats_collector
 
     def run_step(self, n: int) -> None:
         self._run_all_mode = False
@@ -87,21 +78,11 @@ class RunController:
     def _log(self, html: str) -> None:
         self._event_q.put(WorkerEvent("output", html))
 
-    def _build_scheduler(self, auth: dict, perf: dict, pause_event, stop_event) -> AccountScheduler:
-        """Build an AccountScheduler from settings auth+performance sections.
-
-        cookies -> AccountState list (alias from cookies_aliases, proxy from
-        cookie_proxy_map). Empty/blank cookies are skipped. The scheduler reads
-        pid_cooldown_avg from settings on every release(), so live edits in the
-        settings UI are picked up without restart.
-        """
+    def _extract_cookies_list(self, auth: dict) -> list[str]:
+        """Pull the configured cookie strings out of auth settings,
+        preferring cookies_entries -> cookies_pool -> single cookies."""
         entries = auth.get("cookies_entries") or []
         pool = auth.get("cookies_pool") or []
-        alias_map = auth.get("cookies_aliases") or {}
-        proxy_map = auth.get("cookie_proxy_map") or {}
-
-        # Prefer cookies_entries (new format); fall back to cookies_pool, then
-        # the single-cookie cookies field.
         if isinstance(entries, list) and entries:
             cookies_list = [
                 e.get("cookie", "") if isinstance(e, dict) else str(e)
@@ -112,12 +93,86 @@ class RunController:
         else:
             raw = str(auth.get("cookies", "") or "")
             cookies_list = [raw] if raw.strip() else []
+        return [c.strip() for c in cookies_list if c and c.strip()]
 
+    def _test_cookies(self, cookies_list: list[str], agent: str) -> list[str]:
+        """Validate each cookie via Test_cookies and return the valid ones.
+
+        Updates the loading-dialog message per cookie, pushes
+        cookie_status events so the cookies view reflects results live,
+        and persists the new statuses back to settings."""
+        if not cookies_list:
+            return []
+        from app.core import pixiv_api
+        valid: list[str] = []
+        total = len(cookies_list)
+        self._log(f"<p><font color='blue'>啟動前測試 {total} 個 Cookie...</font></p>")
+        for idx, cookie in enumerate(cookies_list, start=1):
+            self._event_q.put(WorkerEvent(
+                "loading", (True, f"測試 Cookie {idx}/{total}...")
+            ))
+            self._event_q.put(WorkerEvent("cookie_status", (cookie, "測試中")))
+            try:
+                count, _ = pixiv_api.Test_cookies([cookie], agent)
+                ok = int(count) > 0
+            except Exception:
+                ok = False
+            status = "有效" if ok else "失效"
+            self._event_q.put(WorkerEvent("cookie_status", (cookie, status)))
+            if ok:
+                valid.append(cookie)
+                self._log(f"<p><font color='green'>Cookie {idx}/{total} 有效</font></p>")
+            else:
+                self._log(
+                    f"<p><font color='red'>Cookie {idx}/{total} 失效，已從本次任務排除</font></p>"
+                )
+        self._persist_cookie_statuses(cookies_list, valid)
+        return valid
+
+    def _persist_cookie_statuses(
+        self, tested_cookies: list[str], valid: list[str]
+    ) -> None:
+        """Write the latest test result back to cookies_entries[].status
+        so the cookies view reflects them on next reload."""
+        valid_set = set(valid)
+        try:
+            store = _store()
+            auth = store.get_section("auth")
+            entries = auth.get("cookies_entries") or []
+            if not isinstance(entries, list):
+                return
+            new_entries = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    new_entries.append(e)
+                    continue
+                c = str(e.get("cookie", "")).strip()
+                if c in tested_cookies:
+                    new_entries.append({**e, "status": "有效" if c in valid_set else "失效"})
+                else:
+                    new_entries.append(e)
+            store.update_section("auth", {**auth, "cookies_entries": new_entries})
+        except Exception:
+            pass
+
+    def _build_scheduler(
+        self,
+        auth: dict,
+        valid_cookies: list[str],
+        pause_event,
+        stop_event,
+    ) -> AccountScheduler:
+        """Build an AccountScheduler from a pre-validated cookie list.
+
+        Alias is sourced from auth.cookies_aliases, proxy from
+        auth.cookie_proxy_map. The scheduler reads pid_cooldown_avg from
+        settings on every release(), so live slider edits in the settings
+        UI take effect without restart.
+        """
+        alias_map = auth.get("cookies_aliases") or {}
+        proxy_map = auth.get("cookie_proxy_map") or {}
         accounts: list[AccountState] = []
-        for i, cookie in enumerate(cookies_list):
-            cookie = (cookie or "").strip()
-            if not cookie:
-                continue
+        for i, cookie in enumerate(valid_cookies):
             alias = alias_map.get(cookie) or f"Cookie {i + 1}"
             raw_proxy = proxy_map.get(cookie) or None
             proxy_url = parse_proxy_url(raw_proxy) if raw_proxy else None
@@ -131,6 +186,7 @@ class RunController:
             pause_event=pause_event,
             stop_event=stop_event,
             emit=self._log,
+            q=self._event_q,
         )
 
     def _start_step(self, n: int) -> None:
@@ -161,7 +217,6 @@ class RunController:
         directory = store.get_section("directory")
         jxl = store.get_section("jxl")
         agent = _agent(auth)
-        cookies = _cookie_payload(auth)
         path = _data_path()
 
         if n == 1:
@@ -169,11 +224,15 @@ class RunController:
             if not userid:
                 self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
                 return None
-            cookies_str = cookies if isinstance(cookies, str) else (str(auth.get("cookies", "")) or "")
+            cookies_list = self._extract_cookies_list(auth)
+            valid_cookies = self._test_cookies(cookies_list, agent)
+            if not valid_cookies:
+                self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 1</font></p>")
+                return None
             return thread_following.get_following(
                 self._event_q,
                 userid,
-                cookies_str,
+                valid_cookies[0],
                 agent,
                 bool(flt.get("hidefollow", False)),
             )
@@ -183,25 +242,35 @@ class RunController:
             if not authors:
                 self._log("<p><font color='red'>找不到 following 清單，請先執行步驟 1</font></p>")
                 return None
+            cookies_list = self._extract_cookies_list(auth)
+            valid_cookies = self._test_cookies(cookies_list, agent)
+            if not valid_cookies:
+                self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 2</font></p>")
+                return None
             t = thread_pid_scan.get_pixiv_author_imgID_Thread(
                 self._event_q,
                 authors,
                 agent,
                 path,
-                cookies,
+                valid_cookies,
                 load_exist_pid_set(path),
                 bool(perf.get("single_thread_mode", False)),
             )
-            t._scheduler = self._build_scheduler(auth, perf, t._pause_event, t._stop_event)
+            t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
             return t
 
         if n == 3:
             authors = _load_author_list()
+            cookies_list = self._extract_cookies_list(auth)
+            valid_cookies = self._test_cookies(cookies_list, agent)
+            if not valid_cookies:
+                self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 3</font></p>")
+                return None
             t = thread_url_fetch.get_img_url_thread(
                 q=self._event_q,
                 Author_list=authors,
                 Agent=agent,
-                cookies=cookies,
+                cookies=valid_cookies,
                 exist_pid=load_exist_pid_set(path),
                 ban_tag=list(dl.get("ban_tag", [])),
                 must_tag=list(dl.get("must_tag", [])),
@@ -213,7 +282,7 @@ class RunController:
                 pid_wait_nocookie_max=int(perf.get("pid_wait_nocookie_max", 6)),
                 special_like_rules=[],
             )
-            t._scheduler = self._build_scheduler(auth, perf, t._pause_event, t._stop_event)
+            t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
             return t
 
         if n == 4:
@@ -226,6 +295,11 @@ class RunController:
                 dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S") if dt_str else datetime(1970, 1, 1)
             except Exception:
                 dt = datetime(1970, 1, 1)
+            cookies_list = self._extract_cookies_list(auth)
+            valid_cookies = self._test_cookies(cookies_list, agent)
+            if not valid_cookies:
+                self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 4</font></p>")
+                return None
             t = thread_download.download_thread(
                 q=self._event_q,
                 nogif=bool(flt.get("nogif", False)),
@@ -233,7 +307,7 @@ class RunController:
                 notime=bool(flt.get("notime", False)),
                 create_dir=bool(directory.get("create_dir", False)),
                 download_path=dl_path,
-                cookies=cookies,
+                cookies=valid_cookies,
                 agent=agent,
                 download_time=dt,
                 no_R18G_dir=bool(directory.get("no_R18G_dir", False)),
@@ -249,7 +323,8 @@ class RunController:
                 must_tag=list(dl.get("must_tag", [])),
                 special_like_rules=[],
                 ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
+                stats_collector=self._stats_collector,
             )
-            t._scheduler = self._build_scheduler(auth, perf, t._pause_event, t._stop_event)
+            t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
             return t
         return None
