@@ -13,6 +13,8 @@ from typing import Optional
 
 from app.core.settings_store import SettingsStore
 from app.core.worker_event import WorkerEvent
+from app.core.account_scheduler import AccountState, AccountScheduler
+from app.core.proxy_utils import parse_proxy_url
 from app.core.pixiv_thread_utils import safe_read_json, load_exist_pid_set
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
 
@@ -84,6 +86,52 @@ class RunController:
 
     def _log(self, html: str) -> None:
         self._event_q.put(WorkerEvent("output", html))
+
+    def _build_scheduler(self, auth: dict, perf: dict, pause_event, stop_event) -> AccountScheduler:
+        """Build an AccountScheduler from settings auth+performance sections.
+
+        cookies -> AccountState list (alias from cookies_aliases, proxy from
+        cookie_proxy_map). Empty/blank cookies are skipped. The scheduler reads
+        pid_cooldown_avg from settings on every release(), so live edits in the
+        settings UI are picked up without restart.
+        """
+        entries = auth.get("cookies_entries") or []
+        pool = auth.get("cookies_pool") or []
+        alias_map = auth.get("cookies_aliases") or {}
+        proxy_map = auth.get("cookie_proxy_map") or {}
+
+        # Prefer cookies_entries (new format); fall back to cookies_pool, then
+        # the single-cookie cookies field.
+        if isinstance(entries, list) and entries:
+            cookies_list = [
+                e.get("cookie", "") if isinstance(e, dict) else str(e)
+                for e in entries
+            ]
+        elif isinstance(pool, list) and pool:
+            cookies_list = [str(c) for c in pool]
+        else:
+            raw = str(auth.get("cookies", "") or "")
+            cookies_list = [raw] if raw.strip() else []
+
+        accounts: list[AccountState] = []
+        for i, cookie in enumerate(cookies_list):
+            cookie = (cookie or "").strip()
+            if not cookie:
+                continue
+            alias = alias_map.get(cookie) or f"Cookie {i + 1}"
+            raw_proxy = proxy_map.get(cookie) or None
+            proxy_url = parse_proxy_url(raw_proxy) if raw_proxy else None
+            accounts.append(AccountState(cookie=cookie, alias=alias, proxy_url=proxy_url))
+
+        return AccountScheduler(
+            accounts=accounts,
+            get_cooldown_avg=lambda: float(
+                _store().get_section("performance").get("pid_cooldown_avg", 35)
+            ),
+            pause_event=pause_event,
+            stop_event=stop_event,
+            emit=self._log,
+        )
 
     def _start_step(self, n: int) -> None:
         try:
