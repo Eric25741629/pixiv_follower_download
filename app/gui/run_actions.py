@@ -226,7 +226,7 @@ class RunController:
                 dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S") if dt_str else datetime(1970, 1, 1)
             except Exception:
                 dt = datetime(1970, 1, 1)
-            return thread_download.download_thread(
+            t = thread_download.download_thread(
                 q=self._event_q,
                 nogif=bool(flt.get("nogif", False)),
                 notag=bool(flt.get("notag", False)),
@@ -238,8 +238,6 @@ class RunController:
                 download_time=dt,
                 no_R18G_dir=bool(directory.get("no_R18G_dir", False)),
                 single_thread_mode=bool(perf.get("single_thread_mode", False)),
-                download_wait_min=int(perf.get("pid_wait_min", 10)),
-                download_wait_max=int(perf.get("pid_wait_max", 60)),
                 intra_pid_wait_min=int(perf.get("pid_wait_nocookie_min", 1)),
                 intra_pid_wait_max=int(perf.get("pid_wait_nocookie_max", 6)),
                 jxl_enable=bool(jxl.get("enable", False)),
@@ -252,4 +250,6 @@ class RunController:
                 special_like_rules=[],
                 ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
             )
+            t._scheduler = self._build_scheduler(auth, perf, t._pause_event, t._stop_event)
+            return t
         return None

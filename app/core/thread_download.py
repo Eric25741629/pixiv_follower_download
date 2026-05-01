@@ -23,7 +23,6 @@ from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
     atomic_write_json,
     atomic_write_text,
-    cookie_speed_divisor,
     fetch_with_cookie_retry,
     init_cookie_fields,
     load_exist_pid_set,
@@ -59,18 +58,17 @@ class download_thread(PauseableThread):
         download_time,
         no_R18G_dir,
         single_thread_mode=False,
-        download_wait_min=10,
-        download_wait_max=60,
         intra_pid_wait_min=1,
         intra_pid_wait_max=3,
         jxl_enable=False,
         jxl_cjxl_path=r"C:\Users\Eric\Downloads\jxl-x64-windows\bin\cjxl.exe",
         jxl_delete_original=False,
         jxl_effort=7,
+        scheduler=None,
         *legacy_args,
         **legacy_kwargs,
     ):
-        super().__init__(q)
+        super().__init__(q, scheduler=scheduler)
         self.nogif=nogif
         self.notime=notime
         self.notag=notag
@@ -78,6 +76,7 @@ class download_thread(PauseableThread):
         self.download_path=download_path     
         self.cookie_entries, self.cookie_pool, self._cookie_alias_map, self.cookies = init_cookie_fields(cookies)
         self._pid_cookie_selection = {}
+        self._current_account = None  # set by _execute_downloads when scheduler is active
         self.agent=agent
         self.download_time=download_time
         self.no_R18G_dir=no_R18G_dir
@@ -85,15 +84,6 @@ class download_thread(PauseableThread):
         self.ai_gen_dir = False
         # explicit local flag for clarity elsewhere in code
         self.single_mode_flag = bool(single_thread_mode)
-        try:
-            self.download_wait_min = int(download_wait_min)
-            self.download_wait_max = int(download_wait_max)
-        except Exception:
-            self.download_wait_min, self.download_wait_max = 10, 60
-        if self.download_wait_min < 0:
-            self.download_wait_min = 0
-        if self.download_wait_max < self.download_wait_min:
-            self.download_wait_max = self.download_wait_min
         try:
             self.intra_pid_wait_min = int(intra_pid_wait_min)
             self.intra_pid_wait_max = int(intra_pid_wait_max)
@@ -1066,7 +1056,7 @@ class download_thread(PauseableThread):
         ratio_text = '1.0x' if cookie_used else '0.5x'
         try:
             self._q.put(WorkerEvent("output",
-                f"<p><font color='{color}'>[下載等待][{label}] 等待 {delay} 秒 (PID {pid}, 倍率 {ratio_text}, cookie_used={cookie_used}, 多Cookie加速x{cookie_speed_divisor(self.cookie_pool):.2f})</font></p>"
+                f"<p><font color='{color}'>[下載等待][{label}] 等待 {delay} 秒 (PID {pid}, 倍率 {ratio_text}, cookie_used={cookie_used})</font></p>"
             ))
         except Exception:
             pass
@@ -1093,11 +1083,24 @@ class download_thread(PauseableThread):
             pass
 
     def _sleep_between_downloads(self, pid):
-        # Wait between PID groups.
+        # Inter-PID cooldown is owned by AccountScheduler.release() when active.
+        # The legacy fixed delay only fires when no scheduler is configured.
+        if self._scheduler is not None:
+            return
+        # Legacy fallback: read pid_cooldown_avg from settings for a reasonable wait
+        try:
+            from app.core.settings_store import SettingsStore
+            store_path = os.getenv("APPDATA") + r"/pixiv_download/"
+            avg = int(SettingsStore(store_path).get_section("performance").get("pid_cooldown_avg", 35))
+        except Exception:
+            avg = 35
+        low = max(1, int(avg * 0.7))
+        high = max(low, int(avg * 1.3))
+        delay = pyrandom.randint(low, high)
         self._run_download_countdown(
             pid,
-            self.download_wait_min,
-            self.download_wait_max,
+            delay,
+            delay,
             label="PID間",
             color="green",
             respect_group_stop=True,
@@ -1151,24 +1154,12 @@ class download_thread(PauseableThread):
             return False
 
     def _calc_sleep_delay(self, min_sec, max_sec, pid=None):
-        """Calculate sleep delay; no-cookie tasks use half wait."""
-        delay = pyrandom.randint(int(min_sec), int(max_sec))
-        try:
-            no_cookie_mode = (pid is not None) and (not self._is_cookie_used_for_pid(pid))
-        except Exception:
-            no_cookie_mode = False
+        """Calculate randomized sleep delay between min_sec and max_sec.
 
-        if no_cookie_mode:
-            # 無 Cookie 任務縮短等待，最低仍保留 1 秒
-            if delay <= 0:
-                return 0
-            delay = max(1, int(delay / 2))
-
-        # 多 cookies 時加速等待，避免每 PID 都用同一強度休眠。
-        div = cookie_speed_divisor(self.cookie_pool)
-        if div > 1.0 and delay > 0:
-            delay = max(1, int(round(float(delay) / div)))
-        return delay
+        The scheduler-aware path no longer applies cookie-pool speedup; this
+        function is now used only for intra-PID polite delays.
+        """
+        return pyrandom.randint(int(min_sec), int(max_sec))
 
     def _extract_pid_from_download_url(self, url):
         try:
@@ -1288,7 +1279,13 @@ class download_thread(PauseableThread):
 
     def _download_pid_group(self, pid, urls):
         failed = []
-        sess = requests.Session()
+        # Build session with the bound proxy when an account is currently held.
+        acc = getattr(self, '_current_account', None)
+        if acc is not None:
+            from app.core import pixiv_api as _pixiv_api
+            sess = _pixiv_api.make_session(acc.proxy_url)
+        else:
+            sess = requests.Session()
         has_actual_download = False  # 是否真的有成功下載任何檔案
         try:
             for idx, u in enumerate(urls):
@@ -1434,13 +1431,7 @@ class download_thread(PauseableThread):
         failed_nested = []
         if self.single_mode_flag:
             self._q.put(WorkerEvent("output", "<p><font color='green'>下載模式：單執行緒 + 每個 PID 共用單一 Session</font></p>"))
-            self._q.put(WorkerEvent("output", f"<p><font color='green'>同PID等待: {self.intra_pid_wait_min}~{self.intra_pid_wait_max} 秒；PID間等待: {self.download_wait_min}~{self.download_wait_max} 秒</font></p>"))
-            try:
-                self._q.put(WorkerEvent("output",
-                    f"<p><font color='gray'>下載階段多Cookie加速：{len(self.cookie_pool or [])} 組 cookies，等待加速係數 x{cookie_speed_divisor(self.cookie_pool):.2f}</font></p>"
-                ))
-            except Exception:
-                pass
+            self._q.put(WorkerEvent("output", f"<p><font color='green'>同PID等待: {self.intra_pid_wait_min}~{self.intra_pid_wait_max} 秒；PID間: 由排程器管理（單帳號平均冷卻）</font></p>"))
             for idx, pid in enumerate(pid_order, start=1):
                 if self._stop_after_group:
                     try:
@@ -1452,10 +1443,40 @@ class download_thread(PauseableThread):
                     break
                 self._active_group_pid = pid
                 self._q.put(WorkerEvent("output", f"<p><font color='black'>處理 PID {idx}/{len(pid_order)}：{pid}（{len(pid_groups.get(pid, []))} 張）</font></p>"))
-                failed_nested.append(self._download_pid_group(pid, pid_groups.get(pid, [])))
+
+                if self._scheduler is not None:
+                    acc = self._acquire_account()
+                    if acc is None:
+                        break  # stop signal or all disabled
+                    # Sticky cookie: this PID's pages all use this cookie+proxy
+                    pid_key = normalize_pid(pid) or str(pid)
+                    self._pid_cookie_selection[pid_key] = acc.cookie
+                    self._current_account = acc
+                    ok = True
+                    result = []
+                    try:
+                        result = self._download_pid_group(pid, pid_groups.get(pid, []))
+                    except (requests.exceptions.ProxyError,
+                            requests.exceptions.ConnectTimeout,
+                            requests.exceptions.ConnectionError) as err:
+                        ok = False
+                        try:
+                            self._q.put(WorkerEvent("output",
+                                f"<p><font color='red'>PID {pid} 因 proxy 失敗略過：{err.__class__.__name__}</font></p>"))
+                        except Exception:
+                            pass
+                    finally:
+                        self._current_account = None
+                        self._release_account(acc, ok=ok)
+                    failed_nested.append(result if isinstance(result, list) else [])
+                else:
+                    failed_nested.append(self._download_pid_group(pid, pid_groups.get(pid, [])))
+
                 self._active_group_pid = None
                 if self._stop_event.is_set():
                     break
+                # _sleep_between_downloads is a no-op when scheduler is set;
+                # call unconditionally — the method itself decides whether to sleep.
                 if idx < len(pid_order):
                     self._sleep_between_downloads(pid)
         else:
