@@ -92,34 +92,25 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         return self.thread_no_use_seleium_get_pid(cookie, self.Agent, self.path, '1', aid)
 
     def _run_step2_with_acquired_cookie(self, aid):
-        """Single-thread path: acquire from AccountScheduler, run, release.
+        """Single-thread path: acquire from AccountScheduler, run with
+        retry, release.
 
         Returns the PID list on success, None if scheduler returned None
-        (stop signal) or the request failed at the proxy level.
+        (stop signal) or the request failed at the proxy level after all
+        retries.
         """
         acc = self._acquire_account()
         if acc is None:
             return None  # stop signal or no accounts
         self._record_step2_cookie_usage(aid, acc.cookie)
         proxies = acc.proxies
-        ok = True
-        result = None
-        try:
-            result = self.thread_no_use_seleium_get_pid(
+        ok, result, _ = self._run_with_network_retry(
+            f"畫師 {aid}",
+            lambda: self.thread_no_use_seleium_get_pid(
                 acc.cookie, self.Agent, self.path, '1', aid, proxies=proxies,
-            )
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError) as err:
-            ok = False
-            try:
-                self._q.put(WorkerEvent("output",
-                    f"<p><font color='red'>畫師 {aid} 因 proxy 失敗略過：{err.__class__.__name__}</font></p>"
-                ))
-            except Exception:
-                pass
-        finally:
-            self._release_account(acc, ok=ok)
+            ),
+        )
+        self._release_account(acc, ok=ok)
         return result
 
     def _collect_step2_incremental_pid(self, raw_pid_list):
@@ -254,7 +245,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                 if self._scheduler is not None:
                     avg = self._scheduler.average_cooldown()
                     self._q.put(WorkerEvent("output",
-                        f"<p><font color='green'>PID 單帳號平均冷卻：{avg:.0f} 秒</font></p>"
+                        f"<p><font color='green'>PID 平均請求頻率：每 {avg:.1f} 秒一次</font></p>"
                     ))
                 else:
                     self._q.put(WorkerEvent("output",
