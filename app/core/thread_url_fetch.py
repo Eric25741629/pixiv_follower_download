@@ -107,7 +107,11 @@ class get_img_url_thread(PauseableThread):
             self._q.put(WorkerEvent("output", "<p><font color='gray'>[Step3初始化] 載入 URL 中繼資料快取...</font></p>"))
         except Exception:
             pass
-        meta = safe_read_json(self.url_meta_path, {})
+        from app.core.pixiv_thread_utils import read_json_with_recovery
+        meta, meta_status = read_json_with_recovery(
+            self.url_meta_path, default={},
+            emit=lambda html: self._q.put(WorkerEvent("output", html)),
+        )
         self.url_meta = meta if isinstance(meta, dict) else {}
         try:
             self._q.put(WorkerEvent("output", f"<p><font color='gray'>[Step3初始化] all_url_meta.json 載入 {len(self.url_meta)} 筆，開始 schema 遷移檢查...</font></p>"))
@@ -701,11 +705,26 @@ class get_img_url_thread(PauseableThread):
             pass
 
     def _flush_url_meta_snapshot(self):
+        # Atomic write so a stop/kill mid-write can't truncate the file
+        # and leave step 4 with an empty/corrupt all_url_meta.json. The
+        # raw open(..., 'w') previously here was the cause of the
+        # observed 8 KB truncated meta.
         try:
-            with open(self.url_meta_path, 'w', encoding='utf-8') as f:
-                json.dump(self.url_meta, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+            atomic_write_json(self.url_meta_path, self.url_meta, backup=False)
+        except Exception as err:
+            # Last-resort fallback; report on both failures so corruption
+            # is never silent the way it used to be.
+            try:
+                with open(self.url_meta_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.url_meta, f, ensure_ascii=False, indent=2)
+            except Exception as err2:
+                try:
+                    self._q.put(WorkerEvent("output",
+                        f"<p><font color='red'>[警告] all_url_meta.json 寫入失敗："
+                        f"atomic={type(err).__name__}, fallback={type(err2).__name__}</font></p>"
+                    ))
+                except Exception:
+                    pass
 
     def _mark_gif_cookie_usage(self, pid, used, source="unknown"):
         pid_key = normalize_pid(pid) or str(pid)
@@ -1240,25 +1259,14 @@ class get_img_url_thread(PauseableThread):
                 if acc is None:
                     break  # stop signal or all disabled
                 session = pixiv_api.make_session(acc.proxy_url)
-                ok = True
-                one = None
-                try:
-                    one = self.get_download_url(
+                ok, one, _ = self._run_with_network_retry(
+                    f"PID {pid}",
+                    lambda: self.get_download_url(
                         self.path, self.Agent, 1, pid,
                         cookie_override=acc.cookie, session=session,
-                    )
-                except (requests.exceptions.ProxyError,
-                        requests.exceptions.ConnectTimeout,
-                        requests.exceptions.ConnectionError) as err:
-                    ok = False
-                    try:
-                        self._q.put(WorkerEvent("output",
-                            f"<p><font color='red'>PID {pid} 因 proxy 失敗略過：{err.__class__.__name__}</font></p>"
-                        ))
-                    except Exception:
-                        pass
-                finally:
-                    self._release_account(acc, ok=ok)
+                    ),
+                )
+                self._release_account(acc, ok=ok)
             else:
                 one = self.get_download_url(self.path, self.Agent, 1, pid)
             if isinstance(one, list):
