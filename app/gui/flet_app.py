@@ -22,7 +22,7 @@ def main(page: ft.Page) -> None:
 
     main_view = MainView(page, event_q)
     settings_view = SettingsView(page)
-    cookies_view = CookiesView(page)
+    cookies_view = CookiesView(page, event_q)
 
     run_controller = RunController(main_view, event_q)
     main_view._run_controller = run_controller
@@ -37,7 +37,10 @@ def main(page: ft.Page) -> None:
     def on_nav_change(e: ft.ControlEvent) -> None:
         idx = e.control.selected_index
         content_area.controls = [views_built[idx]]
-        page.update()
+        if idx == 2:
+            cookies_view.reload_from_settings()
+        else:
+            page.update()
 
     nav_rail = ft.NavigationRail(
         selected_index=0,
@@ -98,13 +101,19 @@ def main(page: ft.Page) -> None:
         else:
             main_view.set_loading(bool(data))
 
+    def handle_cookie_status(data) -> None:
+        if isinstance(data, tuple) and len(data) == 2:
+            cookie, status = data
+            cookies_view.apply_cookie_test_result(str(cookie), str(status))
+
     disp = EventDispatcher(page, event_q, {
-        "output":    handle_output,
-        "progress":  handle_progress,
-        "countdown": handle_countdown,
-        "finished":  handle_finished,
-        "next":      handle_next,
-        "loading":   handle_loading,
+        "output":        handle_output,
+        "progress":      handle_progress,
+        "countdown":     handle_countdown,
+        "finished":      handle_finished,
+        "next":          handle_next,
+        "loading":       handle_loading,
+        "cookie_status": handle_cookie_status,
     })
 
     def toggle_theme(e: ft.ControlEvent) -> None:
