@@ -73,3 +73,26 @@ def test_extract_pid_candidates_from_pximg_filename():
 
 def test_canonicalize_pximg_url_for_storage_removes_hash():
     assert canonicalize_pximg_url_for_storage(PXIMG_URL) == PXIMG_CANONICAL_URL
+
+
+def test_thread_no_use_seleium_propagates_proxy_error():
+    """ProxyError from requests.get must propagate so scheduler can disable."""
+    import requests
+    import queue as _q
+    from app.core import thread_pid_scan
+    t = thread_pid_scan.get_pixiv_author_imgID_Thread.__new__(
+        thread_pid_scan.get_pixiv_author_imgID_Thread
+    )
+    # Bare-bones init enough to call the method
+    t._stop_event = __import__("threading").Event()
+    t._pause_event = __import__("threading").Event()
+    t._pause_event.set()
+    t._q = _q.Queue()
+
+    def boom(*a, **kw):
+        raise requests.exceptions.ProxyError("simulated dead proxy")
+    t._step2_fetch_artist_pid_list = boom
+
+    import pytest
+    with pytest.raises(requests.exceptions.ProxyError):
+        t.thread_no_use_seleium_get_pid("cookie", "agent", ".", "1", "777")

@@ -110,8 +110,14 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             )
         except (requests.exceptions.ProxyError,
                 requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
+                requests.exceptions.ConnectionError) as err:
             ok = False
+            try:
+                self._q.put(WorkerEvent("output",
+                    f"<p><font color='red'>畫師 {aid} 因 proxy 失敗略過：{err.__class__.__name__}</font></p>"
+                ))
+            except Exception:
+                pass
         finally:
             self._release_account(acc, ok=ok)
         return result
@@ -531,6 +537,14 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             self._step2_append_new_pids(pid)
             self._step2_record_author_progress(author_pids)
             return pid
+        except (requests.exceptions.ProxyError,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ConnectionError):
+            # Network/proxy failures must propagate so the scheduler-aware
+            # caller (_run_step2_with_acquired_cookie) can disable the cookie
+            # for this run. Without this re-raise the broad Exception handler
+            # below would swallow it and ok=True would be released as success.
+            raise
         except Exception as err:
             self._step2_record_artist_failure(author_pids, path, num, err)
 
