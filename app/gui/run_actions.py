@@ -15,13 +15,20 @@ from app.core.settings_store import SettingsStore
 from app.core.worker_event import WorkerEvent
 from app.core.account_scheduler import AccountState, AccountScheduler
 from app.core.proxy_utils import parse_proxy_url
-from app.core.pixiv_thread_utils import safe_read_json, load_exist_pid_set
+from app.core.pixiv_thread_utils import (
+    safe_read_json, load_exist_pid_set, normalize_cookie_entries,
+)
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
 
 DEFAULT_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
 )
+
+# Trust a "有效" cookie status without re-testing if it was checked within
+# this window. Cookies that hit a runtime error (proxy_dead) get marked
+# 失效 in settings, so the cache invalidates itself when something breaks.
+_RETEST_INTERVAL_SEC = 30 * 86400  # 30 days
 
 
 def _data_path() -> str:
@@ -78,47 +85,83 @@ class RunController:
     def _log(self, html: str) -> None:
         self._event_q.put(WorkerEvent("output", html))
 
-    def _extract_cookies_list(self, auth: dict) -> list[str]:
-        """Pull the configured cookie strings out of auth settings,
-        preferring cookies_entries -> cookies_pool -> single cookies."""
-        entries = auth.get("cookies_entries") or []
-        pool = auth.get("cookies_pool") or []
-        if isinstance(entries, list) and entries:
-            cookies_list = [
-                e.get("cookie", "") if isinstance(e, dict) else str(e)
-                for e in entries
-            ]
-        elif isinstance(pool, list) and pool:
-            cookies_list = [str(c) for c in pool]
-        else:
-            raw = str(auth.get("cookies", "") or "")
-            cookies_list = [raw] if raw.strip() else []
-        return [c.strip() for c in cookies_list if c and c.strip()]
+    def _extract_cookie_entries(self, auth: dict) -> list[dict]:
+        """Pull configured cookie entries (cookie + alias + status +
+        last_tested_at) from auth settings, normalising whatever shape
+        the user has saved."""
+        raw = auth.get("cookies_entries") or auth.get("cookies_pool") or []
+        if not raw:
+            single = str(auth.get("cookies", "") or "").strip()
+            if single:
+                raw = [single]
+        alias_map = auth.get("cookies_aliases") or {}
+        if not isinstance(alias_map, dict):
+            alias_map = {}
+        return normalize_cookie_entries(raw, alias_map=alias_map)
 
-    def _test_cookies(self, cookies_list: list[str], agent: str) -> list[str]:
-        """Validate each cookie via Test_cookies and return the valid ones.
+    def _test_cookies(self, entries: list[dict], agent: str) -> list[str]:
+        """Validate each cookie, returning the valid cookie strings.
 
-        Updates the loading-dialog message per cookie, pushes
-        cookie_status events so the cookies view reflects results live,
-        and persists the new statuses back to settings."""
-        if not cookies_list:
+        Skips the network test for entries whose cached status is 有效
+        and was checked within ``_RETEST_INTERVAL_SEC`` (30 days). For
+        anything else (失效 / 未知 / stale / no timestamp), runs
+        ``Test_cookies`` and persists the result.
+
+        Pushes cookie_status events to the cookies view so the table
+        reflects the newest state live, and writes status +
+        last_tested_at back to settings."""
+        if not entries:
             return []
+        import time as _time
         from app.core import pixiv_api
+
+        now = _time.time()
         valid: list[str] = []
-        total = len(cookies_list)
+        needs_test: list[dict] = []
+        for e in entries:
+            cookie = str(e.get("cookie", "") or "").strip()
+            if not cookie:
+                continue
+            status = e.get("status")
+            tested_at = e.get("last_tested_at")
+            try:
+                tested_f = float(tested_at) if tested_at is not None else None
+            except (TypeError, ValueError):
+                tested_f = None
+            if (status == "有效" and tested_f is not None
+                    and now - tested_f < _RETEST_INTERVAL_SEC):
+                valid.append(cookie)
+                days = max(0, int((now - tested_f) / 86400))
+                alias = e.get("alias", "") or "Cookie"
+                self._log(
+                    f"<p><font color='gray'>{alias} 信任快取（{days} 天前驗證）</font></p>"
+                )
+            else:
+                needs_test.append(e)
+
+        if not needs_test:
+            return valid
+
+        # Test only the entries that need it. Persist all tested entries'
+        # results in one settings write at the end.
+        total = len(needs_test)
         self._log(f"<p><font color='blue'>啟動前測試 {total} 個 Cookie...</font></p>")
-        for idx, cookie in enumerate(cookies_list, start=1):
+        tested_results: dict[str, bool] = {}
+        for idx, e in enumerate(needs_test, start=1):
+            cookie = str(e.get("cookie", "") or "").strip()
             self._event_q.put(WorkerEvent(
                 "loading", (True, f"測試 Cookie {idx}/{total}...")
             ))
-            self._event_q.put(WorkerEvent("cookie_status", (cookie, "測試中")))
+            self._event_q.put(WorkerEvent("cookie_status", (cookie, "測試中", None)))
             try:
                 count, _ = pixiv_api.Test_cookies([cookie], agent)
                 ok = int(count) > 0
             except Exception:
                 ok = False
+            tested_results[cookie] = ok
             status = "有效" if ok else "失效"
-            self._event_q.put(WorkerEvent("cookie_status", (cookie, status)))
+            tested_at = _time.time()
+            self._event_q.put(WorkerEvent("cookie_status", (cookie, status, tested_at)))
             if ok:
                 valid.append(cookie)
                 self._log(f"<p><font color='green'>Cookie {idx}/{total} 有效</font></p>")
@@ -126,15 +169,18 @@ class RunController:
                 self._log(
                     f"<p><font color='red'>Cookie {idx}/{total} 失效，已從本次任務排除</font></p>"
                 )
-        self._persist_cookie_statuses(cookies_list, valid)
+        self._persist_cookie_statuses(tested_results, _time.time())
         return valid
 
     def _persist_cookie_statuses(
-        self, tested_cookies: list[str], valid: list[str]
+        self, tested_results: dict[str, bool], tested_at: float,
     ) -> None:
-        """Write the latest test result back to cookies_entries[].status
-        so the cookies view reflects them on next reload."""
-        valid_set = set(valid)
+        """Write the latest test results (cookie -> ok bool) and shared
+        timestamp back to cookies_entries[].status / last_tested_at so
+        the cookies view reflects them on next reload. Untested entries
+        keep their existing status untouched."""
+        if not tested_results:
+            return
         try:
             store = _store()
             auth = store.get_section("auth")
@@ -147,13 +193,61 @@ class RunController:
                     new_entries.append(e)
                     continue
                 c = str(e.get("cookie", "")).strip()
-                if c in tested_cookies:
-                    new_entries.append({**e, "status": "有效" if c in valid_set else "失效"})
+                if c in tested_results:
+                    new_entries.append({
+                        **e,
+                        "status": "有效" if tested_results[c] else "失效",
+                        "last_tested_at": tested_at,
+                    })
                 else:
                     new_entries.append(e)
             store.update_section("auth", {**auth, "cookies_entries": new_entries})
         except Exception:
             pass
+
+    def _invalidate_cookie_status(self, cookie: str) -> None:
+        """Mark a single cookie as 失效 in settings (called from the
+        scheduler's on_disable callback when proxy/auth fails at
+        runtime). Sets last_tested_at=now so the cache is treated as
+        fresh-but-bad — next run re-tests instead of trusting it."""
+        if not cookie:
+            return
+        import time as _time
+        try:
+            store = _store()
+            auth = store.get_section("auth")
+            entries = auth.get("cookies_entries") or []
+            if not isinstance(entries, list):
+                return
+            now = _time.time()
+            new_entries = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    new_entries.append(e)
+                    continue
+                c = str(e.get("cookie", "")).strip()
+                if c == cookie.strip():
+                    new_entries.append({**e, "status": "失效", "last_tested_at": now})
+                else:
+                    new_entries.append(e)
+            store.update_section("auth", {**auth, "cookies_entries": new_entries})
+        except Exception:
+            pass
+
+    def _attach_aliases(
+        self, valid_cookies: list[str], auth: dict,
+    ) -> list[dict]:
+        """Pair each validated cookie with its alias from
+        ``auth.cookies_aliases`` so worker threads can resolve aliases
+        for log lines and stats (otherwise ``cookie_usage_label`` falls
+        back to ``Cookie{n}``)."""
+        alias_map = auth.get("cookies_aliases") or {}
+        if not isinstance(alias_map, dict):
+            alias_map = {}
+        return [
+            {"cookie": c, "alias": str(alias_map.get(c, "") or "").strip()}
+            for c in valid_cookies
+        ]
 
     def _build_scheduler(
         self,
@@ -187,6 +281,7 @@ class RunController:
             stop_event=stop_event,
             emit=self._log,
             q=self._event_q,
+            on_disable=lambda acc: self._invalidate_cookie_status(acc.cookie),
         )
 
     def _start_step(self, n: int) -> None:
@@ -224,8 +319,8 @@ class RunController:
             if not userid:
                 self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
                 return None
-            cookies_list = self._extract_cookies_list(auth)
-            valid_cookies = self._test_cookies(cookies_list, agent)
+            cookie_entries = self._extract_cookie_entries(auth)
+            valid_cookies = self._test_cookies(cookie_entries, agent)
             if not valid_cookies:
                 self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 1</font></p>")
                 return None
@@ -242,8 +337,8 @@ class RunController:
             if not authors:
                 self._log("<p><font color='red'>找不到 following 清單，請先執行步驟 1</font></p>")
                 return None
-            cookies_list = self._extract_cookies_list(auth)
-            valid_cookies = self._test_cookies(cookies_list, agent)
+            cookie_entries = self._extract_cookie_entries(auth)
+            valid_cookies = self._test_cookies(cookie_entries, agent)
             if not valid_cookies:
                 self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 2</font></p>")
                 return None
@@ -252,7 +347,7 @@ class RunController:
                 authors,
                 agent,
                 path,
-                valid_cookies,
+                self._attach_aliases(valid_cookies, auth),
                 load_exist_pid_set(path),
                 bool(perf.get("single_thread_mode", False)),
             )
@@ -261,8 +356,8 @@ class RunController:
 
         if n == 3:
             authors = _load_author_list()
-            cookies_list = self._extract_cookies_list(auth)
-            valid_cookies = self._test_cookies(cookies_list, agent)
+            cookie_entries = self._extract_cookie_entries(auth)
+            valid_cookies = self._test_cookies(cookie_entries, agent)
             if not valid_cookies:
                 self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 3</font></p>")
                 return None
@@ -270,7 +365,7 @@ class RunController:
                 q=self._event_q,
                 Author_list=authors,
                 Agent=agent,
-                cookies=valid_cookies,
+                cookies=self._attach_aliases(valid_cookies, auth),
                 exist_pid=load_exist_pid_set(path),
                 ban_tag=list(dl.get("ban_tag", [])),
                 must_tag=list(dl.get("must_tag", [])),
@@ -295,8 +390,8 @@ class RunController:
                 dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S") if dt_str else datetime(1970, 1, 1)
             except Exception:
                 dt = datetime(1970, 1, 1)
-            cookies_list = self._extract_cookies_list(auth)
-            valid_cookies = self._test_cookies(cookies_list, agent)
+            cookie_entries = self._extract_cookie_entries(auth)
+            valid_cookies = self._test_cookies(cookie_entries, agent)
             if not valid_cookies:
                 self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 4</font></p>")
                 return None
@@ -307,7 +402,7 @@ class RunController:
                 notime=bool(flt.get("notime", False)),
                 create_dir=bool(directory.get("create_dir", False)),
                 download_path=dl_path,
-                cookies=valid_cookies,
+                cookies=self._attach_aliases(valid_cookies, auth),
                 agent=agent,
                 download_time=dt,
                 no_R18G_dir=bool(directory.get("no_R18G_dir", False)),
