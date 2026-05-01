@@ -58,3 +58,82 @@ def test_countdown_emits_countdown_events():
     assert 2 in values
     assert 1 in values
     assert 0 in values
+
+
+# --- new tests for scheduler injection (Task 4) ---
+
+def test_pauseable_thread_default_scheduler_is_none():
+    import queue
+    from app.core.pixiv_thread_base import PauseableThread
+    t = PauseableThread(queue.Queue())
+    assert t._scheduler is None
+
+
+def test_acquire_account_returns_none_when_no_scheduler():
+    import queue
+    from app.core.pixiv_thread_base import PauseableThread
+    t = PauseableThread(queue.Queue())
+    assert t._acquire_account() is None
+
+
+def test_release_account_is_noop_when_no_scheduler():
+    import queue
+    from app.core.pixiv_thread_base import PauseableThread
+    t = PauseableThread(queue.Queue())
+    # Should not raise
+    t._release_account(None)
+    t._release_account(object(), ok=True)
+    t._release_account(object(), ok=False)
+
+
+def test_acquire_account_delegates_to_scheduler():
+    import queue
+    from app.core.pixiv_thread_base import PauseableThread
+
+    class FakeScheduler:
+        def __init__(self, value):
+            self.value = value
+            self.acquire_called = 0
+        def acquire(self):
+            self.acquire_called += 1
+            return self.value
+
+    sentinel = object()
+    sched = FakeScheduler(sentinel)
+    t = PauseableThread(queue.Queue(), scheduler=sched)
+    result = t._acquire_account()
+    assert result is sentinel
+    assert sched.acquire_called == 1
+
+
+def test_release_account_delegates_to_scheduler():
+    import queue
+    from app.core.pixiv_thread_base import PauseableThread
+
+    class FakeScheduler:
+        def __init__(self):
+            self.release_args = None
+        def release(self, account, ok=True):
+            self.release_args = (account, ok)
+
+    sched = FakeScheduler()
+    t = PauseableThread(queue.Queue(), scheduler=sched)
+    acc = object()
+    t._release_account(acc, ok=False)
+    assert sched.release_args == (acc, False)
+
+
+def test_release_account_skips_when_account_is_none():
+    import queue
+    from app.core.pixiv_thread_base import PauseableThread
+
+    class FakeScheduler:
+        def __init__(self):
+            self.release_called = False
+        def release(self, account, ok=True):
+            self.release_called = True
+
+    sched = FakeScheduler()
+    t = PauseableThread(queue.Queue(), scheduler=sched)
+    t._release_account(None)
+    assert sched.release_called is False

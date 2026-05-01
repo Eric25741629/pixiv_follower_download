@@ -89,12 +89,13 @@ def _is_ai_artwork_tagged(artwork_tags, tag_hit):
 class PauseableThread(threading.Thread):
     """Base class: pause/resume/stop with countdown support via queue.Queue."""
 
-    def __init__(self, q: _queue.Queue):
+    def __init__(self, q: _queue.Queue, scheduler=None):
         super().__init__(daemon=True)
         self._q = q
         self._pause_event = threading.Event()
         self._pause_event.set()   # not paused by default
         self._stop_event = threading.Event()
+        self._scheduler = scheduler  # AccountScheduler | None
 
     def pause(self):
         self._pause_event.clear()
@@ -145,4 +146,15 @@ class PauseableThread(threading.Thread):
         except Exception:
             pass
 
+    def _acquire_account(self):
+        """Acquire next available account from scheduler, or None if no scheduler."""
+        if self._scheduler is None:
+            return None
+        return self._scheduler.acquire()
+
+    def _release_account(self, account, ok: bool = True) -> None:
+        """Release account back to scheduler. Safe no-op if scheduler/account is None."""
+        if self._scheduler is None or account is None:
+            return
+        self._scheduler.release(account, ok=ok)
 
