@@ -46,14 +46,18 @@ class StatsView:
 
         self._chart_container = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO)
 
-        self._segmented = ft.SegmentedButton(
-            selected={"session"},
-            on_change=self._on_mode_change,
-            segments=[
-                ft.Segment(value="session", label=ft.Text("本次執行")),
-                ft.Segment(value="lifetime", label=ft.Text("歷史累計")),
+        self._tabs = ft.Tabs(
+            selected_index=0,
+            on_change=self._on_tab_change,
+            tabs=[
+                ft.Tab(text="本次執行"),
+                ft.Tab(text="歷史累計"),
             ],
         )
+
+    def _on_tab_change(self, e: ft.ControlEvent) -> None:
+        self._mode = "session" if e.control.selected_index == 0 else "lifetime"
+        self._refresh_now()
 
     def build(self) -> ft.Container:
         cards = self._build_cards()
@@ -68,7 +72,7 @@ class StatsView:
             content=ft.Column(
                 controls=[
                     ft.Text("統計資料", size=20, weight=ft.FontWeight.BOLD),
-                    self._segmented,
+                    self._tabs,
                     cards,
                     ft.Divider(),
                     chart_section,
@@ -104,12 +108,6 @@ class StatsView:
             cards.append(card)
         return ft.Row(controls=cards, wrap=True, spacing=12)
 
-    def _on_mode_change(self, e: ft.ControlEvent) -> None:
-        selected = e.control.selected
-        if selected:
-            self._mode = next(iter(selected))
-        self._refresh_now()
-
     def start_auto_refresh(self) -> None:
         if self._refresh_task is not None:
             return
@@ -129,14 +127,17 @@ class StatsView:
             pass
 
     def _refresh_now(self) -> None:
-        if self._mode == "session":
-            data = self._stats.get_session_stats()
-            self._update_session_cards(data)
-            self._update_chart(data.get("requests", {}))
-        else:
-            data = self._stats.get_lifetime_stats()
-            self._update_lifetime_cards(data)
-            self._update_chart(data.get("cookie_request_counts", {}))
+        try:
+            if self._mode == "session":
+                data = self._stats.get_session_stats()
+                self._update_session_cards(data)
+                self._update_chart(data.get("requests", {}))
+            else:
+                data = self._stats.get_lifetime_stats()
+                self._update_lifetime_cards(data)
+                self._update_chart(data.get("cookie_request_counts", {}))
+        except Exception:
+            pass
 
     def _update_session_cards(self, data: dict[str, Any]) -> None:
         self._card_values[0].value = StatsCollector.format_bytes(data.get("bytes", 0))
