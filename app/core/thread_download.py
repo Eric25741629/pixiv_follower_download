@@ -1548,22 +1548,12 @@ class download_thread(PauseableThread):
                     pid_key = normalize_pid(pid) or str(pid)
                     self._pid_cookie_selection[pid_key] = acc.cookie
                     self._current_account = acc
-                    ok = True
-                    result = []
-                    try:
-                        result = self._download_pid_group(pid, pid_groups.get(pid, []))
-                    except (requests.exceptions.ProxyError,
-                            requests.exceptions.ConnectTimeout,
-                            requests.exceptions.ConnectionError) as err:
-                        ok = False
-                        try:
-                            self._q.put(WorkerEvent("output",
-                                f"<p><font color='red'>PID {pid} 因 proxy 失敗略過：{err.__class__.__name__}</font></p>"))
-                        except Exception:
-                            pass
-                    finally:
-                        self._current_account = None
-                        self._release_account(acc, ok=ok)
+                    ok, result, _ = self._run_with_network_retry(
+                        f"PID {pid}",
+                        lambda: self._download_pid_group(pid, pid_groups.get(pid, [])),
+                    )
+                    self._current_account = None
+                    self._release_account(acc, ok=ok)
                     failed_nested.append(result if isinstance(result, list) else [])
                 else:
                     failed_nested.append(self._download_pid_group(pid, pid_groups.get(pid, [])))
