@@ -718,7 +718,7 @@ def Pixiv_info(url,
 
         return final_result
 
-def get_pixiv_cookie_requirement(pid, *, session: "requests.Session | None" = None):
+def get_pixiv_cookie_requirement(pid):
     """回傳指定 PID 最近一次是否需要 cookie，找不到時回傳 None。"""
     try:
         trace_path = os.path.join(os.getenv('APPDATA')+r'/pixiv_download/', 'pixiv_cookie_requirement.json')
