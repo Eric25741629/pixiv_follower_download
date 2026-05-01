@@ -48,3 +48,24 @@ def parse_proxy_list(text: str) -> list[str]:
             seen.add(parsed)
             result.append(parsed)
     return result
+
+
+def test_proxy(proxy_url: str | None, timeout: int = 10) -> tuple[bool, str]:
+    """Synchronously test a proxy by GETing https://www.pixiv.net.
+
+    Returns (success, message). On success the message includes the HTTP
+    status. On failure it includes the truncated exception text.
+    """
+    import requests
+    try:
+        proxies = to_requests_proxies(proxy_url)
+        resp = requests.get(
+            "https://www.pixiv.net",
+            proxies=proxies,
+            timeout=timeout,
+            verify=False,
+            allow_redirects=True,
+        )
+        return True, f"HTTP {resp.status_code}"
+    except Exception as exc:
+        return False, str(exc)[:80]

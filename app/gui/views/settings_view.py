@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import threading
 import flet as ft
 from app.core.settings_store import SettingsStore
 
@@ -55,9 +56,43 @@ class SettingsView:
         effort_val = max(1, min(9, int(jxl.get("effort", 7))))
         self._sl_jxl_effort = ft.Slider(min=1, max=9, divisions=8, value=effort_val, label="{value}", width=200)
 
-        self._tf_dl_wait_min = ft.TextField(label="等待最小秒數", value=str(perf.get("pid_wait_min", 10)), width=120, keyboard_type=ft.KeyboardType.NUMBER)
-        self._tf_dl_wait_max = ft.TextField(label="等待最大秒數", value=str(perf.get("pid_wait_max", 60)), width=120, keyboard_type=ft.KeyboardType.NUMBER)
+        # Cooldown controls — replace old pid_wait_min / pid_wait_max text fields
+        cooldown_avg = int(perf.get("pid_cooldown_avg", 35))
+        self._sl_cooldown = ft.Slider(
+            min=5, max=300, divisions=59, value=float(cooldown_avg),
+            label="{value}", width=240,
+            on_change=self._on_cooldown_slider_change,
+        )
+        self._tf_cooldown = ft.TextField(
+            label="平均冷卻秒數",
+            value=str(cooldown_avg),
+            width=110,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            on_change=self._on_cooldown_tf_change,
+        )
+        self._label_cooldown_hint = ft.Text(
+            self._cooldown_hint(cooldown_avg),
+            size=11,
+            color=ft.Colors.RED_600 if cooldown_avg < 30 else ft.Colors.GREY_600,
+        )
         self._sw_single_thread = ft.Switch(label="單執行緒 PID 模式", value=bool(perf.get("single_thread_mode", False)))
+
+        # Proxy controls
+        proxy_pool = auth.get("proxy_pool") or []
+        self._tf_proxy_pool = ft.TextField(
+            label="Proxy 列表（每行一個）",
+            hint_text="# 一行一個 proxy\nhttp://1.2.3.4:8080\nsocks5://user:pass@host:1080",
+            value="\n".join(proxy_pool),
+            multiline=True,
+            min_lines=4,
+            max_lines=15,
+            expand=True,
+        )
+        self._proxy_test_results = ft.Column([], spacing=4)
+
+    # ------------------------------------------------------------------
+    # File picker handlers
+    # ------------------------------------------------------------------
 
     async def _pick_folder(self, e: ft.ControlEvent) -> None:
         path = await self._file_picker.get_directory_path()
@@ -70,6 +105,10 @@ class SettingsView:
         if files:
             self._tf_jxl_path.value = files[0].path
             self._tf_jxl_path.update()
+
+    # ------------------------------------------------------------------
+    # Tag handlers
+    # ------------------------------------------------------------------
 
     def _add_ban_tag(self, e: ft.ControlEvent) -> None:
         tag = self._tf_ban_input.value.strip()
@@ -107,14 +146,97 @@ class SettingsView:
         self._refresh_tag_rows()
         self._page.update()
 
+    # ------------------------------------------------------------------
+    # Cooldown helpers
+    # ------------------------------------------------------------------
+
+    def _cooldown_hint(self, avg) -> str:
+        try:
+            avg_f = max(1.0, float(avg))
+        except (TypeError, ValueError):
+            avg_f = 35.0
+        multiplier = 60.0 / avg_f
+        return f"相當於倍率 {multiplier:.2f}x；推薦 >= 30 秒"
+
+    def _on_cooldown_slider_change(self, e: ft.ControlEvent) -> None:
+        try:
+            val = int(e.control.value)
+        except (TypeError, ValueError):
+            return
+        self._tf_cooldown.value = str(val)
+        self._label_cooldown_hint.value = self._cooldown_hint(val)
+        self._label_cooldown_hint.color = ft.Colors.RED_600 if val < 30 else ft.Colors.GREY_600
+        try:
+            self._tf_cooldown.update()
+            self._label_cooldown_hint.update()
+        except Exception:
+            pass
+
+    def _on_cooldown_tf_change(self, e: ft.ControlEvent) -> None:
+        try:
+            val = max(5, min(300, int(self._tf_cooldown.value or "35")))
+        except (TypeError, ValueError):
+            return
+        self._sl_cooldown.value = float(val)
+        self._label_cooldown_hint.value = self._cooldown_hint(val)
+        self._label_cooldown_hint.color = ft.Colors.RED_600 if val < 30 else ft.Colors.GREY_600
+        try:
+            self._sl_cooldown.update()
+            self._label_cooldown_hint.update()
+        except Exception:
+            pass
+
+    def _safe_int_cooldown(self) -> int:
+        try:
+            return max(5, min(300, int(self._tf_cooldown.value or "35")))
+        except (TypeError, ValueError):
+            return 35
+
+    # ------------------------------------------------------------------
+    # Proxy test handler
+    # ------------------------------------------------------------------
+
+    def _on_test_proxies(self, e: ft.ControlEvent) -> None:
+        from app.core.proxy_utils import parse_proxy_list, test_proxy
+        lines = parse_proxy_list(self._tf_proxy_pool.value or "")
+        self._proxy_test_results.controls = [ft.Text("測試中...", size=11)]
+        try:
+            self._page.update()
+        except Exception:
+            pass
+
+        def _run():
+            results = []
+            if not lines:
+                results = [ft.Text("（無有效 proxy）", size=11, color=ft.Colors.GREY_600)]
+            else:
+                for url in lines:
+                    ok, msg = test_proxy(url, timeout=10)
+                    icon = "v" if ok else "x"
+                    color = ft.Colors.GREEN_600 if ok else ft.Colors.RED_600
+                    results.append(ft.Text(f"{icon} {url} — {msg}", size=11, color=color))
+            self._proxy_test_results.controls = results
+            try:
+                self._page.update()
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+
     def save(self) -> None:
         store = _store()
-        auth = store.get_section("auth")
+        from app.core.proxy_utils import parse_proxy_list
+        auth_existing = store.get_section("auth")
         store.update_section("auth", {
-            **auth,
+            **auth_existing,
             "account": self._tf_account.value,
             "password": self._tf_password.value,
             "userid": self._tf_userid.value,
+            "proxy_pool": parse_proxy_list(self._tf_proxy_pool.value or ""),
         })
         store.update_section("download", {
             **store.get_section("download"),
@@ -134,8 +256,9 @@ class SettingsView:
             },
             "performance": {
                 "single_thread_mode": self._sw_single_thread.value,
-                "pid_wait_min": int(self._tf_dl_wait_min.value or 10),
-                "pid_wait_max": int(self._tf_dl_wait_max.value or 60),
+                "pid_cooldown_avg": self._safe_int_cooldown(),
+                "pid_wait_nocookie_min": int(store.get_section("performance").get("pid_wait_nocookie_min", 1)),
+                "pid_wait_nocookie_max": int(store.get_section("performance").get("pid_wait_nocookie_max", 6)),
             },
             "jxl": {
                 "enable": self._sw_jxl.value,
@@ -144,6 +267,51 @@ class SettingsView:
                 "effort": int(self._sl_jxl_effort.value),
             },
         })
+
+    def _save_and_notify(self, e) -> None:
+        avg_val = self._safe_int_cooldown()
+        if avg_val < 30:
+            def _confirm(ev):
+                try:
+                    self._page.pop_dialog()
+                except Exception:
+                    pass
+                self.save()
+                try:
+                    self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
+                except Exception:
+                    pass
+
+            def _cancel(ev):
+                try:
+                    self._page.pop_dialog()
+                except Exception:
+                    pass
+
+            try:
+                self._page.show_dialog(ft.AlertDialog(
+                    title=ft.Text("冷卻時間偏短"),
+                    content=ft.Text(
+                        f"平均冷卻 {avg_val} 秒低於建議值 30 秒，\n可能被 Pixiv 風控偵測。確定要套用？"
+                    ),
+                    actions=[
+                        ft.TextButton("取消", on_click=_cancel),
+                        ft.FilledButton("確定套用", on_click=_confirm),
+                    ],
+                ))
+            except Exception:
+                # If dialog fails for any reason, fall back to direct save
+                self.save()
+            return
+        self.save()
+        try:
+            self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
 
     def build(self) -> ft.Column:
         def _tile(title: str, controls: list) -> ft.ExpansionTile:
@@ -155,11 +323,7 @@ class SettingsView:
                 )],
             )
 
-        def _save_and_notify(e):
-            self.save()
-            self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
-
-        save_btn = ft.FilledButton("儲存設定", icon=ft.Icons.SAVE, on_click=_save_and_notify)
+        save_btn = ft.FilledButton("儲存設定", icon=ft.Icons.SAVE, on_click=self._save_and_notify)
 
         return ft.Column(
             controls=[
@@ -194,9 +358,17 @@ class SettingsView:
                     self._sw_jxl_delete,
                     ft.Row([ft.Text("Effort（1-9）"), self._sl_jxl_effort]),
                 ]),
-                _tile("下載設定", [
-                    ft.Row([self._tf_dl_wait_min, self._tf_dl_wait_max], spacing=16),
+                _tile("冷卻設定", [
+                    ft.Row([self._tf_cooldown, self._sl_cooldown], spacing=12),
+                    self._label_cooldown_hint,
                     self._sw_single_thread,
+                ]),
+                _tile("Proxy 設定", [
+                    self._tf_proxy_pool,
+                    ft.Row([
+                        ft.OutlinedButton("測試全部 Proxy", on_click=self._on_test_proxies),
+                    ]),
+                    self._proxy_test_results,
                 ]),
                 ft.Container(content=save_btn, padding=ft.padding.only(top=8)),
             ],
