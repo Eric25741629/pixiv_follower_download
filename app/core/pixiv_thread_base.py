@@ -1,6 +1,9 @@
 import threading
 import queue as _queue
 import time
+
+import requests
+
 from app.core.worker_event import WorkerEvent
 from pixiv_api import *
 from app.core.pixiv_thread_utils import (
@@ -14,6 +17,15 @@ _normalize_cookie_entries = normalize_cookie_entries
 _normalize_cookie_pool = normalize_cookie_pool
 _cookie_usage_label = cookie_usage_label
 _format_cookie_usage_summary = format_cookie_usage_summary
+
+
+NETWORK_RETRY_ATTEMPTS = 5
+NETWORK_RETRY_WAIT_SEC = 60
+_NETWORK_RETRY_EXCEPTIONS = (
+    requests.exceptions.ProxyError,
+    requests.exceptions.ConnectTimeout,
+    requests.exceptions.ConnectionError,
+)
 
 
 def _normalize_special_like_rules(raw_rules):
@@ -157,4 +169,64 @@ class PauseableThread(threading.Thread):
         if self._scheduler is None or account is None:
             return
         self._scheduler.release(account, ok=ok)
+
+    def _emit_output(self, html: str) -> None:
+        try:
+            self._q.put(WorkerEvent("output", html))
+        except Exception:
+            pass
+
+    def _wait_interruptible(self, seconds: float) -> bool:
+        """Sleep for ``seconds``, polling stop/pause every 0.5 s.
+
+        Returns True if the full duration elapsed, False if stop fired.
+        Paused time does not count toward the budget.
+        """
+        if seconds <= 0:
+            return not self._stop_event.is_set()
+        elapsed = 0.0
+        while elapsed < seconds:
+            if self._stop_event.is_set():
+                return False
+            if not self._pause_event.is_set():
+                self._pause_event.wait(timeout=0.5)
+                continue
+            slice_s = min(0.5, seconds - elapsed)
+            if self._stop_event.wait(timeout=slice_s):
+                return False
+            elapsed += slice_s
+        return True
+
+    def _run_with_network_retry(self, work_label: str, fn):
+        """Run ``fn()`` with up to NETWORK_RETRY_ATTEMPTS attempts on the
+        scheduler network triple. Returns ``(ok, result, last_exc)``.
+
+        Success returns ``(True, result, None)``. Exhaustion or stop during
+        wait returns ``(False, None, last_exc)``. Non-network exceptions
+        propagate unchanged on first occurrence.
+        """
+        if self._stop_event.is_set():
+            return False, None, None
+        last_exc = None
+        for attempt in range(1, NETWORK_RETRY_ATTEMPTS + 1):
+            try:
+                return True, fn(), None
+            except _NETWORK_RETRY_EXCEPTIONS as err:
+                last_exc = err
+                if attempt < NETWORK_RETRY_ATTEMPTS:
+                    self._emit_output(
+                        f"<p><font color='#b58900'>{work_label} 第 {attempt}/"
+                        f"{NETWORK_RETRY_ATTEMPTS} 次失敗"
+                        f"（{err.__class__.__name__}），"
+                        f"{NETWORK_RETRY_WAIT_SEC} 秒後重試</font></p>"
+                    )
+                    if not self._wait_interruptible(NETWORK_RETRY_WAIT_SEC):
+                        return False, None, last_exc
+                else:
+                    self._emit_output(
+                        f"<p><font color='red'>{work_label} 重試 "
+                        f"{NETWORK_RETRY_ATTEMPTS} 次仍失敗"
+                        f"（{err.__class__.__name__}），停用此 Cookie</font></p>"
+                    )
+        return False, None, last_exc
 
