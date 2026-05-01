@@ -8,6 +8,8 @@ from app.gui.run_actions import RunController
 from app.gui.views.main_view import MainView
 from app.gui.views.settings_view import SettingsView
 from app.gui.views.cookies_view import CookiesView
+from app.gui.views.stats_view import StatsView
+from app.core.stats_collector import StatsCollector
 
 
 def main(page: ft.Page) -> None:
@@ -23,11 +25,13 @@ def main(page: ft.Page) -> None:
     main_view = MainView(page, event_q)
     settings_view = SettingsView(page)
     cookies_view = CookiesView(page, event_q)
+    stats_collector = StatsCollector()
+    stats_view = StatsView(page, stats_collector)
 
-    run_controller = RunController(main_view, event_q)
+    run_controller = RunController(main_view, event_q, stats_collector)
     main_view._run_controller = run_controller
 
-    views_built = [main_view.build(), settings_view.build(), cookies_view.build()]
+    views_built = [main_view.build(), settings_view.build(), cookies_view.build(), stats_view.build()]
 
     content_area = ft.Column(
         controls=[views_built[0]],
@@ -39,8 +43,11 @@ def main(page: ft.Page) -> None:
         content_area.controls = [views_built[idx]]
         if idx == 2:
             cookies_view.reload_from_settings()
+        elif idx == 3:
+            stats_view.start_auto_refresh()
         else:
-            page.update()
+            stats_view.stop_auto_refresh()
+        page.update()
 
     nav_rail = ft.NavigationRail(
         selected_index=0,
@@ -61,6 +68,11 @@ def main(page: ft.Page) -> None:
                 icon=ft.Icons.COOKIE_OUTLINED,
                 selected_icon=ft.Icons.COOKIE,
                 label="Cookie",
+            ),
+            ft.NavigationRailDestination(
+                icon=ft.Icons.BAR_CHART_OUTLINED,
+                selected_icon=ft.Icons.BAR_CHART,
+                label="統計",
             ),
         ],
     )
