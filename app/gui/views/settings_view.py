@@ -156,7 +156,7 @@ class SettingsView:
         except (TypeError, ValueError):
             avg_f = 35.0
         multiplier = 60.0 / avg_f
-        return f"相當於倍率 {multiplier:.2f}x；推薦 >= 30 秒"
+        return f"相當於倍率 {multiplier:.1f}x；推薦 >= 30 秒"
 
     def _on_cooldown_slider_change(self, e: ft.ControlEvent) -> None:
         try:
@@ -177,10 +177,12 @@ class SettingsView:
             val = max(5, min(300, int(self._tf_cooldown.value or "35")))
         except (TypeError, ValueError):
             return
+        self._tf_cooldown.value = str(val)            # snap displayed text to clamped value
         self._sl_cooldown.value = float(val)
         self._label_cooldown_hint.value = self._cooldown_hint(val)
         self._label_cooldown_hint.color = ft.Colors.RED_600 if val < 30 else ft.Colors.GREY_600
         try:
+            self._tf_cooldown.update()                # flush the TextField update
             self._sl_cooldown.update()
             self._label_cooldown_hint.update()
         except Exception:
