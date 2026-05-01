@@ -59,27 +59,23 @@ class AccountScheduler:
                 return None
 
             with self._lock:
-                if self.all_disabled():
-                    self._emit(
-                        "<p><font color='red'>所有 Cookie 都已禁用，任務停止</font></p>"
-                    )
+                active = [a for a in self._accounts if a.disabled_reason is None]
+                if not active:
+                    # Empty pool, or every account is disabled.
+                    if self._accounts:
+                        self._emit(
+                            "<p><font color='red'>所有 Cookie 都已禁用，任務停止</font></p>"
+                        )
                     return None
                 now = time.monotonic()
-                available = [
-                    a for a in self._accounts
-                    if a.disabled_reason is None and a.cooldown_until <= now
-                ]
+                available = [a for a in active if a.cooldown_until <= now]
                 if available:
                     return available[0]
-                earliest = min(
-                    a.cooldown_until
-                    for a in self._accounts
-                    if a.disabled_reason is None
-                )
+                earliest = min(a.cooldown_until for a in active)
                 wait = max(0.0, earliest - now)
 
             # Poll at most 0.5 s so stop/pause can interrupt
-            time.sleep(min(0.5, wait))
+            time.sleep(max(0.001, min(0.5, wait)))
 
         return None
 
@@ -109,10 +105,15 @@ class AccountScheduler:
         with self._lock:
             account.disabled_reason = reason
 
-    def all_disabled(self) -> bool:
+    def _all_disabled(self) -> bool:
+        """Internal: caller must hold ``self._lock``."""
         return bool(self._accounts) and all(
             a.disabled_reason is not None for a in self._accounts
         )
+
+    def all_disabled(self) -> bool:
+        with self._lock:
+            return self._all_disabled()
 
     def average_cooldown(self) -> float:
         """Current average cooldown seconds (live read of get_cooldown_avg)."""

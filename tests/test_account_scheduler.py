@@ -101,3 +101,13 @@ def test_account_state_proxies_property_with_proxy():
 def test_account_state_proxies_property_without_proxy():
     acc = AccountState(cookie="c1", alias="A1", proxy_url=None)
     assert acc.proxies is None
+
+
+def test_acquire_returns_none_when_accounts_empty():
+    sched, _, _ = _make_scheduler([])
+    assert sched.acquire() is None
+
+
+def test_all_disabled_false_when_accounts_empty():
+    sched, _, _ = _make_scheduler([])
+    assert sched.all_disabled() is False
