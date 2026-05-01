@@ -6,6 +6,7 @@ import re
 import glob
 import random as pyrandom
 import threading
+import requests
 from queue import Queue
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
@@ -13,11 +14,9 @@ import tag_edit
 import pixiv_api
 from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
-    apply_cookie_pool_speedup,
     atomic_write_json,
     atomic_write_text,
     canonicalize_pximg_url_for_storage,
-    cookie_speed_divisor,
     cookie_usage_label,
     init_cookie_fields,
     normalize_pid,
@@ -51,13 +50,12 @@ class get_img_url_thread(PauseableThread):
         no_to_check,
         base_path=None,
         single_thread_mode=False,
-        pid_wait_min=10,
-        pid_wait_max=60,
         pid_wait_nocookie_min=1,
         pid_wait_nocookie_max=6,
         special_like_rules=None,
+        scheduler=None,
     ):
-        super().__init__(q)
+        super().__init__(q, scheduler=scheduler)
         self.Author_list=Author_list
         self.Agent=Agent
         self.cookie_entries, self.cookie_pool, self._cookie_alias_map, self.cookies = init_cookie_fields(cookies)
@@ -84,19 +82,10 @@ class get_img_url_thread(PauseableThread):
         self._step3_query_notice_every = 200
         self.single_mode_flag = bool(single_thread_mode)
         try:
-            self.pid_wait_min = int(pid_wait_min)
-            self.pid_wait_max = int(pid_wait_max)
-        except Exception:
-            self.pid_wait_min, self.pid_wait_max = 10, 60
-        try:
             self.pid_wait_nocookie_min = int(pid_wait_nocookie_min)
             self.pid_wait_nocookie_max = int(pid_wait_nocookie_max)
         except Exception:
             self.pid_wait_nocookie_min, self.pid_wait_nocookie_max = 1, 6
-        if self.pid_wait_min < 1:
-            self.pid_wait_min = 1
-        if self.pid_wait_max < self.pid_wait_min:
-            self.pid_wait_max = self.pid_wait_min
         if self.pid_wait_nocookie_min < 0:
             self.pid_wait_nocookie_min = 0
         if self.pid_wait_nocookie_max < self.pid_wait_nocookie_min:
@@ -548,6 +537,9 @@ class get_img_url_thread(PauseableThread):
                 return
         except Exception:
             pass
+        # Scheduler handles inter-PID cooldown via release(); skip the legacy sleep.
+        if self._scheduler is not None:
+            return
         try:
             self._countdown_pid = pid_key
         except Exception:
@@ -555,8 +547,8 @@ class get_img_url_thread(PauseableThread):
         if need_cookie is False:
             delay = pyrandom.randint(self.pid_wait_nocookie_min, self.pid_wait_nocookie_max)
         else:
-            delay = pyrandom.randint(self.pid_wait_min, self.pid_wait_max)
-        delay = apply_cookie_pool_speedup(delay, self.cookie_pool)
+            # Without scheduler, fall back to a small fixed delay (legacy single-cookie path)
+            delay = pyrandom.randint(self.pid_wait_nocookie_min, self.pid_wait_nocookie_max)
         for _ in range(delay):
             if self._stop_event.is_set():
                 break
@@ -1200,14 +1192,15 @@ class get_img_url_thread(PauseableThread):
 
     def _build_and_emit_task_queue(self, pictures_id):
         self._q.put(WorkerEvent("output",
-            f"<p><font color='green'>URL階段等待策略：僅網路查詢PID等待；快取PID不等待（需Cookie {self.pid_wait_min}~{self.pid_wait_max} 秒；免Cookie {self.pid_wait_nocookie_min}~{self.pid_wait_nocookie_max} 秒）</font></p>"
+            f"<p><font color='green'>URL階段等待策略：僅網路查詢PID等待；快取PID不等待（免Cookie {self.pid_wait_nocookie_min}~{self.pid_wait_nocookie_max} 秒；Scheduler 管理跨PID冷卻）</font></p>"
         ))
-        try:
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>URL階段多Cookie加速：{len(self.cookie_pool or [])} 組 cookies，等待加速係數 x{cookie_speed_divisor(self.cookie_pool):.2f}</font></p>"
-            ))
-        except Exception:
-            pass
+        if self._scheduler is not None:
+            try:
+                self._q.put(WorkerEvent("output",
+                    f"<p><font color='gray'>URL階段已啟用 AccountScheduler，{len(self.cookie_pool or [])} 組 cookies 輪替</font></p>"
+                ))
+            except Exception:
+                pass
         task_queue = Queue()
         for pid in pictures_id:
             task_queue.put(pid)
@@ -1232,7 +1225,32 @@ class get_img_url_thread(PauseableThread):
                 except Exception:
                     pass
 
-            one = self.get_download_url(self.path, self.Agent, 1, pid)
+            if self._scheduler is not None:
+                acc = self._acquire_account()
+                if acc is None:
+                    break  # stop signal or all disabled
+                session = pixiv_api.make_session(acc.proxy_url)
+                ok = True
+                one = None
+                try:
+                    one = self.get_download_url(
+                        self.path, self.Agent, 1, pid,
+                        cookie_override=acc.cookie, session=session,
+                    )
+                except (requests.exceptions.ProxyError,
+                        requests.exceptions.ConnectTimeout,
+                        requests.exceptions.ConnectionError) as err:
+                    ok = False
+                    try:
+                        self._q.put(WorkerEvent("output",
+                            f"<p><font color='red'>PID {pid} 因 proxy 失敗略過：{err.__class__.__name__}</font></p>"
+                        ))
+                    except Exception:
+                        pass
+                finally:
+                    self._release_account(acc, ok=ok)
+            else:
+                one = self.get_download_url(self.path, self.Agent, 1, pid)
             if isinstance(one, list):
                 results.append(one)
             elif isinstance(one, str):
@@ -1508,7 +1526,7 @@ class get_img_url_thread(PauseableThread):
         except Exception:
             pass
 
-    def get_download_url(self,path,Agent,num,pid):    # 取得單一作品的下載 URL
+    def get_download_url(self, path, Agent, num, pid, *, cookie_override=None, session=None):    # 取得單一作品的下載 URL
         self._pause_event.wait()
         if self._stop_event.is_set():
             return []
@@ -1541,13 +1559,16 @@ class get_img_url_thread(PauseableThread):
             self._pid_cache_hit[pid_key] = False
             should_wait = True
             query_source = "network"
-            pid_cookie = self._select_cookie_for_pid(pid_key)
+            if cookie_override is not None:
+                pid_cookie = cookie_override
+            else:
+                pid_cookie = self._select_cookie_for_pid(pid_key)
             self._record_cookie_usage("step3", pid_key, pid_cookie)
             try:
                 if pid_cookie:
-                    info = Pixiv_info(url, Agent=Agent, cookie=pid_cookie)
+                    info = Pixiv_info(url, Agent=Agent, cookie=pid_cookie, session=session)
                 else:
-                    info = Pixiv_info(url, Agent=Agent)
+                    info = Pixiv_info(url, Agent=Agent, session=session)
             except Exception as e:
                 self._step3_safe_emit(f"<p><font color='red'>PID {pid_key} 取得資訊失敗：{e}</font></p>")
                 if should_wait:

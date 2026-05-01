@@ -180,3 +180,51 @@ def test_is_pid_cached_meta_miss_zero_pagecount():
     t.url_meta = {"123": {"img_url": "https://example.com/123_p0.jpg", "pagecount": 0}}
     hit, _ = t._is_pid_cached_meta("123")
     assert hit is False
+
+
+def test_step3_get_download_url_uses_cookie_override(monkeypatch):
+    """When cookie_override is provided, get_download_url passes it to Pixiv_info."""
+    import queue as _q
+    from app.core import thread_url_fetch as turl
+    import pixiv_api
+
+    captured = {"cookie": None, "session": None}
+
+    def fake_pixiv_info(url, Agent=None, cookie=None, *, session=None):
+        captured["cookie"] = cookie
+        captured["session"] = session
+        return None  # treated as fetch failure; we only care about kwargs
+
+    monkeypatch.setattr(pixiv_api, "Pixiv_info", fake_pixiv_info)
+    monkeypatch.setattr(turl, "Pixiv_info", fake_pixiv_info)
+
+    t = turl.get_img_url_thread.__new__(turl.get_img_url_thread)
+    # bare-bones init: only set what get_download_url touches when info is None
+    t._stop_event = __import__("threading").Event()
+    t._pause_event = __import__("threading").Event()
+    t._pause_event.set()
+    t._q = _q.Queue()
+    t.path = "."
+    t._pid_cookie_selection = {}
+    t._pid_cookie_alias_selection = {}
+    t.cookie_pool = []
+    t._cookie_alias_map = {}
+    t.cookies = ""
+    t.url_meta = {}
+    t._pid_cookie_used = {}
+    t._pid_cache_hit = {}
+    t.exist_pid = set()
+    t._cookie_usage_counts = {"step3": {}, "step4": {}}
+    t._cookie_usage_seen = {"step3": set(), "step4": set()}
+
+    # Run with cookie_override
+    sentinel_session = object()
+    try:
+        t.get_download_url(".", "agent", 1, "777",
+                           cookie_override="OVERRIDE_COOKIE",
+                           session=sentinel_session)
+    except Exception:
+        pass  # downstream errors after Pixiv_info returns None are out of scope
+
+    assert captured["cookie"] == "OVERRIDE_COOKIE"
+    assert captured["session"] is sentinel_session

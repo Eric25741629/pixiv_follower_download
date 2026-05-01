@@ -197,7 +197,7 @@ class RunController:
 
         if n == 3:
             authors = _load_author_list()
-            return thread_url_fetch.get_img_url_thread(
+            t = thread_url_fetch.get_img_url_thread(
                 q=self._event_q,
                 Author_list=authors,
                 Agent=agent,
@@ -209,12 +209,12 @@ class RunController:
                 no_to_check=[],
                 base_path=path,
                 single_thread_mode=bool(perf.get("single_thread_mode", False)),
-                pid_wait_min=int(perf.get("pid_wait_min", 10)),
-                pid_wait_max=int(perf.get("pid_wait_max", 60)),
                 pid_wait_nocookie_min=int(perf.get("pid_wait_nocookie_min", 1)),
                 pid_wait_nocookie_max=int(perf.get("pid_wait_nocookie_max", 6)),
                 special_like_rules=[],
             )
+            t._scheduler = self._build_scheduler(auth, perf, t._pause_event, t._stop_event)
+            return t
 
         if n == 4:
             dl_path = str(dl.get("path", "")).strip()
