@@ -1579,6 +1579,12 @@ class get_img_url_thread(PauseableThread):
                     info = Pixiv_info(url, Agent=Agent, cookie=pid_cookie, session=session)
                 else:
                     info = Pixiv_info(url, Agent=Agent, session=session)
+            except (requests.exceptions.ProxyError,
+                    requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ConnectionError):
+                # Network/proxy failures must propagate so the scheduler-aware caller
+                # (_run_processing_loop) can disable the cookie via release(ok=False).
+                raise
             except Exception as e:
                 self._step3_safe_emit(f"<p><font color='red'>PID {pid_key} 取得資訊失敗：{e}</font></p>")
                 if should_wait:

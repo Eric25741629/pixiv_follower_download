@@ -249,3 +249,39 @@ def test_pixiv_info_propagates_proxy_error():
             cookie="c",
             session=FailSession(),
         )
+
+
+def test_get_download_url_propagates_proxy_error(monkeypatch):
+    """ProxyError from Pixiv_info must propagate out of get_download_url
+    so _run_processing_loop can release(ok=False)."""
+    import pytest
+    import requests
+    from app.core import thread_url_fetch as turl
+    import pixiv_api
+
+    def fail_pixiv_info(url, Agent=None, cookie=None, *, session=None):
+        raise requests.exceptions.ProxyError("dead proxy mid-fetch")
+
+    monkeypatch.setattr(pixiv_api, "Pixiv_info", fail_pixiv_info)
+    monkeypatch.setattr(turl, "Pixiv_info", fail_pixiv_info)
+
+    t = turl.get_img_url_thread.__new__(turl.get_img_url_thread)
+    t._stop_event = __import__("threading").Event()
+    t._pause_event = __import__("threading").Event()
+    t._pause_event.set()
+    t._q = __import__("queue").Queue()
+    t.path = "."
+    t._pid_cookie_selection = {}
+    t._pid_cookie_alias_selection = {}
+    t.cookie_pool = []
+    t._cookie_alias_map = {}
+    t.cookies = ""
+    t.url_meta = {}
+    t._pid_cookie_used = {}
+    t._pid_cache_hit = {}
+    t._cookie_usage_counts = {"step3": {}}
+    t._cookie_usage_seen = {"step3": set()}
+    t.exist_pid = set()
+
+    with pytest.raises(requests.exceptions.ProxyError):
+        t.get_download_url(".", "agent", 1, "777", cookie_override="c", session=None)
