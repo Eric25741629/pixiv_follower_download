@@ -890,6 +890,8 @@ class download_thread(PauseableThread):
                     self._jxl_src_total_bytes += src_size
                     self._jxl_dst_total_bytes += dst_size
                     saved_bytes = src_size - dst_size
+                    if self._stats_collector is not None:
+                        self._stats_collector.report_jxl(src_size, dst_size)
             except Exception:
                 pass
             try:
@@ -1813,6 +1815,9 @@ class download_thread(PauseableThread):
                 self._log_ugoira_meta_failure(pid, htmlfile, meta_trace, first_try_resp)
                 return None
             htmlfile.raise_for_status()
+            if self._stats_collector is not None:
+                label = _cookie_usage_label(pid_cookie, self.cookie_pool, self._cookie_alias_map)
+                self._stats_collector.report_request(label)
             try:
                 gif_info=json.loads(htmlfile.content)['body']
                 download_url=gif_info['originalSrc']
@@ -1838,6 +1843,10 @@ class download_thread(PauseableThread):
                         if data:
                             chunks.append(data)
                     zip_bytes = b"".join(chunks)
+                    if self._stats_collector is not None and zip_bytes:
+                        self._stats_collector.report_bytes(len(zip_bytes))
+                        label = _cookie_usage_label(pid_cookie, self.cookie_pool, self._cookie_alias_map)
+                        self._stats_collector.report_request(label)
             if not zip_bytes:
                 return [url,my_time.strftime('%Y%m%d_%H%M%S')]
             frame_blobs = []
@@ -1864,6 +1873,8 @@ class download_thread(PauseableThread):
             target_dir = self._resolve_download_target_dir(tag, pid, media_kind='GIF')
             saved_gif_path = os.path.join(target_dir, name)
             self._save_ugoira_gif(frame_blobs, saved_gif_path, delay_info)
+            if self._stats_collector is not None:
+                self._stats_collector.report_file(True)
             self._convert_file_to_jxl(saved_gif_path)
             return 0
         except (requests.exceptions.ProxyError,
@@ -1903,7 +1914,10 @@ class download_thread(PauseableThread):
                     pass
                 http = session if session is not None else requests
                 htmlfile = http.get(url,headers=headers,stream=True,timeout=5)
-                htmlfile.raise_for_status() 
+                htmlfile.raise_for_status()
+                if self._stats_collector is not None:
+                    label = _cookie_usage_label(pid_cookie, self.cookie_pool, self._cookie_alias_map)
+                    self._stats_collector.report_request(label)
                 size = 0
                 chunk_size = 1024
                 name=''
@@ -1928,6 +1942,9 @@ class download_thread(PauseableThread):
                         for data in htmlfile.iter_content(chunk_size = chunk_size):
                             file.write(data)
                             size +=len(data)
+                    if self._stats_collector is not None:
+                        self._stats_collector.report_bytes(size)
+                        self._stats_collector.report_file(True)
                     self._convert_file_to_jxl(filepath)
                 return 0
             except (requests.exceptions.ProxyError,
@@ -1943,6 +1960,8 @@ class download_thread(PauseableThread):
                     time.sleep(min(30.0, (2 ** i) + pyrandom.random()))
                     continue
         print(last_err)
+        if self._stats_collector is not None:
+            self._stats_collector.report_file(False)
         return [url, timetag]
 
     def stop(self):
