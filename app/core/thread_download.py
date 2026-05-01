@@ -93,6 +93,16 @@ class download_thread(PauseableThread):
             self.intra_pid_wait_min = 0
         if self.intra_pid_wait_max < self.intra_pid_wait_min:
             self.intra_pid_wait_max = self.intra_pid_wait_min
+        # Legacy inter-PID cooldown (used only when no scheduler is injected).
+        # Read once at construction; live reloads happen via the scheduler path.
+        try:
+            from app.core.settings_store import SettingsStore as _SS
+            self._legacy_pid_cooldown_avg = int(
+                _SS(os.getenv("APPDATA") + r"/pixiv_download/")
+                .get_section("performance").get("pid_cooldown_avg", 35)
+            )
+        except Exception:
+            self._legacy_pid_cooldown_avg = 35
         # Backward compatibility: accept older positional/keyword constructor calls.
         overrides = self._apply_legacy_constructor_args(legacy_args, legacy_kwargs)
         jxl_enable = overrides.get("jxl_enable", jxl_enable)
@@ -1084,16 +1094,9 @@ class download_thread(PauseableThread):
 
     def _sleep_between_downloads(self, pid):
         # Inter-PID cooldown is owned by AccountScheduler.release() when active.
-        # The legacy fixed delay only fires when no scheduler is configured.
         if self._scheduler is not None:
             return
-        # Legacy fallback: read pid_cooldown_avg from settings for a reasonable wait
-        try:
-            from app.core.settings_store import SettingsStore
-            store_path = os.getenv("APPDATA") + r"/pixiv_download/"
-            avg = int(SettingsStore(store_path).get_section("performance").get("pid_cooldown_avg", 35))
-        except Exception:
-            avg = 35
+        avg = int(getattr(self, "_legacy_pid_cooldown_avg", 35))
         low = max(1, int(avg * 0.7))
         high = max(low, int(avg * 1.3))
         delay = pyrandom.randint(low, high)
@@ -1431,7 +1434,12 @@ class download_thread(PauseableThread):
         failed_nested = []
         if self.single_mode_flag:
             self._q.put(WorkerEvent("output", "<p><font color='green'>下載模式：單執行緒 + 每個 PID 共用單一 Session</font></p>"))
-            self._q.put(WorkerEvent("output", f"<p><font color='green'>同PID等待: {self.intra_pid_wait_min}~{self.intra_pid_wait_max} 秒；PID間: 由排程器管理（單帳號平均冷卻）</font></p>"))
+            if self._scheduler is not None:
+                inter_pid_desc = "由排程器管理（單帳號平均冷卻）"
+            else:
+                inter_pid_desc = "固定冷卻（pid_cooldown_avg）"
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='green'>同PID等待: {self.intra_pid_wait_min}~{self.intra_pid_wait_max} 秒；PID間: {inter_pid_desc}</font></p>"))
             for idx, pid in enumerate(pid_order, start=1):
                 if self._stop_after_group:
                     try:
@@ -1852,10 +1860,16 @@ class download_thread(PauseableThread):
             self._save_ugoira_gif(frame_blobs, saved_gif_path, delay_info)
             self._convert_file_to_jxl(saved_gif_path)
             return 0
+        except (requests.exceptions.ProxyError,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ConnectionError):
+            # Network/proxy failures must propagate so the scheduler-aware caller
+            # can disable the cookie/proxy for this run.
+            raise
         except Exception as err:
             print(err,self.cookies)
-        return [url,my_time.strftime('%Y%m%d_%H%M%S')]          
-    
+        return [url,my_time.strftime('%Y%m%d_%H%M%S')]
+
     def jpg_download(self,url, session=None):
         self.timelock.acquire()
         timetag=self.download_time.strftime('%Y%m%d_%H%M%S')
@@ -1910,6 +1924,13 @@ class download_thread(PauseableThread):
                             size +=len(data)
                     self._convert_file_to_jxl(filepath)
                 return 0
+            except (requests.exceptions.ProxyError,
+                    requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ConnectionError):
+                # Bypass the retry loop entirely — the proxy is dead, retrying
+                # against the same proxy will not help. Let the scheduler disable
+                # this cookie via release(ok=False).
+                raise
             except Exception as err:
                 last_err = err
                 if i < 4:

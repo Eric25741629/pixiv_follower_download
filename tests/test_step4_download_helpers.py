@@ -179,3 +179,52 @@ def test_download_pid_group_uses_account_proxy_session(monkeypatch):
 
     assert captured["proxy"] == "http://1.2.3.4:8080"
     assert isinstance(failed, list)
+
+
+def test_gif_download_propagates_proxy_error(monkeypatch):
+    """ProxyError from the inner http.get must propagate so scheduler can disable."""
+    import pytest
+    import requests
+    import datetime
+    from app.core import thread_download as tdl
+
+    t = tdl.download_thread.__new__(tdl.download_thread)
+    t._stop_event = __import__("threading").Event()
+    t._pause_event = __import__("threading").Event()
+    t._pause_event.set()
+    t._q = __import__("queue").Queue()
+    t.q = __import__("queue").Queue()
+    t.cookies = ""
+    t.cookie_pool = []
+    t._cookie_alias_map = {}
+    t._pid_cookie_selection = {}
+    t._pid_cookie_used = {}
+    t._cookie_usage_counts = {"step4": {}}
+    t.url_meta = {}
+    t.agent = "agent"
+    t.download_path = "."
+    t.download_time = datetime.datetime.now()
+    t.timelock = __import__("threading").Lock()
+    t.notag = False
+    t.notime = False
+
+    # Stub helpers that require network/full state so the test focuses on the
+    # ProxyError propagation path inside gif_download.
+    monkeypatch.setattr(t, "_resolve_pid_and_cookie",
+                        lambda url, source="step4": ("777", "", None))
+    monkeypatch.setattr(t, "_load_artwork_metadata",
+                        lambda pid, pid_cookie: ([], 0, 1, None))
+    monkeypatch.setattr(t, "_build_artwork_headers",
+                        lambda *a, **kw: {"User-Agent": "agent"})
+    monkeypatch.setattr(t, "_mark_gif_cookie_usage",
+                        lambda *a, **kw: None)
+
+    class FailGet:
+        def get(self, *a, **kw):
+            raise requests.exceptions.ProxyError("dead proxy")
+
+    with pytest.raises(requests.exceptions.ProxyError):
+        t.gif_download(
+            "https://i.pximg.net/img-original/img/1/777_ugoira0.zip",
+            session=FailGet(),
+        )
