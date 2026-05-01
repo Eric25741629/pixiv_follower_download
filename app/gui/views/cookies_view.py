@@ -138,7 +138,7 @@ class CookiesView:
         )
         self._btn_test_selected.disabled = self._testing or not self._selected
         self._btn_test_all.disabled = self._testing or not self._entries
-        self._btn_auto_pair.disabled = not self._entries or not self._proxy_pool
+        self._btn_auto_pair.disabled = not self._entries
 
     def _on_toggle_row(self, cookie: str, value: bool) -> None:
         if value:
