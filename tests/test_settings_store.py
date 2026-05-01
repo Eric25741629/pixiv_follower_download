@@ -302,3 +302,25 @@ def test_migration_skipped_when_avg_already_set(tmp_path):
     store = SettingsStore(str(tmp_path))
     perf = store.get_section("performance")
     assert perf["pid_cooldown_avg"] == 100
+
+
+def test_migration_skipped_when_avg_is_default_value_but_explicitly_set(tmp_path):
+    """avg==35 saved explicitly: must NOT be overwritten by migration.
+
+    Guards against a refactor regression where the migration condition
+    becomes ``"pid_cooldown_avg" not in perf or perf == 35`` (which the
+    plan spec originally proposed but is wrong: 35 is also the DEFAULTS
+    value, making it indistinguishable from absence post-merge).
+    """
+    import json
+    data = {
+        "performance": {
+            "pid_wait_min": 20,
+            "pid_wait_max": 80,
+            "pid_cooldown_avg": 35,
+        },
+    }
+    (tmp_path / "settings.json").write_text(json.dumps(data))
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert perf["pid_cooldown_avg"] == 35  # not 50
