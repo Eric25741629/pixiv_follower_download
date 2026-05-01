@@ -614,6 +614,7 @@ def format_cookie_usage_summary(cookie_usage_counts, cookie_pool=None, alias_map
         return "未使用 Cookie"
 
 
+# Deprecated: superseded by AccountScheduler per-account cooldown. Kept for import compat.
 def cookie_speed_divisor(cookie_pool):
     """Speed multiplier for multi-cookie pool: n=1→1.0x, n=2→1.6x … max 4.0x."""
     try:
@@ -625,6 +626,7 @@ def cookie_speed_divisor(cookie_pool):
     return min(4.0, 1.0 + 0.6 * float(n - 1))
 
 
+# Deprecated: superseded by AccountScheduler per-account cooldown. Kept for import compat.
 def apply_cookie_pool_speedup(delay, cookie_pool):
     """Reduce delay proportionally to cookie pool size."""
     try:

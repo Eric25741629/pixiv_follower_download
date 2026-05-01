@@ -23,7 +23,12 @@ def parse_proxy_url(raw: str) -> str | None:
 
 
 def to_requests_proxies(proxy_url: str | None) -> dict | None:
-    """Convert a proxy URL to a requests-compatible ``proxies`` dict.
+    """Convert a pre-validated proxy URL to a requests-compatible ``proxies`` dict.
+
+    The caller is expected to have run the URL through ``parse_proxy_url`` first
+    (or to have constructed ``proxy_url`` from a trusted source). This function
+    does not re-validate the URL; an invalid URL will produce a dict that fails
+    at request time, not at parse time.
 
     Returns ``None`` for direct connection (no proxy).
     """

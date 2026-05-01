@@ -18,6 +18,10 @@ def test_parse_socks5h():
     assert parse_proxy_url("socks5h://1.2.3.4:1080") == "socks5h://1.2.3.4:1080"
 
 
+def test_parse_socks4():
+    assert parse_proxy_url("socks4://1.2.3.4:1080") == "socks4://1.2.3.4:1080"
+
+
 def test_parse_with_auth():
     url = "socks5://user:pass@1.2.3.4:1080"
     assert parse_proxy_url(url) == url
