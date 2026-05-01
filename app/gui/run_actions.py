@@ -183,7 +183,7 @@ class RunController:
             if not authors:
                 self._log("<p><font color='red'>找不到 following 清單，請先執行步驟 1</font></p>")
                 return None
-            return thread_pid_scan.get_pixiv_author_imgID_Thread(
+            t = thread_pid_scan.get_pixiv_author_imgID_Thread(
                 self._event_q,
                 authors,
                 agent,
@@ -191,9 +191,9 @@ class RunController:
                 cookies,
                 load_exist_pid_set(path),
                 bool(perf.get("single_thread_mode", False)),
-                int(perf.get("pid_wait_min", 10)),
-                int(perf.get("pid_wait_max", 60)),
             )
+            t._scheduler = self._build_scheduler(auth, perf, t._pause_event, t._stop_event)
+            return t
 
         if n == 3:
             authors = _load_author_list()
