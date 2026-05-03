@@ -44,8 +44,10 @@ DEFAULTS = {
         "pid_cooldown_avg": 35,
         "pid_wait_min": 10,
         "pid_wait_max": 60,
-        "pid_wait_nocookie_min": 1,
-        "pid_wait_nocookie_max": 6,
+        "pid_wait_nocookie_min": 3,
+        "pid_wait_nocookie_max": 8,
+        "intra_pid_wait_min": 5,
+        "intra_pid_wait_max": 15,
     },
     "jxl": {
         "enable": False,

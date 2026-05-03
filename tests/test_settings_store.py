@@ -324,3 +324,28 @@ def test_migration_skipped_when_avg_is_default_value_but_explicitly_set(tmp_path
     store = SettingsStore(str(tmp_path))
     perf = store.get_section("performance")
     assert perf["pid_cooldown_avg"] == 35  # not 50
+
+
+def test_intra_pid_wait_defaults(tmp_path):
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert perf["intra_pid_wait_min"] == 5
+    assert perf["intra_pid_wait_max"] == 15
+
+
+def test_nocookie_wait_defaults_bumped(tmp_path):
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert perf["pid_wait_nocookie_min"] == 3
+    assert perf["pid_wait_nocookie_max"] == 8
+
+
+def test_new_keys_merged_into_old_settings(tmp_path):
+    """Existing settings.json without new keys still gets defaults via _merge_defaults."""
+    (tmp_path / "settings.json").write_text(
+        '{"performance": {"pid_cooldown_avg": 40}}', encoding="utf-8"
+    )
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert perf["intra_pid_wait_min"] == 5
+    assert perf["intra_pid_wait_max"] == 15
