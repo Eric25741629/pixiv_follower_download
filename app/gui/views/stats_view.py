@@ -206,31 +206,40 @@ class StatsView:
                 pass
             return
 
-        sorted_items = sorted(requests.items(), key=lambda kv: kv[1], reverse=True)
-        max_count = sorted_items[0][1] if sorted_items else 1
-        if max_count <= 0:
-            max_count = 1
+        free_count = requests.get("免Cookie", 0)
+        cookie_requests = {k: v for k, v in requests.items() if k != "免Cookie"}
 
-        rows: list[ft.Row] = []
-        for idx, (label, count) in enumerate(sorted_items):
-            bar_w = max(2, int(count / max_count * _MAX_BAR_PX))
-            color = _BAR_COLORS[idx % len(_BAR_COLORS)]
-            rows.append(
-                ft.Row(
-                    controls=[
-                        ft.Text(label, size=11, width=120, overflow=ft.TextOverflow.ELLIPSIS, no_wrap=True),
-                        ft.Container(
-                            bgcolor=color,
-                            width=bar_w,
-                            height=18,
-                            border_radius=4,
-                        ),
-                        ft.Text(str(count), size=11, width=60),
-                    ],
-                    spacing=8,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        rows: list[ft.Control] = []
+        if cookie_requests:
+            sorted_items = sorted(cookie_requests.items(), key=lambda kv: kv[1], reverse=True)
+            max_count = sorted_items[0][1] if sorted_items else 1
+            if max_count <= 0:
+                max_count = 1
+            for idx, (label, count) in enumerate(sorted_items):
+                bar_w = max(2, int(count / max_count * _MAX_BAR_PX))
+                color = _BAR_COLORS[idx % len(_BAR_COLORS)]
+                rows.append(
+                    ft.Row(
+                        controls=[
+                            ft.Text(label, size=11, width=120, overflow=ft.TextOverflow.ELLIPSIS, no_wrap=True),
+                            ft.Container(
+                                bgcolor=color,
+                                width=bar_w,
+                                height=18,
+                                border_radius=4,
+                            ),
+                            ft.Text(str(count), size=11, width=60),
+                        ],
+                        spacing=8,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    )
                 )
-            )
+
+        if free_count > 0:
+            rows.append(ft.Text(f"免 Cookie：{free_count} 次", size=12, color=ft.Colors.TEAL_700))
+
+        if not rows:
+            rows = [ft.Text("尚無資料", size=12, color=ft.Colors.GREY_500)]
 
         self._chart_container.controls = rows
         try:
