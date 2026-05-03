@@ -1730,6 +1730,13 @@ class get_img_url_thread(PauseableThread):
         self._emit_step3_filter_skip_final_summary()
         self._emit_step3_query_final_summary(final=True)
         self._emit_cookie_usage_summary("step3", "Step3 Cookie統計")
+        free = int(self._step3_cookie_req_counts.get("free", 0))
+        if free > 0:
+            try:
+                self._q.put(WorkerEvent("output",
+                    f"<p><font color='teal'>免 Cookie 查詢：{free} 次</font></p>"))
+            except Exception:
+                pass
 
     def _finalize_on_complete(self, results):
         self._step3_emit("<p><font color='gray'>[Step3完成] 整理結果並寫入 all_url.txt...</font></p>")
