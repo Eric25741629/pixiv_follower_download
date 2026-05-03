@@ -114,6 +114,35 @@ class SettingsView:
         )
         self._proxy_test_results = ft.Column([], spacing=4)
 
+        # Wait time controls
+        intra_min = int(perf.get("intra_pid_wait_min", 5))
+        intra_max = int(perf.get("intra_pid_wait_max", 15))
+        self._tf_intra_min = ft.TextField(
+            value=str(intra_min), width=80, keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        self._tf_intra_max = ft.TextField(
+            value=str(intra_max), width=80, keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        nocookie_min = int(perf.get("pid_wait_nocookie_min", 3))
+        nocookie_max = int(perf.get("pid_wait_nocookie_max", 8))
+        self._tf_nocookie_min = ft.TextField(
+            value=str(nocookie_min), width=80, keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        self._tf_nocookie_max = ft.TextField(
+            value=str(nocookie_max), width=80, keyboard_type=ft.KeyboardType.NUMBER,
+        )
+
+        # User-Agent controls
+        self._tf_agent = ft.TextField(
+            value=auth.get("agent", ""),
+            hint_text="未設定，將使用內建隨機 UA",
+            expand=True,
+        )
+        self._btn_detect_ua = ft.OutlinedButton(
+            "重新偵測 Chrome", on_click=self._on_detect_chrome,
+        )
+        self._label_ua_status = ft.Text("", size=11, color=ft.Colors.GREY_600)
+
     # ------------------------------------------------------------------
     # File picker handlers
     # ------------------------------------------------------------------
@@ -218,6 +247,22 @@ class SettingsView:
         except (TypeError, ValueError):
             return 35
 
+    @staticmethod
+    def _clamp_wait(tf: ft.TextField, default: int, lo: int = 1) -> int:
+        try:
+            return max(lo, int(tf.value or str(default)))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _clamp_wait_max(tf_min: ft.TextField, tf_max: ft.TextField, default_min: int, default_max: int) -> int:
+        try:
+            lo = max(1, int(tf_min.value or str(default_min)))
+            hi = int(tf_max.value or str(default_max))
+            return max(lo, hi)
+        except (TypeError, ValueError):
+            return default_max
+
     # ------------------------------------------------------------------
     # Proxy test handler
     # ------------------------------------------------------------------
@@ -249,6 +294,23 @@ class SettingsView:
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _on_detect_chrome(self, e: ft.ControlEvent) -> None:
+        from app.core.chrome_detect import detect_chrome_ua
+        ua = detect_chrome_ua()
+        if ua:
+            self._tf_agent.value = ua
+            version = ua.split("Chrome/")[1].split(" ")[0] if "Chrome/" in ua else ua
+            self._label_ua_status.value = f"已從登錄檔偵測到 Chrome {version}，UA 已更新"
+            self._label_ua_status.color = ft.Colors.GREEN_600
+        else:
+            self._label_ua_status.value = "找不到 Chrome 安裝（已檢查登錄檔與 AppData），請手動填寫 UA"
+            self._label_ua_status.color = ft.Colors.RED_600
+        try:
+            self._tf_agent.update()
+            self._label_ua_status.update()
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
@@ -263,6 +325,7 @@ class SettingsView:
             "password": self._tf_password.value,
             "userid": self._tf_userid.value,
             "proxy_pool": parse_proxy_list(self._tf_proxy_pool.value or ""),
+            "agent": self._tf_agent.value.strip(),
         })
         store.update_section("download", {
             **store.get_section("download"),
@@ -289,10 +352,13 @@ class SettingsView:
                 "ai_gen_dir": bool(self._sw_ai_dir.value),
             },
             "performance": {
+                **store.get_section("performance"),
                 "single_thread_mode": self._sw_single_thread.value,
                 "pid_cooldown_avg": self._safe_int_cooldown(),
-                "pid_wait_nocookie_min": int(store.get_section("performance").get("pid_wait_nocookie_min", 1)),
-                "pid_wait_nocookie_max": int(store.get_section("performance").get("pid_wait_nocookie_max", 6)),
+                "pid_wait_nocookie_min": self._clamp_wait(self._tf_nocookie_min, 3, lo=1),
+                "pid_wait_nocookie_max": self._clamp_wait_max(self._tf_nocookie_min, self._tf_nocookie_max, 3, 8),
+                "intra_pid_wait_min": self._clamp_wait(self._tf_intra_min, 5, lo=1),
+                "intra_pid_wait_max": self._clamp_wait_max(self._tf_intra_min, self._tf_intra_max, 5, 15),
             },
             "jxl": {
                 "enable": self._sw_jxl.value,
@@ -411,8 +477,18 @@ class SettingsView:
                     ft.Row([ft.Text("Effort（1-9）"), self._sl_jxl_effort]),
                 ]),
                 _tile("冷卻設定", [
-                    ft.Row([self._tf_cooldown, self._sl_cooldown], spacing=12),
-                    self._label_cooldown_hint,
+                    ft.Row([self._tf_cooldown, self._label_cooldown_hint], spacing=12),
+                    self._sl_cooldown,
+                    ft.Row(
+                        [ft.Text("同 PID 頁間等待（秒）", size=13),
+                         self._tf_intra_min, ft.Text("~"), self._tf_intra_max],
+                        spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Row(
+                        [ft.Text("免 Cookie 請求等待（秒）", size=13),
+                         self._tf_nocookie_min, ft.Text("~"), self._tf_nocookie_max],
+                        spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
                     self._sw_single_thread,
                 ]),
                 _tile("Proxy 設定", [
@@ -421,6 +497,10 @@ class SettingsView:
                         ft.OutlinedButton("測試全部 Proxy", on_click=self._on_test_proxies),
                     ]),
                     self._proxy_test_results,
+                ]),
+                _tile("User-Agent 設定", [
+                    ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
+                    self._label_ua_status,
                 ]),
                 ft.Container(content=save_btn, padding=ft.padding.only(top=8)),
             ],
