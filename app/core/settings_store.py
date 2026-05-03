@@ -23,6 +23,7 @@ DEFAULTS = {
         "rule_like_1": 0,
         "rule_tag_2": "",
         "rule_like_2": 0,
+        "filename_template": "",
     },
     "filter": {
         "pass_tag": False,
@@ -35,6 +36,7 @@ DEFAULTS = {
     "directory": {
         "create_dir": False,
         "no_R18G_dir": False,
+        "no_R18_dir": False,
         "ai_gen_dir": False,
     },
     "performance": {
@@ -218,6 +220,7 @@ class SettingsStore:
         merged["directory"].update({
             "create_dir": bool(d.get("create_dir", False)),
             "no_R18G_dir": bool(d.get("no_R18G_dir", False)),
+            "no_R18_dir": bool(d.get("no_R18_dir", False)),
             "ai_gen_dir": bool(d.get("ai_gen_dir", False)),
         })
         merged["performance"].update({

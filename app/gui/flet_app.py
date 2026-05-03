@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import queue
+import sqlite3
 import flet as ft
 
 from app.gui.dispatcher import EventDispatcher
@@ -43,11 +44,13 @@ def main(page: ft.Page) -> None:
         content_area.controls = [views_built[idx]]
         if idx == 2:
             cookies_view.reload_from_settings()
-        elif idx == 3:
-            stats_view.start_auto_refresh()
-        else:
-            stats_view.stop_auto_refresh()
         page.update()
+
+    # Stats auto-refresh runs for the whole session — controls only flush
+    # when their parent is on screen, but the stats values keep updating
+    # in the background so they're already current the moment the user
+    # navigates to the tab.
+    stats_view.start_auto_refresh()
 
     nav_rail = ft.NavigationRail(
         selected_index=0,
@@ -114,9 +117,15 @@ def main(page: ft.Page) -> None:
             main_view.set_loading(bool(data))
 
     def handle_cookie_status(data) -> None:
-        if isinstance(data, tuple) and len(data) == 2:
-            cookie, status = data
-            cookies_view.apply_cookie_test_result(str(cookie), str(status))
+        if isinstance(data, tuple):
+            if len(data) == 3:
+                cookie, status, tested_at = data
+                cookies_view.apply_cookie_test_result(
+                    str(cookie), str(status), tested_at,
+                )
+            elif len(data) == 2:
+                cookie, status = data
+                cookies_view.apply_cookie_test_result(str(cookie), str(status))
 
     disp = EventDispatcher(page, event_q, {
         "output":        handle_output,
@@ -126,6 +135,7 @@ def main(page: ft.Page) -> None:
         "next":          handle_next,
         "loading":       handle_loading,
         "cookie_status": handle_cookie_status,
+        "phase":         lambda data: main_view.set_phase(str(data) if data else ""),
     })
 
     def toggle_theme(e: ft.ControlEvent) -> None:
@@ -168,11 +178,32 @@ def main(page: ft.Page) -> None:
     async def _shutdown_and_destroy() -> None:
         try:
             t = getattr(main_view, "_active_thread", None)
-            if t is not None and hasattr(t, "stop"):
-                try:
-                    t.stop()
-                except Exception:
-                    pass
+            if t is not None:
+                if hasattr(t, "flush_for_shutdown"):
+                    try:
+                        t.flush_for_shutdown()
+                    except Exception:
+                        pass
+                if hasattr(t, "stop"):
+                    try:
+                        t.stop()
+                    except Exception:
+                        pass
+            # Merge any un-checkpointed WAL pages into the main DB file so the
+            # on-disk state is consistent before os._exit(0) bypasses atexit.
+            # PASSIVE mode is non-blocking: checkpoints what it can without
+            # waiting for active readers/writers to finish.
+            try:
+                from app.core.metadata_db import DB_FILENAME
+                _db_path = os.path.join(
+                    os.getenv("APPDATA", ""), "pixiv_download", DB_FILENAME
+                )
+                if os.path.isfile(_db_path):
+                    _c = sqlite3.connect(_db_path, timeout=3.0, isolation_level=None)
+                    _c.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    _c.close()
+            except Exception:
+                pass
         finally:
             disp.stop()
             try:

@@ -14,6 +14,30 @@ def _ensure_history_dir(file_path):
         return None
 
 
+def _next_unique_backup_path(hist, base, ts):
+    """Return a backup path that doesn't exist yet (appends .1, .2, ... on collision)."""
+    dst = os.path.join(hist, f"{base}.{ts}")
+    if not os.path.exists(dst):
+        return dst
+    idx = 1
+    while True:
+        candidate = os.path.join(hist, f"{base}.{ts}.{idx}")
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
+
+
+def _prune_old_backups(hist, base, max_history):
+    """Keep at most ``max_history`` files in ``hist`` whose name starts with ``base.``."""
+    try:
+        files = [f for f in os.listdir(hist) if f.startswith(base + '.')]
+        files.sort(key=lambda x: os.path.getmtime(os.path.join(hist, x)), reverse=True)
+        while len(files) > max_history:
+            os.remove(os.path.join(hist, files.pop()))
+    except Exception:
+        pass
+
+
 def backup_file(file_path, max_history=10):
     """
     備份檔案到 history/，並限制保留的歷史檔數量。
@@ -26,28 +50,11 @@ def backup_file(file_path, max_history=10):
         hist = _ensure_history_dir(file_path)
         if not hist:
             return
-        ts = datetime.datetime.now().strftime('%Y%m%d')
         base = os.path.basename(file_path)
-        dst = os.path.join(hist, f"{base}.{ts}")
-        if os.path.exists(dst):
-            idx = 1
-            while True:
-                candidate = os.path.join(hist, f"{base}.{ts}.{idx}")
-                if not os.path.exists(candidate):
-                    dst = candidate
-                    break
-                idx += 1
+        ts = datetime.datetime.now().strftime('%Y%m%d')
+        dst = _next_unique_backup_path(hist, base, ts)
         shutil.copy2(file_path, dst)
-        
-        # 清理超過 max_history 的舊檔
-        try:
-            files = [f for f in os.listdir(hist) if f.startswith(base + '.')]
-            files.sort(key=lambda x: os.path.getmtime(os.path.join(hist, x)), reverse=True)
-            while len(files) > max_history:
-                old_file = os.path.join(hist, files.pop())
-                os.remove(old_file)
-        except Exception:
-            pass
+        _prune_old_backups(hist, base, max_history)
     except Exception:
         pass
 

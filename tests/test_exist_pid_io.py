@@ -127,3 +127,40 @@ def test_p1_p2_preserved(tmp_path):
     s = load_exist_pid_set(str(tmp_path))
     assert "123456p1" in s
     assert "123456p2" in s
+
+
+# ── DB augmentation: union with metadata.sqlite3 downloaded set ─────────────
+
+def test_load_unions_with_metadata_db(tmp_path):
+    """A PID present in the DB but absent from JSON must still be returned —
+    covers the case of a previous worker crashing after marking the DB but
+    before flushing the JSON file."""
+    from app.core.metadata_db import MetadataDB
+
+    (tmp_path / "exist_pid.json").write_text('["100"]', encoding='utf-8')
+    db = MetadataDB(str(tmp_path))
+    db.mark_downloaded("200")
+    db.mark_downloaded("300")
+    db.close()
+
+    s = load_exist_pid_set(str(tmp_path))
+    assert s == {"100", "200", "300"}
+
+
+def test_load_with_db_only_returns_db_set(tmp_path):
+    """When the JSON file is missing but the DB has entries, those entries
+    are returned — no re-download from a previously-tracked session."""
+    from app.core.metadata_db import MetadataDB
+    db = MetadataDB(str(tmp_path))
+    db.mark_downloaded("999")
+    db.close()
+    s = load_exist_pid_set(str(tmp_path))
+    assert "999" in s
+
+
+def test_load_db_corruption_does_not_break_json_read(tmp_path):
+    """If metadata.sqlite3 is corrupt, the function still returns the JSON set."""
+    (tmp_path / "exist_pid.json").write_text('["100","200"]', encoding='utf-8')
+    (tmp_path / "metadata.sqlite3").write_bytes(b"not a sqlite file")
+    s = load_exist_pid_set(str(tmp_path))
+    assert s == {"100", "200"}

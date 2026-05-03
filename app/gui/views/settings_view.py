@@ -29,6 +29,7 @@ class SettingsView:
         flt = store.get_section("filter")
         perf = store.get_section("performance")
         jxl = store.get_section("jxl")
+        directory = store.get_section("directory")
 
         self._tf_account = ft.TextField(label="帳號", value=auth.get("account", ""), width=300)
         self._tf_password = ft.TextField(label="密碼", value=auth.get("password", ""), width=300, password=True, can_reveal_password=True)
@@ -41,6 +42,12 @@ class SettingsView:
         self._sw_notime = ft.Switch(label="無時間不下載", value=bool(flt.get("notime", False)))
         self._tf_like_num = ft.TextField(label="最低讚數（一般）", value=str(dl.get("like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
         self._tf_r18_like_num = ft.TextField(label="最低讚數（R18）", value=str(dl.get("r18_like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
+        self._tf_filename_template = ft.TextField(
+            label="檔名範本（留空＝使用預設）",
+            value=str(dl.get("filename_template", "") or ""),
+            hint_text="例：{timetag}_PID{pid}{page}{hashtag}.{ext}",
+            expand=True,
+        )
 
         self._ban_tags: list[str] = list(dl.get("ban_tag", []))
         self._must_tags: list[str] = list(dl.get("must_tag", []))
@@ -49,6 +56,23 @@ class SettingsView:
         self._tf_ban_input = ft.TextField(label="新增禁止 tag", width=200, on_submit=self._add_ban_tag)
         self._tf_must_input = ft.TextField(label="新增必須 tag", width=200, on_submit=self._add_must_tag)
         self._refresh_tag_rows()
+
+        self._sw_create_dir = ft.Switch(
+            label="依作者 ID 建立子資料夾",
+            value=bool(directory.get("create_dir", False)),
+        )
+        self._sw_r18_dir = ft.Switch(
+            label="R-18 作品分類資料夾",
+            value=not bool(directory.get("no_R18_dir", False)),
+        )
+        self._sw_r18g_dir = ft.Switch(
+            label="R-18G 作品分類資料夾",
+            value=not bool(directory.get("no_R18G_dir", False)),
+        )
+        self._sw_ai_dir = ft.Switch(
+            label="AI 生成作品分類資料夾",
+            value=bool(directory.get("ai_gen_dir", False)),
+        )
 
         self._sw_jxl = ft.Switch(label="啟用 JXL 轉檔", value=bool(jxl.get("enable", False)))
         self._tf_jxl_path = ft.TextField(label="cjxl.exe 路徑", value=jxl.get("cjxl_path", ""), expand=True, read_only=True)
@@ -66,7 +90,7 @@ class SettingsView:
         self._tf_cooldown = ft.TextField(
             label="平均冷卻秒數",
             value=str(cooldown_avg),
-            width=110,
+            width=170,
             keyboard_type=ft.KeyboardType.NUMBER,
             on_change=self._on_cooldown_tf_change,
         )
@@ -247,6 +271,7 @@ class SettingsView:
             "r18_like_num": int(self._tf_r18_like_num.value or 0),
             "ban_tag": self._ban_tags,
             "must_tag": self._must_tags,
+            "filename_template": (self._tf_filename_template.value or "").strip(),
         })
         store.update_multiple({
             "filter": {
@@ -255,6 +280,13 @@ class SettingsView:
                 "nogif": self._sw_nogif.value,
                 "notag": self._sw_notag.value,
                 "notime": self._sw_notime.value,
+            },
+            "directory": {
+                **store.get_section("directory"),
+                "create_dir": bool(self._sw_create_dir.value),
+                "no_R18_dir": not bool(self._sw_r18_dir.value),
+                "no_R18G_dir": not bool(self._sw_r18g_dir.value),
+                "ai_gen_dir": bool(self._sw_ai_dir.value),
             },
             "performance": {
                 "single_thread_mode": self._sw_single_thread.value,
@@ -342,6 +374,24 @@ class SettingsView:
                 _tile("過濾規則", [
                     ft.Row([self._sw_hidefollow, self._sw_nogif, self._sw_notag, self._sw_notime], wrap=True),
                     ft.Row([self._tf_like_num, self._tf_r18_like_num], spacing=16),
+                ]),
+                _tile("檔名範本", [
+                    ft.Text(
+                        "可用佔位符：{pid} {page} {ext} {tag} {hashtag} {timetag} {date} {time}\n"
+                        "留空時使用預設規則。檔名會自動清掉 Windows 不允許的字元。",
+                        size=11, color=ft.Colors.GREY_700,
+                    ),
+                    self._tf_filename_template,
+                ]),
+                _tile("資料夾分類", [
+                    ft.Text(
+                        "啟用後將在下載目錄底下，依作品屬性建立子資料夾。",
+                        size=11, color=ft.Colors.GREY_700,
+                    ),
+                    self._sw_create_dir,
+                    self._sw_r18_dir,
+                    self._sw_r18g_dir,
+                    self._sw_ai_dir,
                 ]),
                 _tile("標籤過濾", [
                     ft.Text("禁止 tag", size=12),

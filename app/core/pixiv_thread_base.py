@@ -28,54 +28,82 @@ _NETWORK_RETRY_EXCEPTIONS = (
 )
 
 
-def _normalize_special_like_rules(raw_rules):
-    normalized = []
+def _coerce_to_rule_iterable(raw_rules):
+    """Wrap a single dict in a list; return [] for non-iterable inputs."""
     if isinstance(raw_rules, dict):
-        raw_rules = [raw_rules]
-    if not isinstance(raw_rules, (list, tuple, set)):
-        return normalized
-    for index, rule in enumerate(raw_rules):
-        if not isinstance(rule, dict):
-            continue
-        raw_tags = rule.get("tags", rule.get("tag", []))
-        if isinstance(raw_tags, str):
-            raw_tags = [raw_tags]
-        elif not isinstance(raw_tags, (list, tuple, set)):
-            raw_tags = [raw_tags]
-        tags = []
-        for tag in raw_tags:
-            text = str(tag or "").strip().lower()
-            if text:
-                tags.append(text)
-        tags = list(dict.fromkeys(tags))
-        try:
-            min_like = int(float(str(rule.get("min_like", rule.get("like_num", 0)) or 0).strip() or 0))
-        except Exception:
-            min_like = 0
-        if min_like <= 0 or not tags:
-            continue
-        label = str(rule.get("label", rule.get("name", f"rule_{index + 1}"))).strip()
-        normalized.append({"label": label, "tags": tags, "min_like": min_like})
+        return [raw_rules]
+    if isinstance(raw_rules, (list, tuple, set)):
+        return raw_rules
+    return []
+
+
+def _normalize_rule_tags(raw_tags):
+    """Coerce a raw tags field to a deduplicated list of lowercase strings."""
+    if isinstance(raw_tags, str):
+        items = [raw_tags]
+    elif isinstance(raw_tags, (list, tuple, set)):
+        items = list(raw_tags)
+    else:
+        items = [raw_tags]
+    out = []
+    for tag in items:
+        text = str(tag or "").strip().lower()
+        if text:
+            out.append(text)
+    return list(dict.fromkeys(out))
+
+
+def _parse_rule_min_like(rule):
+    """Coerce min_like / like_num to a non-negative int, defaulting to 0 on error."""
+    try:
+        raw = str(rule.get("min_like", rule.get("like_num", 0)) or 0).strip() or 0
+        return int(float(raw))
+    except Exception:
+        return 0
+
+
+def _normalize_one_rule(rule, index):
+    """Validate + normalize one rule dict. Returns the entry dict or None to skip."""
+    if not isinstance(rule, dict):
+        return None
+    tags = _normalize_rule_tags(rule.get("tags", rule.get("tag", [])))
+    min_like = _parse_rule_min_like(rule)
+    if min_like <= 0 or not tags:
+        return None
+    label = str(rule.get("label", rule.get("name", f"rule_{index + 1}"))).strip()
+    return {"label": label, "tags": tags, "min_like": min_like}
+
+
+def _normalize_special_like_rules(raw_rules):
+    rules = _coerce_to_rule_iterable(raw_rules)
+    normalized = []
+    for index, rule in enumerate(rules):
+        entry = _normalize_one_rule(rule, index)
+        if entry is not None:
+            normalized.append(entry)
     return normalized
+
+
+def _read_rule_tags_and_min(rule, to_int):
+    """Pull (tags, min_like) out of a normalized rule dict, returning (None, 0) on error."""
+    try:
+        return rule.get("tags", []), to_int(rule.get("min_like", 0), 0) or 0
+    except Exception:
+        return None, 0
+
+
+def _rule_matches_artwork(rule_tags, artwork_tags, tag_hit):
+    return any(tag_hit(target, artwork_tags) for target in rule_tags or [])
 
 
 def _resolve_like_threshold(base_like, artwork_tags, special_like_rules, tag_hit, to_int):
     threshold = to_int(base_like, 0) or 0
     matched_rules = []
     for rule in special_like_rules or []:
-        try:
-            rule_tags = rule.get("tags", [])
-            rule_min_like = to_int(rule.get("min_like", 0), 0) or 0
-        except Exception:
+        rule_tags, rule_min_like = _read_rule_tags_and_min(rule, to_int)
+        if rule_min_like <= 0 or rule_tags is None:
             continue
-        if rule_min_like <= 0:
-            continue
-        hit = False
-        for target_tag in rule_tags:
-            if tag_hit(target_tag, artwork_tags):
-                hit = True
-                break
-        if hit:
+        if _rule_matches_artwork(rule_tags, artwork_tags, tag_hit):
             matched_rules.append(rule)
             if rule_min_like > threshold:
                 threshold = rule_min_like

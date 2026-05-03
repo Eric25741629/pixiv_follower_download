@@ -3,7 +3,6 @@ import os
 import random
 import threading
 import time
-from random import random
 
 import bs4
 import requests
@@ -437,7 +436,7 @@ def get_author_picture_ids(illust_ids,path,num,q,exist_pid):
                     f.close()
                 except Exception:
                     pass
-        time.sleep(random())
+        time.sleep(random.random())
         #print(num)
     q.put(download_Pid)
 def get_follow_illust(id,headers,state,times):
@@ -455,7 +454,6 @@ def illusts(id,cookie,Agent):				#輸入你的id得到你所有關注的P站畫�
     }
     times=0
     pixiv_author_id=[]
-    limit=1
     url = ('https://www.pixiv.net/ajax/user/27915696/following?offset='+str(times)+'&limit=1&rest=show&tag=&lang=zh_tw') # 访问存有画师所有作品
     print(url)
     res = requests.get(url, headers=headers, timeout=(10, 30))
@@ -558,65 +556,135 @@ def Pixiv_Tag(url):                                                 #回傳標�
     #print(resdicts)
     #resdicts = str(json.loads(o)['illust'][str(id)]['tags']['tags'])
     return resdicts
-class tagErr(Exception):
-    pass 
-class Err(Exception):
-    pass
-def get_download_url(path,cookie,Agent,num,pid):    #回傳下載連結
-    download_url=[]
-    for x in range(0,2):
+_R18G_GORE_TAGS = (
+    '死姦', '脫腸', '斬首', '屍姦', 'necrophilia', '割脖', '砍頭', '食糞', '眼孔姦',
+)
+_EXCLUDE_TAGS = ('gay', '原創BL')
+_DEFAULT_LIKE_THRESHOLD = 300
+
+
+def _pixiv_info_with_retry(url, Agent, max_attempts=2):
+    """Fetch Pixiv info with up to ``max_attempts`` retries.
+
+    Returns the (tag, like, pagecount, img_url) tuple, or ``None`` if every
+    attempt produced the empty/404 response shape.
+    """
+    for _ in range(max_attempts):
+        info = Pixiv_info(url, Agent=Agent)
+        if info == [404]:
+            return None
         try:
-            #print('檢測tag')
-            url='https://www.pixiv.net/artworks/'+pid
-            #print(url)
-            j=1
-            while(j):
-                tag,like,pagecount,img_url=Pixiv_info(url,Agent=Agent)
-                j=j+1
-                if tag!=[] or like!=404:
-                    break
-                if j==3:
-                    raise Err()
-                if tag==404 and like==404:
-                    break
-            if tag ==404 and like==404:
-                break
-            tag=str(tag) 
-            if ('R-18G'in tag) and (('死姦'in tag) or ('脫腸'in tag) or ('斬首' in tag) or ('屍姦'in tag) or ('necrophilia'in tag) or('割脖'in tag) or ('砍頭'in tag)or('食糞'in tag)or('眼孔姦'in tag)):
-                break
-            if ( ('gay'in tag)or ('原創BL'in tag)):
-                return pid
-            if like <300:
-                return pid
-            img_url=img_url.rsplit(".",1)
-            for count in range(0,pagecount):
-                download_url.append(img_url[0]+str(count)+"."+img_url[1])
-            time.sleep(random()/5)
-            return (download_url)
-        except Exception as err:
-            print(pid+'獲取失敗',err) 
-            if x==9:
-                    print(pid+'獲取失敗',err) 
-                    myfile = Path(path+"network_err"+str(num%20)+".txt")
-                    myfile.touch(exist_ok=True)
-                    f = open(path+"network_err"+str(num%20)+".txt")           
-                    exist=f.read()
-                    f.close()
-                    if str(pid) not in exist:
-                        try:
-                            from safe_io import atomic_append_text
-                            atomic_append_text(os.path.join(path, f"network_err{int(num%20)}.txt"), str(pid))
-                        except Exception:
-                            try:
-                                f = open((path+"network_err"+str(num%20)+".txt"), "a+")  
-                                f.write(str(pid)+'\n')
-                                f.close()
-                            except Exception:
-                                pass
-                        f.close() 
-        time.sleep(random())
-    #print(download_url)
-    return(download_url)
+            tag, like, pagecount, img_url = info
+        except Exception:
+            continue
+        if tag != [] or like != 404:
+            return tag, like, pagecount, img_url
+        if tag == 404 and like == 404:
+            return None
+    return None
+
+
+def _is_blocked_r18g_artwork(tag):
+    """An R-18G work mixed with any of the gore-marker tags is hard-blocked."""
+    tag_str = str(tag)
+    if 'R-18G' not in tag_str:
+        return False
+    return any(marker in tag_str for marker in _R18G_GORE_TAGS)
+
+
+def _is_excluded_orientation_tag(tag):
+    """Hard-exclude based on orientation/genre tags hard-coded in the original script."""
+    tag_str = str(tag)
+    return any(marker in tag_str for marker in _EXCLUDE_TAGS)
+
+
+def _build_per_page_urls(img_url, pagecount):
+    """Expand a single img_url into one URL per page using the original path scheme."""
+    parts = img_url.rsplit(".", 1)
+    return [parts[0] + str(i) + "." + parts[1] for i in range(pagecount)]
+
+
+def get_download_url(path, cookie, Agent, num, pid):
+    """回傳下載連結 — utility script entrypoint, not used by the main worker pipeline."""
+    url = 'https://www.pixiv.net/artworks/' + pid
+    try:
+        info = _pixiv_info_with_retry(url, Agent)
+    except Exception as err:
+        print(pid + '獲取失敗', err)
+        return []
+    if info is None:
+        return []
+    tag, like, pagecount, img_url = info
+    if _is_blocked_r18g_artwork(tag):
+        return []
+    if _is_excluded_orientation_tag(tag):
+        return pid
+    if like < _DEFAULT_LIKE_THRESHOLD:
+        return pid
+    download_url = _build_per_page_urls(img_url, pagecount)
+    time.sleep(random.random() / 5)
+    return download_url
+def _result_preview(final_result):
+    """Build the small dict logged into pixiv_cookie_requirement.json under ``result_preview``."""
+    if not isinstance(final_result, list):
+        return {"tags_len": 0, "bookmarkCount": 0, "pageCount": 0, "img_url": None}
+    n = len(final_result)
+    tags_len = (
+        len(final_result[0])
+        if n >= 1 and isinstance(final_result[0], list)
+        else 0
+    )
+    return {
+        "tags_len": tags_len,
+        "bookmarkCount": final_result[1] if n >= 2 else 0,
+        "pageCount": final_result[2] if n >= 3 else 0,
+        "img_url": final_result[3] if n >= 4 else None,
+    }
+
+
+def _record_pixiv_info_trace(pid_id, ajax_url, requires_cookie,
+                              status_no_cookie, status_cookie, final_result):
+    """Append a Pixiv_info call to pixiv_cookie_requirement.json (best-effort)."""
+    try:
+        trace_entry = {
+            'artwork_url': 'https://www.pixiv.net/artworks/' + pid_id,
+            'pid': str(pid_id),
+            'ajax_url': ajax_url,
+            'requires_cookie': requires_cookie,
+            'status_no_cookie': status_no_cookie,
+            'status_cookie': status_cookie,
+            'result_preview': _result_preview(final_result),
+            'checked_at': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
+        }
+        trace_path = os.path.join(
+            os.getenv('APPDATA') + r'/pixiv_download/',
+            'pixiv_cookie_requirement.json',
+        )
+        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        _append_pixiv_info_history(trace_path, pid_id, {**trace_entry, 'source': 'fetch'})
+    except Exception:
+        pass
+
+
+def _decide_pixiv_info_result(no_cookie_result, no_cookie_valid, cookie, fetch_with_cookie):
+    """Decide which fetch result to return based on the no-cookie outcome.
+
+    Returns ``(final_result, requires_cookie, status_cookie)``. ``status_cookie``
+    is ``None`` when no cookie fetch was attempted.
+    """
+    if no_cookie_result == [404]:
+        return [404], None, None
+    if no_cookie_valid:
+        return no_cookie_result, False, None
+    if not cookie:
+        return no_cookie_result, None, None
+    cookie_result, cookie_valid, status_cookie = fetch_with_cookie()
+    if cookie_valid:
+        return cookie_result, True, status_cookie
+    final = cookie_result if cookie_result != [404] else no_cookie_result
+    return final, False, status_cookie
+
+
 def Pixiv_info(url,
     Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50'
     ,cookie=None,ip=None, *, session: "requests.Session | None" = None):                                                #回傳標籤
@@ -678,49 +746,14 @@ def Pixiv_info(url,
             return parsed, valid, res.status_code
 
         no_cookie_result, no_cookie_valid, status_no_cookie = _fetch(use_cookie=False)
-        final_result = no_cookie_result
-        requires_cookie = None
-        status_cookie = None
-
-        if no_cookie_result == [404]:
-            final_result = [404]
-            requires_cookie = None
-        elif no_cookie_valid:
-            final_result = no_cookie_result
-            requires_cookie = False
-        elif (not no_cookie_valid) and cookie:
-            cookie_result, cookie_valid, status_cookie = _fetch(use_cookie=True)
-            if cookie_valid:
-                final_result = cookie_result
-                requires_cookie = True
-            else:
-                final_result = cookie_result if cookie_result != [404] else no_cookie_result
-                requires_cookie = False
-        else:
-            requires_cookie = None
-
-        try:
-            trace_entry = {
-                'artwork_url': 'https://www.pixiv.net/artworks/'+id,
-                'pid': str(id),
-                'ajax_url': ajax_url,
-                'requires_cookie': requires_cookie,
-                'status_no_cookie': status_no_cookie,
-                'status_cookie': status_cookie,
-                'result_preview': {
-                    'tags_len': len(final_result[0]) if isinstance(final_result, list) and len(final_result) >= 1 and isinstance(final_result[0], list) else 0,
-                    'bookmarkCount': final_result[1] if isinstance(final_result, list) and len(final_result) >= 2 else 0,
-                    'pageCount': final_result[2] if isinstance(final_result, list) and len(final_result) >= 3 else 0,
-                    'img_url': final_result[3] if isinstance(final_result, list) and len(final_result) >= 4 else None,
-                },
-                'checked_at': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-            }
-            trace_path = os.path.join(os.getenv('APPDATA')+r'/pixiv_download/', 'pixiv_cookie_requirement.json')
-            os.makedirs(os.path.dirname(trace_path), exist_ok=True)
-            _append_pixiv_info_history(trace_path, id, {**trace_entry, 'source': 'fetch'})
-        except Exception:
-            pass
-
+        final_result, requires_cookie, status_cookie = _decide_pixiv_info_result(
+            no_cookie_result, no_cookie_valid, cookie,
+            lambda: _fetch(use_cookie=True),
+        )
+        _record_pixiv_info_trace(
+            id, ajax_url, requires_cookie,
+            status_no_cookie, status_cookie, final_result,
+        )
         return final_result
 
 def get_pixiv_cookie_requirement(pid):
@@ -796,7 +829,6 @@ def pixiv_following_count(id,cookie,Agent):
     #print(objSoup)
 
 def no_use_seleium_get_pid(author_pids,cookie,Agent,q,path,num,exist_pid):
-    pids=[]
     for i in trange(0,len(author_pids)):
         try:
             url='https://www.pixiv.net/ajax/user/'+author_pids[i]+'/profile/all?lang=zh%27'

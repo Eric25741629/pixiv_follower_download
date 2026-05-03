@@ -46,17 +46,42 @@ class StatsView:
 
         self._chart_container = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO)
 
-        self._tabs = ft.Tabs(
-            selected_index=0,
-            on_change=self._on_tab_change,
-            tabs=[
-                ft.Tab(text="本次執行"),
-                ft.Tab(text="歷史累計"),
-            ],
+        # Flet 0.84's Tabs requires TabBar+TabBarView with separate content
+        # bodies. Both modes here share one body, so a plain button toggle
+        # is cleaner than forcing the new Tabs structure.
+        self._btn_session = ft.FilledButton(
+            "本次執行", on_click=lambda e: self._switch_mode("session"),
+        )
+        self._btn_lifetime = ft.OutlinedButton(
+            "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
+        )
+        self._mode_toggle = ft.Row(
+            controls=[self._btn_session, self._btn_lifetime], spacing=8,
         )
 
-    def _on_tab_change(self, e: ft.ControlEvent) -> None:
-        self._mode = "session" if e.control.selected_index == 0 else "lifetime"
+    def _switch_mode(self, mode: str) -> None:
+        if mode == self._mode:
+            return
+        self._mode = mode
+        is_session = mode == "session"
+        # Swap which side is FilledButton (active). Flet 0.84 doesn't let
+        # us morph button types, so we just toggle them as filled/outlined
+        # via Row controls reassignment.
+        self._btn_session = ft.FilledButton(
+            "本次執行", on_click=lambda e: self._switch_mode("session"),
+        ) if is_session else ft.OutlinedButton(
+            "本次執行", on_click=lambda e: self._switch_mode("session"),
+        )
+        self._btn_lifetime = ft.OutlinedButton(
+            "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
+        ) if is_session else ft.FilledButton(
+            "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
+        )
+        self._mode_toggle.controls = [self._btn_session, self._btn_lifetime]
+        try:
+            self._mode_toggle.update()
+        except Exception:
+            pass
         self._refresh_now()
 
     def build(self) -> ft.Container:
@@ -72,7 +97,7 @@ class StatsView:
             content=ft.Column(
                 controls=[
                     ft.Text("統計資料", size=20, weight=ft.FontWeight.BOLD),
-                    self._tabs,
+                    self._mode_toggle,
                     cards,
                     ft.Divider(),
                     chart_section,
@@ -158,7 +183,10 @@ class StatsView:
         self._card_values[0].value = StatsCollector.format_bytes(
             data.get("lifetime_bytes_downloaded", 0)
         )
-        self._card_values[1].value = "-"
+        jxl_src = data.get("lifetime_jxl_src", 0)
+        jxl_dst = data.get("lifetime_jxl_dst", 0)
+        saved = jxl_src - jxl_dst if jxl_src > jxl_dst else 0
+        self._card_values[1].value = StatsCollector.format_bytes(saved) if saved > 0 else "-"
         cookie_counts = data.get("cookie_request_counts", {})
         total_req = sum(cookie_counts.values())
         self._card_values[2].value = str(total_req)

@@ -1,88 +1,58 @@
 # pixiv-img-download
 
-Pixiv desktop downloader (PyQt5 GUI) for:
+Pixiv desktop/web downloader rebuilt with **Flet (Material 3)**.
 
-- fetching followed artists
-- fetching artwork IDs
-- fetching artwork detail/URLs
-- downloading images/ugoira files
+Chinese README: [README.zh-TW.md](README.zh-TW.md)
 
 ## Features
 
-- GUI workflow with step-by-step actions (`Step 1` -> `Step 4`)
-- one-click pipeline run (`Run All`)
-- pause / resume / stop for long-running tasks
-- tag include/exclude filtering
-- minimum likes filter
-- skip gif / skip tag / skip by time options
-- auto-save runtime state (cookies/settings/history files)
-
-## Project Structure
-
-- `main.py`: app entry point
-- `controller.py`: UI/controller layer
-- `run_actions.py`: workflow action orchestration
-- `pixiv_thread.py`: threaded fetch/download jobs
-- `pixiv_api.py`: Pixiv request/parsing and cookie helpers
-- `download_img.py`, `download_url.py`: download utility logic
-- `safe_io.py`: atomic write + optional file history backup
-- `Ui2.py` / `test.ui`: PyQt UI code/layout
+- 4-step pipeline: Step 1 (following) → Step 2 (PIDs) → Step 3 (URLs) → Step 4 (download)
+- one-click `Run All` pipeline
+- pause / resume / stop per step
+- multi-account cookie pool with alias support and per-cookie validity testing
+- `AccountScheduler`: round-robin cooldown (`avg × ln(N+1)` s) with per-cookie proxy binding
+- tag include/exclude filter (chip UI), min-likes threshold (normal / R18)
+- directory organisation by author ID, R18/R18G/AI subdirs
+- optional JXL post-processing via `cjxl.exe`
+- statistics view: download counts + per-cookie bar chart
+- network retry (5 attempts, 60 s wait) for Steps 2/3/4 on proxy/connection errors
+- atomic writes with up to 10 rolling history backups
 
 ## Requirements
 
-Recommended environment:
-
-- Windows 10/11
-- Python 3.8+
-- Chrome + compatible ChromeDriver (for Selenium login flows if needed)
-
-Core Python packages used in this project include:
-
-- `PyQt5`
-- `requests`
-- `beautifulsoup4`
-- `selenium`
-- `numpy`
-- `tqdm`
-- `imageio`
-- `loguru`
-- `gdown`
-
-Install example:
+- Windows 10/11, Python 3.8+
 
 ```bash
-pip install PyQt5 requests beautifulsoup4 selenium numpy tqdm imageio loguru gdown
+pip install flet "requests[socks]"
 ```
 
 ## Run
+
+Desktop:
 
 ```bash
 python main.py
 ```
 
+Web (browser):
+
+```bash
+flet run app/gui/flet_app.py --web
+```
+
 ## Typical Workflow
 
-1. Configure account/cookies and download path in GUI.
-2. Run `Step 1: Get Following Artists`.
-3. Run `Step 2: Get Artwork IDs`.
-4. Run `Step 3: Get Artwork Details`.
-5. Run `Step 4: Start Download`.
+1. Set account / User ID, download path, and filter rules in the **Settings** tab.
+2. Add and test Cookie strings in the **Cookie** tab.
+3. On the **Home** tab, run steps 1–4 in order, or click **Run All**.
 
-Or click `Run All (1->4)`.
+## Data Location
 
-## Data and Backup
-
-Runtime files are usually under `%APPDATA%/pixiv_download/`.
-
-When `atomic_write_*` is used with backup enabled, old versions are copied to a sibling `history/` directory.
-
-- naming format: `filename.YYYYMMDD(.N)`
-- keep latest 10 backup files by default
-- some files (for example `cookies.json`) may be written with backup disabled
+Runtime state under `%APPDATA%/pixiv_download/` (`othersettings.json`, `cookies.json`, `pictures_id.txt`, `pixiv_info_cache.json`). Backup copies go to a sibling `history/` directory as `filename.YYYYMMDD(.N)`; latest 10 kept.
 
 ## Notes
 
 - Respect Pixiv terms of service and local laws.
-- For private/restricted content, valid cookies may be required.
-- If rate-limited, enable single-thread mode and increase wait range in UI settings.
+- Valid login cookies are required for restricted content.
+- If rate-limited, raise the cooldown average (≥ 30 s recommended) or enable single-thread PID mode.
 

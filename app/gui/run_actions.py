@@ -9,15 +9,15 @@ from __future__ import annotations
 import os
 from datetime import datetime
 from queue import Queue
-from typing import Optional
 
 from app.core.settings_store import SettingsStore
 from app.core.worker_event import WorkerEvent
 from app.core.account_scheduler import AccountState, AccountScheduler
 from app.core.proxy_utils import parse_proxy_url
 from app.core.pixiv_thread_utils import (
-    safe_read_json, load_exist_pid_set, normalize_cookie_entries,
+    safe_read_json, load_exist_pid_set, normalize_cookie_entries, backup_file,
 )
+from app.core.metadata_db import DB_FILENAME
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
 
 DEFAULT_AGENT = (
@@ -68,12 +68,24 @@ class RunController:
         self._run_all_mode = False
         self._stats_collector = stats_collector
 
+    def _backup_db(self) -> None:
+        try:
+            db_path = os.path.join(_data_path(), DB_FILENAME)
+            if not os.path.isfile(db_path):
+                return
+            from app.core.metadata_db import MetadataDB
+            MetadataDB(_data_path()).backup_db(max_history=3)
+        except Exception:
+            pass
+
     def run_step(self, n: int) -> None:
         self._run_all_mode = False
+        self._backup_db()
         self._start_step(n)
 
     def run_all(self) -> None:
         self._run_all_mode = True
+        self._backup_db()
         self._start_step(1)
 
     def on_next(self, n: int) -> None:
@@ -99,6 +111,57 @@ class RunController:
             alias_map = {}
         return normalize_cookie_entries(raw, alias_map=alias_map)
 
+    @staticmethod
+    def _cookie_cache_is_fresh(entry, now):
+        """Return True iff this entry has status=有效 and was tested within the retest window."""
+        if entry.get("status") != "有效":
+            return False
+        tested_at = entry.get("last_tested_at")
+        try:
+            tested_f = float(tested_at) if tested_at is not None else None
+        except (TypeError, ValueError):
+            return False
+        if tested_f is None:
+            return False
+        return (now - tested_f) < _RETEST_INTERVAL_SEC
+
+    def _partition_cookies_by_cache(self, entries, now):
+        """Split entries into (cached_valid_cookies, entries_needing_network_test).
+
+        Empty cookie strings are dropped entirely. For each cached-valid hit a
+        gray "信任快取" log line is emitted with the staleness in days.
+        """
+        valid: list[str] = []
+        needs_test: list[dict] = []
+        for e in entries:
+            cookie = str(e.get("cookie", "") or "").strip()
+            if not cookie:
+                continue
+            if self._cookie_cache_is_fresh(e, now):
+                valid.append(cookie)
+                tested_f = float(e.get("last_tested_at"))
+                days = max(0, int((now - tested_f) / 86400))
+                alias = e.get("alias", "") or "Cookie"
+                self._log(
+                    f"<p><font color='gray'>{alias} 信任快取（{days} 天前驗證）</font></p>"
+                )
+            else:
+                needs_test.append(e)
+        return valid, needs_test
+
+    def _run_one_cookie_test(self, cookie, idx, total, agent, pixiv_api_module):
+        """Run a single cookie network test, emit progress + status events, return ok."""
+        self._event_q.put(WorkerEvent(
+            "loading", (True, f"測試 Cookie {idx}/{total}...")
+        ))
+        self._event_q.put(WorkerEvent("cookie_status", (cookie, "測試中", None)))
+        try:
+            count, _ = pixiv_api_module.Test_cookies([cookie], agent)
+            ok = int(count) > 0
+        except Exception:
+            ok = False
+        return ok
+
     def _test_cookies(self, entries: list[dict], agent: str) -> list[str]:
         """Validate each cookie, returning the valid cookie strings.
 
@@ -116,52 +179,19 @@ class RunController:
         from app.core import pixiv_api
 
         now = _time.time()
-        valid: list[str] = []
-        needs_test: list[dict] = []
-        for e in entries:
-            cookie = str(e.get("cookie", "") or "").strip()
-            if not cookie:
-                continue
-            status = e.get("status")
-            tested_at = e.get("last_tested_at")
-            try:
-                tested_f = float(tested_at) if tested_at is not None else None
-            except (TypeError, ValueError):
-                tested_f = None
-            if (status == "有效" and tested_f is not None
-                    and now - tested_f < _RETEST_INTERVAL_SEC):
-                valid.append(cookie)
-                days = max(0, int((now - tested_f) / 86400))
-                alias = e.get("alias", "") or "Cookie"
-                self._log(
-                    f"<p><font color='gray'>{alias} 信任快取（{days} 天前驗證）</font></p>"
-                )
-            else:
-                needs_test.append(e)
-
+        valid, needs_test = self._partition_cookies_by_cache(entries, now)
         if not needs_test:
             return valid
 
-        # Test only the entries that need it. Persist all tested entries'
-        # results in one settings write at the end.
         total = len(needs_test)
         self._log(f"<p><font color='blue'>啟動前測試 {total} 個 Cookie...</font></p>")
         tested_results: dict[str, bool] = {}
         for idx, e in enumerate(needs_test, start=1):
             cookie = str(e.get("cookie", "") or "").strip()
-            self._event_q.put(WorkerEvent(
-                "loading", (True, f"測試 Cookie {idx}/{total}...")
-            ))
-            self._event_q.put(WorkerEvent("cookie_status", (cookie, "測試中", None)))
-            try:
-                count, _ = pixiv_api.Test_cookies([cookie], agent)
-                ok = int(count) > 0
-            except Exception:
-                ok = False
+            ok = self._run_one_cookie_test(cookie, idx, total, agent, pixiv_api)
             tested_results[cookie] = ok
             status = "有效" if ok else "失效"
-            tested_at = _time.time()
-            self._event_q.put(WorkerEvent("cookie_status", (cookie, status, tested_at)))
+            self._event_q.put(WorkerEvent("cookie_status", (cookie, status, _time.time())))
             if ok:
                 valid.append(cookie)
                 self._log(f"<p><font color='green'>Cookie {idx}/{total} 有效</font></p>")
@@ -303,6 +333,131 @@ class RunController:
         self._log(f"<p><font color='gray'>--- 步驟 {n} 開始 ---</font></p>")
         t.start()
 
+    def _validate_cookies_for_step(self, auth, agent, step_num):
+        """Test cookies and return the valid list, or None on failure (with log)."""
+        cookie_entries = self._extract_cookie_entries(auth)
+        valid_cookies = self._test_cookies(cookie_entries, agent)
+        if not valid_cookies:
+            self._log(
+                f"<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 {step_num}</font></p>"
+            )
+            return None
+        return valid_cookies
+
+    def _build_step1(self, auth, agent, flt):
+        userid = str(auth.get("userid", "")).strip()
+        if not userid:
+            self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
+            return None
+        valid_cookies = self._validate_cookies_for_step(auth, agent, 1)
+        if not valid_cookies:
+            return None
+        return thread_following.get_following(
+            self._event_q,
+            userid,
+            valid_cookies[0],
+            agent,
+            bool(flt.get("hidefollow", False)),
+        )
+
+    def _build_step2(self, auth, agent, perf, path):
+        authors = _load_author_list()
+        if not authors:
+            self._log(
+                "<p><font color='red'>找不到 following 清單，請先執行步驟 1</font></p>"
+            )
+            return None
+        valid_cookies = self._validate_cookies_for_step(auth, agent, 2)
+        if not valid_cookies:
+            return None
+        t = thread_pid_scan.get_pixiv_author_imgID_Thread(
+            self._event_q,
+            authors,
+            agent,
+            path,
+            self._attach_aliases(valid_cookies, auth),
+            load_exist_pid_set(path),
+            bool(perf.get("single_thread_mode", False)),
+            stats_collector=self._stats_collector,
+        )
+        t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
+        return t
+
+    def _build_step3(self, auth, agent, dl, perf, path):
+        authors = _load_author_list()
+        valid_cookies = self._validate_cookies_for_step(auth, agent, 3)
+        if not valid_cookies:
+            return None
+        t = thread_url_fetch.get_img_url_thread(
+            q=self._event_q,
+            Author_list=authors,
+            Agent=agent,
+            cookies=self._attach_aliases(valid_cookies, auth),
+            exist_pid=load_exist_pid_set(path),
+            ban_tag=list(dl.get("ban_tag", [])),
+            must_tag=list(dl.get("must_tag", [])),
+            like_num=int(dl.get("like_num", 0)),
+            no_to_check=[],
+            base_path=path,
+            single_thread_mode=bool(perf.get("single_thread_mode", False)),
+            pid_wait_nocookie_min=int(perf.get("pid_wait_nocookie_min", 1)),
+            pid_wait_nocookie_max=int(perf.get("pid_wait_nocookie_max", 6)),
+            special_like_rules=[],
+            stats_collector=self._stats_collector,
+        )
+        t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
+        return t
+
+    @staticmethod
+    def _parse_download_time(dt_str):
+        """Parse download_time setting; falls back to epoch on any error."""
+        s = str(dt_str or "").strip()
+        if not s:
+            return datetime(1970, 1, 1)
+        try:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return datetime(1970, 1, 1)
+
+    def _build_step4(self, auth, agent, dl, flt, perf, directory, jxl):
+        dl_path = str(dl.get("path", "")).strip()
+        if not dl_path:
+            self._log("<p><font color='red'>請先在「設定」指定下載路徑</font></p>")
+            return None
+        dt = self._parse_download_time(dl.get("download_time"))
+        valid_cookies = self._validate_cookies_for_step(auth, agent, 4)
+        if not valid_cookies:
+            return None
+        t = thread_download.download_thread(
+            q=self._event_q,
+            nogif=bool(flt.get("nogif", False)),
+            notag=bool(flt.get("notag", False)),
+            notime=bool(flt.get("notime", False)),
+            create_dir=bool(directory.get("create_dir", False)),
+            download_path=dl_path,
+            cookies=self._attach_aliases(valid_cookies, auth),
+            agent=agent,
+            download_time=dt,
+            no_R18G_dir=bool(directory.get("no_R18G_dir", False)),
+            no_R18_dir=bool(directory.get("no_R18_dir", False)),
+            single_thread_mode=bool(perf.get("single_thread_mode", False)),
+            intra_pid_wait_min=int(perf.get("pid_wait_nocookie_min", 1)),
+            intra_pid_wait_max=int(perf.get("pid_wait_nocookie_max", 6)),
+            jxl_enable=bool(jxl.get("enable", False)),
+            jxl_cjxl_path=str(jxl.get("cjxl_path", "")),
+            jxl_delete_original=bool(jxl.get("delete_original", False)),
+            jxl_effort=int(jxl.get("effort", 7)),
+            like_num=int(dl.get("like_num", 0)),
+            ban_tag=list(dl.get("ban_tag", [])),
+            must_tag=list(dl.get("must_tag", [])),
+            special_like_rules=[],
+            ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
+            filename_template=str(dl.get("filename_template", "") or ""),
+            stats_collector=self._stats_collector,
+        )
+        t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
+        return t
+
     def _build_thread(self, n: int):
         store = _store()
         auth = store.get_section("auth")
@@ -315,111 +470,11 @@ class RunController:
         path = _data_path()
 
         if n == 1:
-            userid = str(auth.get("userid", "")).strip()
-            if not userid:
-                self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
-                return None
-            cookie_entries = self._extract_cookie_entries(auth)
-            valid_cookies = self._test_cookies(cookie_entries, agent)
-            if not valid_cookies:
-                self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 1</font></p>")
-                return None
-            return thread_following.get_following(
-                self._event_q,
-                userid,
-                valid_cookies[0],
-                agent,
-                bool(flt.get("hidefollow", False)),
-            )
-
+            return self._build_step1(auth, agent, flt)
         if n == 2:
-            authors = _load_author_list()
-            if not authors:
-                self._log("<p><font color='red'>找不到 following 清單，請先執行步驟 1</font></p>")
-                return None
-            cookie_entries = self._extract_cookie_entries(auth)
-            valid_cookies = self._test_cookies(cookie_entries, agent)
-            if not valid_cookies:
-                self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 2</font></p>")
-                return None
-            t = thread_pid_scan.get_pixiv_author_imgID_Thread(
-                self._event_q,
-                authors,
-                agent,
-                path,
-                self._attach_aliases(valid_cookies, auth),
-                load_exist_pid_set(path),
-                bool(perf.get("single_thread_mode", False)),
-            )
-            t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
-            return t
-
+            return self._build_step2(auth, agent, perf, path)
         if n == 3:
-            authors = _load_author_list()
-            cookie_entries = self._extract_cookie_entries(auth)
-            valid_cookies = self._test_cookies(cookie_entries, agent)
-            if not valid_cookies:
-                self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 3</font></p>")
-                return None
-            t = thread_url_fetch.get_img_url_thread(
-                q=self._event_q,
-                Author_list=authors,
-                Agent=agent,
-                cookies=self._attach_aliases(valid_cookies, auth),
-                exist_pid=load_exist_pid_set(path),
-                ban_tag=list(dl.get("ban_tag", [])),
-                must_tag=list(dl.get("must_tag", [])),
-                like_num=int(dl.get("like_num", 0)),
-                no_to_check=[],
-                base_path=path,
-                single_thread_mode=bool(perf.get("single_thread_mode", False)),
-                pid_wait_nocookie_min=int(perf.get("pid_wait_nocookie_min", 1)),
-                pid_wait_nocookie_max=int(perf.get("pid_wait_nocookie_max", 6)),
-                special_like_rules=[],
-            )
-            t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
-            return t
-
+            return self._build_step3(auth, agent, dl, perf, path)
         if n == 4:
-            dl_path = str(dl.get("path", "")).strip()
-            if not dl_path:
-                self._log("<p><font color='red'>請先在「設定」指定下載路徑</font></p>")
-                return None
-            dt_str = str(dl.get("download_time", "")).strip()
-            try:
-                dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S") if dt_str else datetime(1970, 1, 1)
-            except Exception:
-                dt = datetime(1970, 1, 1)
-            cookie_entries = self._extract_cookie_entries(auth)
-            valid_cookies = self._test_cookies(cookie_entries, agent)
-            if not valid_cookies:
-                self._log("<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 4</font></p>")
-                return None
-            t = thread_download.download_thread(
-                q=self._event_q,
-                nogif=bool(flt.get("nogif", False)),
-                notag=bool(flt.get("notag", False)),
-                notime=bool(flt.get("notime", False)),
-                create_dir=bool(directory.get("create_dir", False)),
-                download_path=dl_path,
-                cookies=self._attach_aliases(valid_cookies, auth),
-                agent=agent,
-                download_time=dt,
-                no_R18G_dir=bool(directory.get("no_R18G_dir", False)),
-                single_thread_mode=bool(perf.get("single_thread_mode", False)),
-                intra_pid_wait_min=int(perf.get("pid_wait_nocookie_min", 1)),
-                intra_pid_wait_max=int(perf.get("pid_wait_nocookie_max", 6)),
-                jxl_enable=bool(jxl.get("enable", False)),
-                jxl_cjxl_path=str(jxl.get("cjxl_path", "")),
-                jxl_delete_original=bool(jxl.get("delete_original", False)),
-                jxl_effort=int(jxl.get("effort", 7)),
-                like_num=int(dl.get("like_num", 0)),
-                ban_tag=list(dl.get("ban_tag", [])),
-                must_tag=list(dl.get("must_tag", [])),
-                special_like_rules=[],
-                ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
-                stats_collector=self._stats_collector,
-            )
-            t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
-            return t
+            return self._build_step4(auth, agent, dl, flt, perf, directory, jxl)
         return None

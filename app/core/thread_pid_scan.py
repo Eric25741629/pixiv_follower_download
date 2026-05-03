@@ -7,6 +7,7 @@ import requests
 import random as pyrandom
 import threading
 from pixiv_api import *
+from app.core.metadata_db import MetadataDB
 from app.core.worker_event import WorkerEvent
 from app.core.pixiv_thread_utils import (
     atomic_write_text,
@@ -29,7 +30,7 @@ pid_len = 0
 
 class get_pixiv_author_imgID_Thread(PauseableThread):
     '''抓取畫師作品下所有圖片的 Pixiv ID'''
-    def __init__(self, q, Author_list, Agent, path, cookies, exist_pid, single_thread_mode=False, scheduler=None):
+    def __init__(self, q, Author_list, Agent, path, cookies, exist_pid, single_thread_mode=False, scheduler=None, stats_collector=None):
         super().__init__(q, scheduler=scheduler)
         self.Author_list = Author_list
         self.Agent = Agent
@@ -44,6 +45,60 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         self._last_step2_cookie_label = ""
         self._step2_early_skip_pids = set()
         self._step2_skip_lock = threading.Lock()
+        self._stats_collector = stats_collector
+        self._metadata_db = self._init_metadata_db()
+        self._mirror_exist_pid_to_db()
+        self._emit_metadata_db_stats(stage="Step2")
+
+    def _init_metadata_db(self):
+        """Open the SQLite metadata cache (no JSON migration here — Step 2 doesn't read it)."""
+        try:
+            return MetadataDB(self.path)
+        except Exception:
+            return None
+
+    def _mirror_exist_pid_to_db(self):
+        """Best-effort copy of exist_pid into the SQLite cache."""
+        db = getattr(self, "_metadata_db", None)
+        if db is None:
+            return
+        try:
+            if self.exist_pid:
+                db.import_downloaded_set(self.exist_pid)
+        except Exception:
+            pass
+
+    def _emit_metadata_db_stats(self, stage="Step2"):
+        """Print a one-liner with current SQLite cache size."""
+        db = getattr(self, "_metadata_db", None)
+        if db is None:
+            return
+        try:
+            meta_n = db.meta_count()
+            dl_n = db.downloaded_count()
+        except Exception:
+            return
+        try:
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='gray'>[{stage} SQLite] metadata.sqlite3 載入 "
+                f"{meta_n} 筆 meta、{dl_n} 筆已下載</font></p>"
+            ))
+        except Exception:
+            pass
+
+    def flush_for_shutdown(self):
+        """Synchronously close SQLite cache for the window-close hook.
+
+        Step 2 doesn't own url_meta but does own a MetadataDB connection per
+        thread; close it so a clean checkpoint runs before os._exit(0).
+        """
+        db = getattr(self, "_metadata_db", None)
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
     def __del__(self):
         try:
             executor = getattr(self, 'executor', None)
@@ -355,6 +410,12 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                     self._q.put(WorkerEvent("output",f"<p><font color='red'>寫入 pictures_id 失敗：{e2}</font></p>"))
                 except Exception:
                     pass
+        db = getattr(self, "_metadata_db", None)
+        if db is not None and new_candidates:
+            try:
+                db.upsert_pending_pids(new_candidates)
+            except Exception:
+                pass
         try:
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>pictures_id 既有 {len(existing_list)} 筆，新增 {len(new_candidates)} 筆，合計 {len(existing_list) + len(new_candidates)} 筆</font></p>"
@@ -459,6 +520,24 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         except Exception:
             pass
 
+    def _mark_pid_seen(self, npid):
+        """Add to _seen_pids under _pid_file_lock; falls back to direct add on lock failure."""
+        try:
+            with self._pid_file_lock:
+                self._seen_pids.add(npid)
+        except Exception:
+            try:
+                self._seen_pids.add(npid)
+            except Exception:
+                pass
+
+    def _emit_pid_write_error(self, err):
+        try:
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='red'>寫入 pictures_id 失敗：{err}</font></p>"))
+        except Exception:
+            pass
+
     def _step2_append_new_pids(self, pid):
         '''把新 PID 追加到 _collected_pids，並更新 _seen_pids（避免跨 worker 重複，吞例外）'''
         try:
@@ -471,19 +550,9 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                         if npid in self._seen_pids:
                             continue
                         self._collected_pids.append(npid)
-                        try:
-                            with self._pid_file_lock:
-                                self._seen_pids.add(npid)
-                        except Exception:
-                            try:
-                                self._seen_pids.add(npid)
-                            except Exception:
-                                pass
+                        self._mark_pid_seen(npid)
             except Exception as e:
-                try:
-                    self._q.put(WorkerEvent("output",f"<p><font color='red'>寫入 pictures_id 失敗：{e}</font></p>"))
-                except Exception:
-                    pass
+                self._emit_pid_write_error(e)
         except Exception:
             pass
 
@@ -522,6 +591,8 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             self._q.put(WorkerEvent("output", f"<p><font color='black'>PID progress: {pid_num}</font></p>"))
         try:
             pid = self._step2_fetch_artist_pid_list(author_pids, cookie, Agent, proxies=proxies)
+            if self._stats_collector is not None:
+                self._stats_collector.report_request(self._last_step2_cookie_label)
             pid, step2_skipped_pid, pid_stats = self._collect_step2_incremental_pid(pid)
             self._step2_emit_incremental_status(author_pids, pid_stats)
             self._step2_record_skipped_pids(step2_skipped_pid)

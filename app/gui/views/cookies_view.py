@@ -20,6 +20,24 @@ _STATUS_COLORS = {
 }
 
 
+def _format_tested_at(value) -> str:
+    """Render last_tested_at (epoch float) as 'M月D日 HH:MM' / '剛剛' / '—'."""
+    if value is None or value == "":
+        return "—"
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    import time as _time
+    delta = _time.time() - ts
+    if delta < 60:
+        return "剛剛"
+    if delta < 3600:
+        return f"{int(delta // 60)} 分鐘前"
+    local = _time.localtime(ts)
+    return _time.strftime("%m月%d日 %H:%M", local)
+
+
 def _store() -> SettingsStore:
     path = os.getenv("APPDATA") + r"/pixiv_download/"
     os.makedirs(path, exist_ok=True)
@@ -58,6 +76,7 @@ class CookiesView:
                 ft.DataColumn(ft.Text("選取")),
                 ft.DataColumn(ft.Text("別名")),
                 ft.DataColumn(ft.Text("狀態")),
+                ft.DataColumn(ft.Text("上次檢查")),
                 ft.DataColumn(ft.Text("Cookie 預覽")),
                 ft.DataColumn(ft.Text("Proxy 綁定")),
                 ft.DataColumn(ft.Text("操作")),
@@ -96,41 +115,52 @@ class CookiesView:
             "cookie_proxy_map": self._cookie_proxy_map,
         })
 
-    def _refresh_table(self) -> None:
-        self._table.rows = []
-        for i, entry in enumerate(self._entries):
-            alias = entry.get("alias", "") or f"Cookie {i+1}"
-            cookie = entry.get("cookie", "")
-            status = entry.get("status", "未知")
-            preview = cookie[:30] + "..." if len(cookie) > 30 else cookie
-            status_color = _STATUS_COLORS.get(status, ft.Colors.GREY_600)
-            current_proxy = self._cookie_proxy_map.get(cookie) or ""
-            proxy_options = [ft.dropdown.Option(key="", text="（本機 IP）")] + [
-                ft.dropdown.Option(key=p, text=p[:50]) for p in self._proxy_pool
-            ]
-            proxy_dd = ft.Dropdown(
-                options=proxy_options,
-                value=current_proxy if (current_proxy == "" or current_proxy in self._proxy_pool) else "",
-                width=220,
-                on_change=lambda e, c=cookie: self._on_proxy_change(c, e.control.value),
-            )
-            self._table.rows.append(ft.DataRow(cells=[
-                ft.DataCell(ft.Checkbox(
-                    value=cookie in self._selected,
-                    on_change=lambda e, c=cookie: self._on_toggle_row(c, e.control.value),
-                )),
-                ft.DataCell(ft.Text(alias)),
-                ft.DataCell(ft.Text(status, color=status_color, weight=ft.FontWeight.BOLD)),
-                ft.DataCell(ft.Text(preview, size=11, font_family="monospace")),
-                ft.DataCell(proxy_dd),
-                ft.DataCell(ft.Row([
-                    ft.IconButton(icon=ft.Icons.EDIT, tooltip="編輯",
-                                  on_click=lambda e, idx=i: self._open_edit_dialog(idx)),
-                    ft.IconButton(icon=ft.Icons.DELETE, tooltip="刪除",
-                                  icon_color=ft.Colors.RED_400,
-                                  on_click=lambda e, idx=i: self._remove_entry(idx)),
-                ])),
-            ]))
+    def _build_proxy_dropdown(self, cookie):
+        """Build the per-row proxy dropdown control."""
+        current_proxy = self._cookie_proxy_map.get(cookie) or ""
+        options = [ft.dropdown.Option(key="", text="（本機 IP）")] + [
+            ft.dropdown.Option(key=p, text=p[:50]) for p in self._proxy_pool
+        ]
+        return ft.Dropdown(
+            options=options,
+            value=current_proxy if (current_proxy == "" or current_proxy in self._proxy_pool) else "",
+            width=220,
+            on_select=lambda e, c=cookie: self._on_proxy_change(c, e.control.value),
+        )
+
+    def _build_action_cell(self, idx):
+        """Build the per-row edit/delete IconButton row."""
+        return ft.Row([
+            ft.IconButton(icon=ft.Icons.EDIT, tooltip="編輯",
+                          on_click=lambda e, i=idx: self._open_edit_dialog(i)),
+            ft.IconButton(icon=ft.Icons.DELETE, tooltip="刪除",
+                          icon_color=ft.Colors.RED_400,
+                          on_click=lambda e, i=idx: self._remove_entry(i)),
+        ])
+
+    def _build_cookie_row(self, idx, entry):
+        """Build one DataRow for the cookies table."""
+        alias = entry.get("alias", "") or f"Cookie {idx+1}"
+        cookie = entry.get("cookie", "")
+        status = entry.get("status", "未知")
+        preview = cookie[:30] + "..." if len(cookie) > 30 else cookie
+        status_color = _STATUS_COLORS.get(status, ft.Colors.GREY_600)
+        tested_text = _format_tested_at(entry.get("last_tested_at"))
+        return ft.DataRow(cells=[
+            ft.DataCell(ft.Checkbox(
+                value=cookie in self._selected,
+                on_change=lambda e, c=cookie: self._on_toggle_row(c, e.control.value),
+            )),
+            ft.DataCell(ft.Text(alias)),
+            ft.DataCell(ft.Text(status, color=status_color, weight=ft.FontWeight.BOLD)),
+            ft.DataCell(ft.Text(tested_text, size=11, color=ft.Colors.GREY_700)),
+            ft.DataCell(ft.Text(preview, size=11, font_family="monospace")),
+            ft.DataCell(self._build_proxy_dropdown(cookie)),
+            ft.DataCell(self._build_action_cell(idx)),
+        ])
+
+    def _refresh_table_header_state(self):
+        """Update the count label, select-all checkbox, and button-disabled flags."""
         self._count_text.value = f"（共 {len(self._entries)} 筆，已選 {len(self._selected)}）"
         all_cookies = {e.get("cookie", "") for e in self._entries if e.get("cookie")}
         self._select_all_cb.value = (
@@ -139,6 +169,12 @@ class CookiesView:
         self._btn_test_selected.disabled = self._testing or not self._selected
         self._btn_test_all.disabled = self._testing or not self._entries
         self._btn_auto_pair.disabled = not self._entries
+
+    def _refresh_table(self) -> None:
+        self._table.rows = [
+            self._build_cookie_row(i, entry) for i, entry in enumerate(self._entries)
+        ]
+        self._refresh_table_header_state()
 
     def _on_toggle_row(self, cookie: str, value: bool) -> None:
         if value:
@@ -267,6 +303,7 @@ class CookiesView:
 
     def _do_tests(self, cookies: list[str], agent: str) -> None:
         # Imported here to keep the module import lightweight at app start.
+        import time as _time
         from app.core import pixiv_api
         try:
             for cookie in cookies:
@@ -277,20 +314,33 @@ class CookiesView:
                 except Exception:
                     ok = False
                 self._event_q.put(WorkerEvent(
-                    "cookie_status", (cookie, "有效" if ok else "失效"),
+                    "cookie_status",
+                    (cookie, "有效" if ok else "失效", _time.time()),
                 ))
         finally:
-            self._event_q.put(WorkerEvent("cookie_status", ("__done__", "")))
+            self._event_q.put(WorkerEvent("cookie_status", ("__done__", "", None)))
 
-    def apply_cookie_test_result(self, cookie: str, status: str) -> None:
-        """Called by the dispatcher (event-loop thread) when a test finishes."""
+    def apply_cookie_test_result(
+        self, cookie: str, status: str, tested_at: float | None = None,
+    ) -> None:
+        """Called by the dispatcher (event-loop thread) when a test finishes.
+        tested_at is an epoch timestamp (None for sentinel/in-progress events)."""
         if cookie == "__done__":
             self._testing = False
+            # All in-flight cookie_status events have been applied to
+            # self._entries by now (they came in earlier on the same
+            # queue), so flush the new statuses + timestamps to disk.
+            try:
+                self._save_entries()
+            except Exception:
+                pass
             self._refresh_table()
             return
         for entry in self._entries:
             if entry.get("cookie", "") == cookie:
                 entry["status"] = status
+                if tested_at is not None:
+                    entry["last_tested_at"] = float(tested_at)
                 break
         self._refresh_table()
 

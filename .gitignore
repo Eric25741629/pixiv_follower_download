@@ -1,1 +1,89 @@
-/__pycache__
+# Python 快取
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 測試快取
+.pytest_cache/
+
+# IDE / 環境
+.vscode/
+.conda/
+.idea/
+
+# Build 產出
+build/
+dist/
+*.spec
+
+# Jupyter
+*.ipynb
+*.ipynb_checkpoints/
+
+# Runtime 資料輸出（由 app 產生，不入版控）
+exist.json
+exist_pid.json
+following.json
+following.txt
+following4.json
+following*.json
+following*.txt
+like_record.json
+like_record.txt
+less_like
+less_like.txt
+network_err.txt
+error_find.txt
+retry_urls.txt
+download_time.json
+illust.json
+images.db
+R-18G.txt
+all_url.txt
+all_url_meta.json
+err_url.txt
+net_err.txt
+tag_ban_pid.txt
+pid_num_pid.txt
+revoked_pid.txt
+pictures_id.txt
+step2_skip_pid.txt
+author_progress.json
+pixiv_cookie_requirement.json
+pixiv_info_cache.json
+diag_events.jsonl
+
+# 憑證 / 私鑰
+certs.pem
+*.pem
+
+# 驅動 zip
+chromedriver_*.zip
+
+# 壓縮封存
+*.7z
+*.zip
+*.tar.gz
+
+# 暫存 / debug
+tmp_*.txt
+commit_message.txt
+
+# 平台
+Thumbs.db
+.DS_Store
+
+# 暫存目錄
+tmp_single_test/
+trash/
+manual_download/
+
+# Claude Code 工具設定（不入版控）
+.claude/
+
+# 舊版遺留
+新增資料夾/
+
+# 規劃文件
+docs/superpowers/

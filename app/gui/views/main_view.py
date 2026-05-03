@@ -1,6 +1,7 @@
 from __future__ import annotations
 import queue
 import threading
+import time
 import flet as ft
 
 from app.core.worker_event import WorkerEvent
@@ -40,6 +41,12 @@ class MainView:
 
         self._progress_bar = ft.ProgressBar(value=0, expand=True)
         self._progress_text = ft.Text("", size=12, color=ft.Colors.GREY_600, width=120)
+        self._eta_text = ft.Text(
+            "",
+            size=12,
+            color=ft.Colors.BLUE_GREY_500,
+            width=160,
+        )
         self._countdown_text = ft.Text(
             "",
             size=13,
@@ -49,6 +56,15 @@ class MainView:
         )
         self._progress_value = 0
         self._progress_total = 0
+        self._progress_started_at: float | None = None
+
+        self._phase_ring = ft.ProgressRing(width=14, height=14, stroke_width=2)
+        self._phase_label = ft.Text("", size=11, color=ft.Colors.BLUE_700, expand=True)
+        self._phase_row = ft.Row(
+            controls=[self._phase_ring, self._phase_label],
+            spacing=6,
+            visible=False,
+        )
 
         # Modal overlay shown while a step is launching or stopping.
         self._loading_msg = ft.Text("正在啟動...", size=15, weight=ft.FontWeight.BOLD)
@@ -114,23 +130,51 @@ class MainView:
             t = int(total)
         except (TypeError, ValueError):
             return
+        now = time.monotonic()
         if d <= 0:
             self._progress_value = 0
+            self._progress_started_at = now
         else:
             self._progress_value += d
+            if self._progress_started_at is None:
+                self._progress_started_at = now
         self._progress_total = t
         if t > 0:
             ratio = self._progress_value / t
             self._progress_bar.value = max(0.0, min(1.0, ratio))
             self._progress_text.value = f"{self._progress_value}/{t}"
+            self._eta_text.value = self._format_eta(now)
         else:
             self._progress_bar.value = 0
             self._progress_text.value = ""
+            self._eta_text.value = ""
         try:
             self._progress_bar.update()
             self._progress_text.update()
+            self._eta_text.update()
         except Exception:
             pass
+
+    def _format_eta(self, now: float) -> str:
+        if self._progress_started_at is None:
+            return ""
+        if self._progress_value <= 0 or self._progress_total <= 0:
+            return ""
+        if self._progress_value >= self._progress_total:
+            return "預計剩餘：完成"
+        elapsed = now - self._progress_started_at
+        if elapsed <= 0:
+            return ""
+        remaining_items = self._progress_total - self._progress_value
+        eta_sec = int(remaining_items * elapsed / self._progress_value)
+        if eta_sec <= 0:
+            return ""
+        if eta_sec >= 3600:
+            h, rem = divmod(eta_sec, 3600)
+            m, s = divmod(rem, 60)
+            return f"預計剩餘：{h}:{m:02d}:{s:02d}"
+        m, s = divmod(eta_sec, 60)
+        return f"預計剩餘：{m:02d}:{s:02d}"
 
     def update_countdown(self, remaining: int) -> None:
         try:
@@ -147,6 +191,16 @@ class MainView:
         # own update from a background thread.
         try:
             self._page.update()
+        except Exception:
+            pass
+
+    def set_phase(self, text: str) -> None:
+        """Update the phase indicator row below the progress bar."""
+        has_text = bool(text and text.strip())
+        self._phase_label.value = text if has_text else ""
+        self._phase_row.visible = has_text
+        try:
+            self._phase_row.update()
         except Exception:
             pass
 
@@ -183,6 +237,7 @@ class MainView:
         if not is_running:
             self._is_paused = False
             self._btn_pause.content = "⏸ 暫停"
+            self.set_phase("")
         else:
             self._is_paused = False
             self._btn_pause.content = "⏸ 暫停"
@@ -283,7 +338,12 @@ class MainView:
             spacing=8,
         )
         progress_row = ft.Row(
-            controls=[self._progress_bar, self._progress_text, self._countdown_text],
+            controls=[
+                self._progress_bar,
+                self._progress_text,
+                self._eta_text,
+                self._countdown_text,
+            ],
             spacing=12,
         )
         return ft.Column(
@@ -291,6 +351,7 @@ class MainView:
                 step_row,
                 control_row,
                 progress_row,
+                self._phase_row,
                 ft.Divider(),
                 ft.Text("即時 Log", size=12, weight=ft.FontWeight.BOLD),
                 ft.Container(

@@ -29,6 +29,8 @@ class StatsCollector:
             "lifetime_sessions": 0,
             "last_run_time": None,
             "cookie_request_counts": {},
+            "lifetime_jxl_src": 0,
+            "lifetime_jxl_dst": 0,
         }
         self._load()
 
@@ -96,6 +98,8 @@ class StatsCollector:
                 for label, count in self._session_requests.items():
                     cookie_counts = self._lifetime.setdefault("cookie_request_counts", {})
                     cookie_counts[label] = cookie_counts.get(label, 0) + count
+                self._lifetime["lifetime_jxl_src"] += self._session_jxl_src
+                self._lifetime["lifetime_jxl_dst"] += self._session_jxl_dst
                 data = dict(self._lifetime)
             os.makedirs(os.path.dirname(self._stats_path), exist_ok=True)
             tmp = self._stats_path + ".tmp"
@@ -121,6 +125,8 @@ class StatsCollector:
                     "lifetime_sessions": int(data.get("lifetime_sessions", 0)),
                     "last_run_time": data.get("last_run_time"),
                     "cookie_request_counts": data.get("cookie_request_counts") or {},
+                    "lifetime_jxl_src": int(data.get("lifetime_jxl_src", 0)),
+                    "lifetime_jxl_dst": int(data.get("lifetime_jxl_dst", 0)),
                 })
         except Exception:
             pass

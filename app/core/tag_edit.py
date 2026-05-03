@@ -14,31 +14,42 @@ _BUCKET_GTE20   = [(r[0], r[1]) for r in TAG_RULES if len(r) == 3 and r[2] == "g
 _BUCKET_ALWAYS  = [(r[0], r[1]) for r in TAG_RULES if len(r) == 2]
 
 
+_FORBIDDEN_CHARS_TT = str.maketrans("", "", '"}{[]:<|>?/※\\⊂⊃*')
+_USER_BUCKET_TAG = "users入り"
+
+
+def _bucket_for_length(length):
+    """Pick the rule bucket whose length range covers ``length``."""
+    if length <= 5:
+        return _BUCKET_LTE5
+    if length <= 10:
+        return _BUCKET_GT5LTE10
+    if length < 20:
+        return _BUCKET_GT10LT20
+    return _BUCKET_GTE20
+
+
+def _apply_replacements(tag, bucket):
+    """Sequentially apply ``(old, new)`` replacements; bucket may be empty."""
+    for old, new in bucket:
+        tag = tag.replace(old, new)
+    return tag
+
+
+def _normalize_one_tag(tag):
+    """Run a single tag through punctuation normalization, length-bucket
+    replacements, and the always-on replacement bucket."""
+    tag = tag.replace('・', '_').replace('.', '_')
+    tag = _apply_replacements(tag, _bucket_for_length(len(tag)))
+    tag = _apply_replacements(tag, _BUCKET_ALWAYS)
+    return tag
+
+
 def Tag(resdicts):  # 回傳標籤
-    Taglist = resdicts
-    Taglist = [t for t in Taglist if "users入り" not in t]
-    Taglist = [t.translate(str.maketrans(
-        "", "", '"}{[]:<|>?/※\\⊂⊃*')) for t in Taglist]
+    """Normalize a list of artwork tags via the tag_rules.json bucket system."""
+    taglist = [t for t in resdicts if _USER_BUCKET_TAG not in t]
+    taglist = [t.translate(_FORBIDDEN_CHARS_TT) for t in taglist]
     try:
-        for i in range(0, len(Taglist)):
-            lenth = len(Taglist[i])
-            Taglist[i] = Taglist[i].replace('・', '_')
-            Taglist[i] = Taglist[i].replace('.', '_')
-            if lenth <= 5:
-                bucket = _BUCKET_LTE5
-            elif lenth > 5 and lenth <= 10:
-                bucket = _BUCKET_GT5LTE10
-            elif lenth > 10 and lenth < 20:
-                bucket = _BUCKET_GT10LT20
-            elif lenth >= 20:
-                bucket = _BUCKET_GTE20
-            else:
-                bucket = []
-            for old, new in bucket:
-                Taglist[i] = Taglist[i].replace(old, new)
-            for old, new in _BUCKET_ALWAYS:
-                Taglist[i] = Taglist[i].replace(old, new)
-        # print(Taglist)
-        return Taglist
+        return [_normalize_one_tag(t) for t in taglist]
     except Exception:
-        return Taglist
+        return taglist

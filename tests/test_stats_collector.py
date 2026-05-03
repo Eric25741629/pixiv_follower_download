@@ -79,6 +79,8 @@ def test_save_and_load(tmp_path):
     assert lt["lifetime_bytes_downloaded"] == 999
     assert lt["lifetime_files_downloaded"] == 1
     assert lt["cookie_request_counts"]["CookieA"] == 1
+    assert lt["lifetime_jxl_src"] == 100
+    assert lt["lifetime_jxl_dst"] == 50
 
 
 def test_save_accumulates(tmp_path):
@@ -103,6 +105,8 @@ def test_save_accumulates(tmp_path):
     assert lt["lifetime_files_downloaded"] == 2
     assert lt["lifetime_sessions"] == 2
     assert lt["cookie_request_counts"]["Cookie1"] == 2
+    assert lt["lifetime_jxl_src"] == 110
+    assert lt["lifetime_jxl_dst"] == 50
 
 
 def test_load_missing_file():

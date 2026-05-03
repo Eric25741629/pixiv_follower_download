@@ -377,22 +377,26 @@ class cookies_set:
             print("read cookies failed")
             return 0, 0, 0, [], []
 
-    def write_cookies(self):
-        alias_map = {}
+    @staticmethod
+    def _build_alias_map(entries):
+        """Build {cookie: alias} for entries with non-empty cookie strings."""
+        return {
+            x.get("cookie", ""): str(x.get("alias", "") or "").strip()
+            for x in entries if str(x.get("cookie", "")).strip()
+        }
+
+    def _resolve_cookie_pool_and_entries(self):
+        """Return (pool, entries, alias_map) — falls back through normalize_pool when entries are empty."""
         entries = self._normalize_cookie_entries(self.cookies)
         if entries:
             pool = [x.get("cookie", "") for x in entries if str(x.get("cookie", "")).strip()]
-            alias_map = {
-                x.get("cookie", ""): str(x.get("alias", "") or "").strip()
-                for x in entries if str(x.get("cookie", "")).strip()
-            }
         else:
             pool = self._normalize_cookie_pool(self.cookies)
             entries = self._normalize_cookie_entries(pool)
-            alias_map = {
-                x.get("cookie", ""): str(x.get("alias", "") or "").strip()
-                for x in entries if str(x.get("cookie", "")).strip()
-            }
+        return pool, entries, self._build_alias_map(entries)
+
+    def write_cookies(self):
+        pool, entries, alias_map = self._resolve_cookie_pool_and_entries()
         self.cookies_pool = pool
         self.cookies = pool[0] if pool else ""
         store = SettingsStore(self.path)
