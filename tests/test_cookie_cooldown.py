@@ -1,5 +1,7 @@
 from pathlib import Path
 import sys
+import queue
+import threading
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -10,6 +12,10 @@ from app.core.pixiv_thread import download_thread
 
 def _build_thread_stub():
     t = download_thread.__new__(download_thread)
+    t._q = queue.Queue()
+    t._pause_event = threading.Event()
+    t._pause_event.set()
+    t._stop_event = threading.Event()
     t.cookies = "PHPSESSID=dummy"
     t.cookie_pool = []
     t.url_meta = {}

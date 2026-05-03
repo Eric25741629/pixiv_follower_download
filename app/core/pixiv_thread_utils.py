@@ -34,7 +34,7 @@ def safe_json(res, *keys, default=None):
 def output_err(e):
     error_class = e.__class__.__name__
     detail = e.args[0] if e.args else ""
-    cl, exc, tb = sys.exc_info()
+    _, _, tb = sys.exc_info()
     if tb is None:
         return f"[{error_class}] {detail}"
     lastCallStack = traceback.extract_tb(tb)[-1]
@@ -163,41 +163,81 @@ def _parse_exist_pid_list(data):
     return set(str(x).replace("p0", "") for x in data if str(x).strip())
 
 
+def _augment_exist_pid_from_db(base_path, json_set):
+    """Union the JSON-derived set with the SQLite downloaded set, if available.
+
+    This catches PIDs that a previous worker marked as downloaded in the
+    DB but failed to flush to ``exist_pid.json`` (e.g. crashed mid-run).
+    Returns ``json_set`` unchanged when no DB exists, when SQLite import
+    fails, or when the DB is empty.
+    """
+    db_file = os.path.join(base_path, "metadata.sqlite3")
+    if not os.path.isfile(db_file):
+        return json_set
+    try:
+        from app.core.metadata_db import MetadataDB
+        db_set = MetadataDB(base_path).downloaded_set()
+    except Exception:
+        return json_set
+    if not db_set:
+        return json_set
+    return json_set | db_set
+
+
+def _read_exist_pid_json(json_path):
+    """Read the canonical exist_pid.json; returns the parsed set or None on miss."""
+    if not os.path.isfile(json_path):
+        return None
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    return _parse_exist_pid_list(data)
+
+
+def _read_legacy_exist_pid_set(legacy_json_path, txt_path):
+    """Read the legacy exist.json or existPID.txt formats. Returns set (possibly empty)."""
+    if os.path.isfile(legacy_json_path):
+        with open(legacy_json_path, encoding="utf-8") as f:
+            data = json.load(f)
+        return _parse_exist_pid_list(data)
+    if os.path.isfile(txt_path):
+        with open(txt_path, encoding="utf-8") as f:
+            return set(line.rstrip().replace("p0", "") for line in f if line.rstrip())
+    return set()
+
+
+def _trash_legacy_exist_pid_files(base_path, legacy_paths):
+    """Move any legacy exist_pid file variants to trash/."""
+    for old in legacy_paths:
+        if os.path.isfile(old):
+            trash_file(old, base_path)
+
+
 def load_exist_pid_set(base_path):
-    """Load exist_pid from the single canonical JSON file.
+    """Load exist_pid from the canonical JSON file, merged with the SQLite cache.
 
     Automatically migrates legacy formats (exist.json / existPID.txt) to
-    exist_pid.json on first run and moves old files to trash/.
+    exist_pid.json on first run and moves old files to trash/. When a
+    sibling ``metadata.sqlite3`` is present, its ``downloaded`` set is
+    unioned into the result so a JSON file lagging behind the DB doesn't
+    cause re-download.
     """
-    out = set()
     if not base_path:
-        return out
+        return set()
     json_path = os.path.join(base_path, "exist_pid.json")
     legacy_json_path = os.path.join(base_path, "exist.json")
     txt_path = os.path.join(base_path, "existPID.txt")
+    legacy_paths = [legacy_json_path, txt_path]
     try:
-        if os.path.isfile(json_path):
-            with open(json_path, encoding="utf-8") as f:
-                data = json.load(f)
-            out = _parse_exist_pid_list(data)
-            # Opportunistically trash lingering legacy files
-            for old in [legacy_json_path, txt_path]:
-                if os.path.isfile(old):
-                    trash_file(old, base_path)
-            return out
-        # Legacy migration: read whichever format exists, write exist_pid.json, trash old
-        if os.path.isfile(legacy_json_path):
-            with open(legacy_json_path, encoding="utf-8") as f:
-                data = json.load(f)
-            out = _parse_exist_pid_list(data)
-        elif os.path.isfile(txt_path):
-            with open(txt_path, encoding="utf-8") as f:
-                out = set(line.rstrip().replace("p0", "") for line in f if line.rstrip())
-        if out:
-            atomic_write_json(json_path, list(out), backup=False)
-            for old in [legacy_json_path, txt_path]:
-                if os.path.isfile(old):
-                    trash_file(old, base_path)
+        primary = _read_exist_pid_json(json_path)
+        if primary is not None:
+            out = primary
+            _trash_legacy_exist_pid_files(base_path, legacy_paths)
+        else:
+            out = _read_legacy_exist_pid_set(legacy_json_path, txt_path)
+            if out:
+                atomic_write_json(json_path, list(out), backup=False)
+                _trash_legacy_exist_pid_files(base_path, legacy_paths)
+        out = _augment_exist_pid_from_db(base_path, out)
     except Exception:
         out = set()
     return out
@@ -276,7 +316,6 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
     if cached_count == current_file_count and current_file_count > 0:
         scanned_pids = cached_pids
         scanned_files = current_file_count
-        used_cache = True
     else:
         # 檔案數量變化，重新掃描
         before_scan = set(merged)
@@ -292,7 +331,6 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
             "updated_at": datetime.datetime.now().isoformat()
         }
         _save_folder_file_count_cache(base_path, cache)
-        used_cache = False
 
         if base_path and changed_vs_disk:
             json_path = os.path.join(base_path, "exist_pid.json")
@@ -362,6 +400,30 @@ def _ensure_history_dir(file_path):
         return None
 
 
+def _next_unique_history_path(hist, base, ts):
+    """Return a backup path that doesn't exist yet (appends .1, .2, ... on collision)."""
+    dst = os.path.join(hist, f"{base}.{ts}")
+    if not os.path.exists(dst):
+        return dst
+    idx = 1
+    while True:
+        candidate = os.path.join(hist, f"{base}.{ts}.{idx}")
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
+
+
+def _prune_history_backups(hist, base, max_history):
+    """Keep at most ``max_history`` files in ``hist`` whose name starts with ``base.``."""
+    try:
+        files = [f for f in os.listdir(hist) if f.startswith(base + '.')]
+        files.sort(key=lambda x: os.path.getmtime(os.path.join(hist, x)), reverse=True)
+        while len(files) > max_history:
+            os.remove(os.path.join(hist, files.pop()))
+    except Exception:
+        pass
+
+
 def backup_file(file_path, max_history=10):
     try:
         if not os.path.exists(file_path):
@@ -369,26 +431,11 @@ def backup_file(file_path, max_history=10):
         hist = _ensure_history_dir(file_path)
         if not hist:
             return
-        ts = datetime.datetime.now().strftime('%Y%m%d')
         base = os.path.basename(file_path)
-        dst = os.path.join(hist, f"{base}.{ts}")
-        if os.path.exists(dst):
-            idx = 1
-            while True:
-                candidate = os.path.join(hist, f"{base}.{ts}.{idx}")
-                if not os.path.exists(candidate):
-                    dst = candidate
-                    break
-                idx += 1
+        ts = datetime.datetime.now().strftime('%Y%m%d')
+        dst = _next_unique_history_path(hist, base, ts)
         shutil.copy2(file_path, dst)
-        try:
-            files = [f for f in os.listdir(hist) if f.startswith(base + '.')]
-            files.sort(key=lambda x: os.path.getmtime(os.path.join(hist, x)), reverse=True)
-            while len(files) > max_history:
-                old_file = os.path.join(hist, files.pop())
-                os.remove(old_file)
-        except Exception:
-            pass
+        _prune_history_backups(hist, base, max_history)
     except Exception:
         pass
 
@@ -466,46 +513,40 @@ def atomic_write_json(file_path, obj, encoding='utf-8', backup=True):
             pass
 
 
-def read_pid_lines(file_path):
-    """Read a PID text file, yielding normalized non-empty PID strings.
+def _normalize_pid_lines(line_iter):
+    """Iterate ``line_iter``, yielding the normalized non-empty PIDs."""
+    out = []
+    for line in line_iter:
+        text = str(line).strip()
+        if not text:
+            continue
+        pid = normalize_pid(text)
+        if pid:
+            out.append(pid)
+    return out
 
-    Handles missing files, UTF-8 decode errors, and strips 'p0' prefix via normalize_pid.
+
+def read_pid_lines(file_path):
+    """Read a PID text file, returning normalized non-empty PID strings.
+
+    Handles missing files and UTF-8 decode errors (falls back to errors='ignore').
     Returns an empty list (not a generator) so callers can iterate multiple times.
     """
-    out = []
+    if not os.path.isfile(file_path):
+        return []
     try:
-        if not os.path.isfile(file_path):
-            return out
-        try:
-            opener = open(file_path, encoding='utf-8')
-        except Exception:
-            return out
-        with opener as f:
-            try:
-                lines = f.readlines()
-            except UnicodeDecodeError:
-                pass
-            else:
-                for line in lines:
-                    text = str(line).strip()
-                    if not text:
-                        continue
-                    pid = normalize_pid(text)
-                    if pid:
-                        out.append(pid)
-                return out
-        # fallback: re-open with errors='ignore'
-        with open(file_path, encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                text = str(line).strip()
-                if not text:
-                    continue
-                pid = normalize_pid(text)
-                if pid:
-                    out.append(pid)
-    except Exception:
+        with open(file_path, encoding='utf-8') as f:
+            lines = f.readlines()
+        return _normalize_pid_lines(lines)
+    except UnicodeDecodeError:
         pass
-    return out
+    except Exception:
+        return []
+    try:
+        with open(file_path, encoding='utf-8', errors='ignore') as f:
+            return _normalize_pid_lines(f)
+    except Exception:
+        return []
 
 
 def safe_read_json(file_path, default=None):
@@ -519,48 +560,203 @@ def safe_read_json(file_path, default=None):
         return default
 
 
+def _safe_emit(emit, html):
+    """Best-effort callback into the optional ``emit`` hook."""
+    if emit is None:
+        return
+    try:
+        emit(html)
+    except Exception:
+        pass
+
+
+def _list_history_backups(hist_dir, base):
+    """Return sibling backup files for ``base``, newest first."""
+    try:
+        candidates = [
+            os.path.join(hist_dir, n) for n in os.listdir(hist_dir)
+            if n.startswith(base + '.')
+        ]
+    except Exception:
+        return []
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates
+
+
+def _atomic_restore_file(file_path, value):
+    """Replace a corrupt JSON file with ``value`` via tmp + os.replace."""
+    try:
+        tmp = file_path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(value, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, file_path)
+    except Exception:
+        pass
+
+
+_NO_RECOVERY = object()
+
+
+def _try_recover_from_history(file_path, emit):
+    """Attempt to restore a corrupt JSON file from its history/ backups.
+
+    Returns the recovered value on success, or the sentinel
+    ``_NO_RECOVERY`` when no usable backup was found (so callers can
+    distinguish a legitimately recovered ``None`` from "nothing found").
+    """
+    hist_dir = os.path.join(os.path.dirname(file_path), 'history')
+    base = os.path.basename(file_path)
+    if not os.path.isdir(hist_dir):
+        _safe_emit(emit,
+            f"<p><font color='red'>[警告] 無 history/ 備份可還原，"
+            f"{base} 將以空值繼續。</font></p>"
+        )
+        return _NO_RECOVERY
+    for cand in _list_history_backups(hist_dir, base):
+        try:
+            with open(cand, encoding='utf-8') as f:
+                value = json.load(f)
+        except Exception:
+            continue
+        _atomic_restore_file(file_path, value)
+        n = len(value) if isinstance(value, (dict, list)) else 0
+        _safe_emit(emit,
+            f"<p><font color='green'>[還原] 已從 "
+            f"history/{os.path.basename(cand)} 還原 {n} 筆</font></p>"
+        )
+        return value
+    _safe_emit(emit,
+        f"<p><font color='red'>[警告] history/ 內所有 {base} 備份"
+        f"都無法解析，將以空值繼續。</font></p>"
+    )
+    return _NO_RECOVERY
+
+
+def read_json_with_recovery(file_path, default=None, emit=None):
+    """Read a JSON file; on parse failure, try to auto-recover from
+    the latest valid backup in ``history/`` next to it.
+
+    Returns ``(value, status)`` where status is one of:
+      'missing'   — file doesn't exist; returned default
+      'ok'        — file parsed cleanly
+      'recovered' — file was corrupt; restored from history/<name>.<...>
+      'corrupt'   — file was corrupt and no usable backup found
+
+    ``emit`` is an optional callback ``emit(html_message)`` for surfacing
+    recovery actions to the user (e.g., the worker thread's _q.put).
+    """
+    if not os.path.isfile(file_path):
+        return default, 'missing'
+    try:
+        with open(file_path, encoding='utf-8') as f:
+            return json.load(f), 'ok'
+    except Exception as parse_err:
+        _safe_emit(emit,
+            f"<p><font color='red'>[警告] {os.path.basename(file_path)} "
+            f"解析失敗（{type(parse_err).__name__}），嘗試從 history/ 還原...</font></p>"
+        )
+        recovered = _try_recover_from_history(file_path, emit)
+        if recovered is _NO_RECOVERY:
+            return default, 'corrupt'
+        return recovered, 'recovered'
+
+
+def _strip_cookie_prefix(text):
+    """Drop the leading ``Cookie:`` prefix some users paste verbatim."""
+    if text.lower().startswith("cookie:"):
+        return text.split(":", 1)[1].strip()
+    return text
+
+
+def _parse_cookie_entry(item):
+    """Convert one raw input (str or dict) into a normalised entry dict.
+
+    Returns ``None`` for empty / blank inputs so the caller can skip them.
+    """
+    if isinstance(item, dict):
+        text = str(item.get("cookie", "") or "").strip()
+        alias = str(item.get("alias", "") or "").strip()
+        status = str(item.get("status", "") or "").strip()
+        last_tested_at = item.get("last_tested_at", None)
+    else:
+        text = str(item or "").strip()
+        alias = ""
+        status = ""
+        last_tested_at = None
+
+    if not text:
+        return None
+    text = _strip_cookie_prefix(text)
+    if not text:
+        return None
+
+    entry = {"cookie": text, "alias": alias}
+    if status:
+        entry["status"] = status
+    if last_tested_at is not None:
+        entry["last_tested_at"] = last_tested_at
+    return entry
+
+
+def _merge_duplicate_entry(existing, duplicate):
+    """Carry alias / status / last_tested_at forward when the dedupe target is missing them."""
+    alias_text = str(duplicate.get("alias", "") or "").strip()
+    if alias_text and not str(existing.get("alias", "")).strip():
+        existing["alias"] = alias_text
+    if "status" in duplicate and not existing.get("status"):
+        existing["status"] = duplicate["status"]
+    if "last_tested_at" in duplicate and existing.get("last_tested_at") is None:
+        existing["last_tested_at"] = duplicate["last_tested_at"]
+
+
+def _dedupe_cookie_entries(entries):
+    """Collapse entries with the same cookie string, merging metadata first-wins."""
+    deduped = []
+    seen = {}
+    for item in entries:
+        cookie_text = str(item.get("cookie", "") or "").strip()
+        if not cookie_text:
+            continue
+        if cookie_text in seen:
+            _merge_duplicate_entry(deduped[seen[cookie_text]], item)
+            continue
+        seen[cookie_text] = len(deduped)
+        new_entry = {
+            "cookie": cookie_text,
+            "alias": str(item.get("alias", "") or "").strip(),
+        }
+        if "status" in item:
+            new_entry["status"] = item["status"]
+        if "last_tested_at" in item:
+            new_entry["last_tested_at"] = item["last_tested_at"]
+        deduped.append(new_entry)
+    return deduped
+
+
+def _fill_missing_aliases(entries, alias_map):
+    """Populate empty ``alias`` fields from a ``{cookie: alias}`` lookup."""
+    if not isinstance(alias_map, dict) or not alias_map:
+        return
+    for entry in entries:
+        if entry.get("alias"):
+            continue
+        entry["alias"] = str(alias_map.get(entry.get("cookie", ""), "") or "").strip()
+
+
 def normalize_cookie_entries(raw_value, alias_map=None):
     """Normalise any raw cookie input into a deduplicated list of {cookie, alias} dicts.
 
     alias_map: optional {cookie_str: alias_str} dict to fill in aliases that are not
     already embedded in the raw entries (used by the GUI cookie-persistence layer).
     """
-    entries = []
     if isinstance(raw_value, (list, tuple, set)):
         candidates = list(raw_value)
     else:
         candidates = [raw_value]
-    for item in candidates:
-        alias = ""
-        if isinstance(item, dict):
-            text = str(item.get("cookie", "") or "").strip()
-            alias = str(item.get("alias", "") or "").strip()
-        else:
-            text = str(item or "").strip()
-        if not text:
-            continue
-        if text.lower().startswith("cookie:"):
-            text = text.split(":", 1)[1].strip()
-        if text:
-            entries.append({"cookie": text, "alias": alias})
-    deduped = []
-    seen = {}
-    for item in entries:
-        cookie_text = str(item.get("cookie", "") or "").strip()
-        alias_text = str(item.get("alias", "") or "").strip()
-        if not cookie_text:
-            continue
-        if cookie_text in seen:
-            idx = seen[cookie_text]
-            if alias_text and not str(deduped[idx].get("alias", "")).strip():
-                deduped[idx]["alias"] = alias_text
-            continue
-        seen[cookie_text] = len(deduped)
-        deduped.append({"cookie": cookie_text, "alias": alias_text})
-    if isinstance(alias_map, dict) and alias_map:
-        for entry in deduped:
-            if not entry.get("alias"):
-                entry["alias"] = str(alias_map.get(entry.get("cookie", ""), "") or "").strip()
+
+    parsed = [e for e in (_parse_cookie_entry(item) for item in candidates) if e]
+    deduped = _dedupe_cookie_entries(parsed)
+    _fill_missing_aliases(deduped, alias_map)
     return deduped
 
 
@@ -614,6 +810,7 @@ def format_cookie_usage_summary(cookie_usage_counts, cookie_pool=None, alias_map
         return "未使用 Cookie"
 
 
+# Deprecated: superseded by AccountScheduler per-account cooldown. Kept for import compat.
 def cookie_speed_divisor(cookie_pool):
     """Speed multiplier for multi-cookie pool: n=1→1.0x, n=2→1.6x … max 4.0x."""
     try:
@@ -625,6 +822,7 @@ def cookie_speed_divisor(cookie_pool):
     return min(4.0, 1.0 + 0.6 * float(n - 1))
 
 
+# Deprecated: superseded by AccountScheduler per-account cooldown. Kept for import compat.
 def apply_cookie_pool_speedup(delay, cookie_pool):
     """Reduce delay proportionally to cookie pool size."""
     try:

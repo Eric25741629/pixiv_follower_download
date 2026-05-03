@@ -3,6 +3,7 @@ name = "pixiv-img-download"
 version = "0.1.0"
 description = "PyQt5 desktop app for scraping Pixiv following lists, fetching artwork URLs, and downloading images with optional JXL post-processing."
 requires-python = ">=3.10"
+dependencies = ["flet>=0.21.0"]
 
 # Runtime deps deliberately not pinned here — managed via the conda env (pixiv_env).
 # This block exists for tooling discovery, not as a build manifest.

@@ -2,16 +2,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Before touching `app/gui/`, `app/core/thread_*.py`, or anything Flet-related,
+> read `.claude/skills/flet-0-84-pitfalls/SKILL.md`.** It documents every API
+> rename, threading hazard, and dialog-system change that bit during the
+> PyQt5 → Flet 0.84 migration.
+
 ## Commands
 
-Run the app:
+Run the app (desktop):
 ```bash
 python main.py
 ```
 
-Regenerate the Qt UI backup from the single source `test.ui` (only for reference; the app loads `.ui` directly):
+Run the app (web browser):
 ```bash
-python uimake.py    # pyuic5 -o trash/Ui2.py test.ui
+flet run app/gui/flet_app.py --web
 ```
 
 Tests use `pytest` with one custom marker `integration` (configured in `pyproject.toml` under `[tool.pytest.ini_options]`) for tests that need network/real credentials.
@@ -36,19 +41,25 @@ Reports from `Phase 24 baseline` and `Phase 26 final` live under `reports/`.
 
 ## Architecture
 
-This is a PyQt5 desktop app that scrapes Pixiv. The high-level pipeline is a 4-step workflow (`Step 1: following → Step 2: PIDs → Step 3: artwork URLs → Step 4: download`) which can also be chained via `Run All`.
+This is a Flet (Material 3) desktop/web app that scrapes Pixiv. The high-level pipeline is a 4-step workflow (`Step 1: following → Step 2: PIDs → Step 3: artwork URLs → Step 4: download`) which can also be chained via `Run All`. The GUI is completely Qt-free; all worker threads use `threading.Thread` and communicate via `queue.Queue`.
 
 ### Layered package layout (`app/`)
 
 The canonical code lives under `app/` in three layers:
 
-- `app/entry/main.py` — Qt bootstrap. Creates the `QApplication`, applies `qfluentwidgets` light theme if available, instantiates `MainWindow_controller`, then calls `window.setup_control()`.
-- `app/gui/` — Qt UI layer.
-  - `controller.py` defines `MainWindow_controller`, a `FramelessMainWindow` subclass that loads `test.ui` at runtime via `uic.loadUi(...)` (no generated `Ui_*` class is imported in production; `trash/Ui2.py` is a reference backup only). All `on_<objectName>_clicked` slots and cookie-pool management live here.
-  - `run_actions.py` is the workflow orchestrator. `start_get_following` / `start_get_pid` / `start_get_url` / `start_download` / `start_all` / `continue_all(num)` each build a `QThread` from `app.core.pixiv_thread`, wire its signals, and start it. The controller delegates button handlers into these.
-  - `user_info.py` contains persistence adapters (`Userdata_controller`, `othersettings`, `cookies_set`, `logging_mode_set`, `userpass`) that read/write JSON under `%APPDATA%/pixiv_download/`.
-- `app/core/` — network + heavy lifting (no Qt UI imports beyond `QThread`).
-  - `pixiv_thread.py` holds the long-running workers as `QThread` subclasses: `get_following`, `get_pixiv_author_imgID_Thread`, `get_img_url_thread`, `download_thread`, `test_thread`. These are what `run_actions` instantiates.
+- `app/entry/main.py` — Flet bootstrap. Calls `ft.app(target=flet_main)` where `flet_main` is imported from `app.gui.flet_app`.
+- `app/gui/` — Flet UI layer (no Qt imports anywhere in this directory).
+  - `flet_app.py` defines `main(page: ft.Page)`. Builds the `NavigationRail` layout, instantiates `MainView` / `SettingsView` / `CookiesView`, creates the `event_q: queue.Queue`, wires `EventDispatcher`, and calls `page.run_thread(disp.run)`.
+  - `dispatcher.py` — `EventDispatcher` polls `queue.Queue` every 50 ms via a background thread started with `page.run_thread`. Routes typed `WorkerEvent` payloads to registered handler callbacks which then call `page.update()`.
+  - `views/main_view.py` — step buttons (1-4, Run All), log output panel, progress bar, countdown display, pause/resume/stop controls.
+  - `views/settings_view.py` — download path, filter rules (ban/must tags, like threshold), wait-range spinners, JXL options.
+  - `views/cookies_view.py` — cookie pool list, alias editing, add/remove/test-validity actions.
+  - `log_format.py` — `html_to_spans()` converts HTML log lines (e.g. `<font color='red'>`) to `ft.TextSpan` lists for the Flet `ft.Text` widget.
+  - `user_info.py` — persistence adapters (`Userdata_controller`, `othersettings`, `cookies_set`, `logging_mode_set`, `userpass`) that read/write JSON under `%APPDATA%/pixiv_download/`. No longer Qt-dependent.
+- `app/core/` — network + heavy lifting (completely Qt-free).
+  - `pixiv_thread_base.py` — `PauseableThread(threading.Thread)` base class with `pause()`, `resume()`, `stop()`, and `countdown()`. Pushes `WorkerEvent` objects onto a `queue.Queue` instead of emitting Qt signals.
+  - `worker_event.py` — `WorkerEvent` frozen dataclass with fields `kind: str` and `data: object`.
+  - `thread_following.py`, `thread_pid_scan.py`, `thread_url_fetch.py`, `thread_download.py` — the four worker threads, each extending `PauseableThread`. Instantiated directly by the view layer; the queue they share with the dispatcher is passed in at construction time.
   - `pixiv_api.py` wraps Pixiv HTTP endpoints, cookie handling, and response parsing.
   - `pixiv_thread_utils.py` is a helpers module: `atomic_write_json/text`, `normalize_pid`, `fetch_with_cookie_retry`, diagnostic event logging, PID cache sync.
   - `safe_io.py` provides atomic write + history-based backup (keeps latest 10 copies in a sibling `history/` directory).
@@ -56,19 +67,14 @@ The canonical code lives under `app/` in three layers:
 
 ### Top-level shim files
 
-Several files at the repository root are thin re-exports that keep legacy absolute imports working — always edit the `app/` version, not the shim:
+A few files at the repository root are thin re-exports that keep legacy absolute imports working — always edit the `app/` version, not the shim:
 
 - `main.py` → `app.entry.main`
-- `controller.py` → `app.gui.controller`
 - `user_info.py` → `app.gui.user_info`
 - `tag_edit.py` → `app.core.tag_edit`
 - `update_selenium.py` → `app.core.update_selenium`
 
 Note: the root `pixiv_api.py`, `pixiv_thread.py`, and `download_img.py` are still standalone copies (not shims) — the `app/core/*.py` versions are the ones loaded through `main.py → app.entry.main`. When in doubt, trace from `app/entry/main.py`; modules inside `app.core` import `from pixiv_api import *` and `import tag_edit` as bare names (not `app.core.*`), so `sys.path` must include the repo root (tests do this explicitly; `main.py` inherits it from being run at the repo root).
-
-### UI source of truth
-
-`test.ui` (Qt Designer) is the sole UI structure source. `controller.py` loads it with `uic.loadUi((repo_root / "test.ui"))` at `__init__` time, so widget object names in `.ui` are used directly as attributes (e.g. `self.ui.like_num`, `self.ui.cookies_input`, `self.ui.settings_tabs`, `self.ui.jxl_enable`). Any `objectName` change in `test.ui` must be mirrored in `controller.py`, `run_actions.py`, and `user_info.py` (see `UI_REFACTOR_IMPLEMENTATION_PLAN.md`). Do not hand-edit `trash/Ui2.py`; regenerate it with `uimake.py` if needed.
 
 ### Runtime data locations
 
@@ -76,14 +82,31 @@ All persisted settings and progress live under `%APPDATA%/pixiv_download/` (e.g.
 
 ### JXL post-processing
 
-`download_thread` optionally converts downloaded images to JPEG XL using an external `cjxl.exe`. `run_actions._find_default_cjxl_path()` searches known Windows paths (`~/Downloads/jxl*/bin/cjxl.exe`) as fallback; the UI field `jxl_cjxl_path` overrides it; persisted `othersettings.json.jxl_*` keys are the final fallback. Keep behavior optional — absence of `cjxl.exe` must not break downloads (`tests/test_jxl_fallback.py`).
+`thread_download` optionally converts downloaded images to JPEG XL using an external `cjxl.exe`. `_find_default_cjxl_path()` in `app/core/thread_download.py` searches known Windows paths (`~/Downloads/jxl*/bin/cjxl.exe`) as fallback; the settings view field `jxl_cjxl_path` overrides it; persisted `othersettings.json.jxl_*` keys are the final fallback. Keep behavior optional — absence of `cjxl.exe` must not break downloads (`tests/test_jxl_fallback.py`).
 
 ### Cookie pool
 
-The app supports multiple cookies in rotation. `MainWindow_controller` owns `cookies_pool` (list[str]) and `_cookie_alias_map` / `_cookie_status_map`. Entries are normalized (strip `Cookie:` prefix, dedupe) in both `controller._normalize_cookie_pool` and `run_actions._get_cookie_payload`; downloader threads record per-PID cookie usage in `_pid_cookie_used`, which takes priority over `url_meta[pid].requires_cookie` (see `tests/test_cookie_cooldown.py`).
+The app supports multiple cookies in rotation. The cookies view owns `cookies_pool` (list[str]) and `_cookie_alias_map` / `_cookie_status_map`. Entries are normalized (strip `Cookie:` prefix, dedupe) before being stored and passed to threads; downloader threads record per-PID cookie usage in `_pid_cookie_used`, which takes priority over `url_meta[pid].requires_cookie` (see `tests/test_cookie_cooldown.py`).
+
+### Per-account cooldown + proxy binding (Steps 2/3/4)
+
+`AccountScheduler` (`app/core/account_scheduler.py`) is a single-consumer round-robin state machine that gates HTTP work behind a per-account cooldown. Each `AccountState` holds `(cookie, alias, proxy_url, cooldown_until, disabled_reason)`; `proxies` property returns the `requests`-compatible dict via `app/core/proxy_utils.to_requests_proxies`. Workers in Steps 2/3/4 call `_acquire_account()` (blocks until next available) before each work unit and `_release_account(acc, ok=...)` after; `ok=False` (raised by `ProxyError` / `ConnectionError`) marks that cookie disabled for the entire run.
+
+On a `(ProxyError, ConnectTimeout, ConnectionError)` raised inside the four scheduler-aware call sites (Steps 2/3/4), the worker retries on the **same account** up to **5 attempts total** with a fixed **60 s** wait between attempts (constants `NETWORK_RETRY_ATTEMPTS` and `NETWORK_RETRY_WAIT_SEC` in `app/core/pixiv_thread_base.py`). The retry is implemented in `PauseableThread._run_with_network_retry`. Only after all 5 attempts fail does the cookie get disabled via `release(ok=False)`. The 60 s wait is interruptible by `stop_event` and skipped during pause (paused time does not count toward the budget).
+
+Settings keys driving this:
+- `performance.pid_cooldown_avg` — single live-adjustable value (slider in settings UI). Per-account cooldown is the deterministic `avg × ln(N+1)` seconds (no jitter on this), where N is active account count. Randomness lives on a throughput gate inside `acquire()`: each successful pickup advances `next_emit_at` by `throughput × random(0.9, 1.1)` where `throughput = avg × ln(N+1) / N`. This bounds the inter-request gap to ±10% of throughput regardless of N, instead of the unbounded variance you get from per-account jitter. Initial per-account cooldowns are staggered by one throughput interval so the first round paces correctly and the UI countdown shows "next request in X seconds". `AccountScheduler.average_cooldown()` returns the throughput. The settings UI warns when `avg < 30`.
+- `auth.proxy_pool: list[str]` — multi-line proxy list edited in the settings "Proxy 設定" tile (`http://`, `https://`, `socks5://` URLs accepted; auto-detected via scheme).
+- `auth.cookie_proxy_map: dict[cookie_str, proxy_url | None]` — bound in the cookies view's "Proxy 綁定" dropdown column. `None` = use local IP. Same account always uses same IP (hard contract).
+
+`RunController._build_scheduler` (`app/gui/run_actions.py`) wires the scheduler from settings before launching n=2/3/4 threads; n=1 (`thread_following`) does not use a scheduler. The scheduler reads `pid_cooldown_avg` live (lambda over `_store()`) so a UI slider change takes effect on the next `release()`.
+
+`pixiv_api.make_session(proxy_url)` builds a `requests.Session` with the bound proxy; `Pixiv_info(..., session=...)` keyword-only arg routes traffic through it. Step 2 (`thread_pid_scan`) passes `proxies=acc.proxies` directly to `requests.get`; Step 4 (`thread_download`) shares one session per PID across all multi-page downloads. ProxyError must propagate to the worker's release boundary — `Pixiv_info`, `gif_download`, `jpg_download`, `get_download_url`, and `thread_no_use_seleium_get_pid` all re-raise `(ProxyError, ConnectTimeout, ConnectionError)` before their broad `except Exception` handlers.
+
+Deprecated: `cookie_speed_divisor` and `apply_cookie_pool_speedup` in `pixiv_thread_utils.py` are superseded by `AccountScheduler` and kept only for import compat.
 
 ## Conventions worth knowing
 
 - User-facing strings and log/output messages are Traditional Chinese; keep that style when touching UI.
-- Workers extend `QThread`; never call network code on the GUI thread. `run_actions._connect_common` is the standard place to wire `countdown`, `timechanged`, and `thenext` signals.
+- Workers extend `PauseableThread` (which extends `threading.Thread`); never call network code on the GUI thread. Workers push `WorkerEvent(kind=..., data=...)` onto the shared `queue.Queue`; `EventDispatcher` routes them to the correct handler on the Flet event loop.
 - Writes to shared state files go through `safe_io.atomic_write_*` or `pixiv_thread_utils.atomic_write_*`, not raw `open(..., "w")`, to survive interrupted runs.

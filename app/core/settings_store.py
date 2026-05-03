@@ -23,6 +23,7 @@ DEFAULTS = {
         "rule_like_1": 0,
         "rule_tag_2": "",
         "rule_like_2": 0,
+        "filename_template": "",
     },
     "filter": {
         "pass_tag": False,
@@ -35,10 +36,12 @@ DEFAULTS = {
     "directory": {
         "create_dir": False,
         "no_R18G_dir": False,
+        "no_R18_dir": False,
         "ai_gen_dir": False,
     },
     "performance": {
         "single_thread_mode": False,
+        "pid_cooldown_avg": 35,
         "pid_wait_min": 10,
         "pid_wait_max": 60,
         "pid_wait_nocookie_min": 1,
@@ -60,6 +63,8 @@ DEFAULTS = {
         "cookies_pool": [],
         "cookies_aliases": {},
         "cookies_entries": [],
+        "proxy_pool": [],
+        "cookie_proxy_map": {},
     },
 }
 
@@ -155,6 +160,18 @@ class SettingsStore:
             raw_section = raw.get(section_key)
             if isinstance(raw_section, dict):
                 merged[section_key] = {**default_section, **raw_section}
+        # Migration: derive pid_cooldown_avg from old pid_wait_min/max if absent.
+        raw_perf = raw.get("performance", {})
+        if isinstance(raw_perf, dict) and "pid_cooldown_avg" not in raw_perf:
+            if "pid_wait_min" in raw_perf or "pid_wait_max" in raw_perf:
+                try:
+                    old_min = int(raw_perf.get("pid_wait_min", 10))
+                    old_max = int(raw_perf.get("pid_wait_max", 60))
+                    avg = (old_min + old_max) // 2
+                    avg = max(5, min(300, avg))
+                    merged["performance"]["pid_cooldown_avg"] = avg
+                except (TypeError, ValueError):
+                    pass
         return merged
 
     def _read_legacy(self, fname):
@@ -203,6 +220,7 @@ class SettingsStore:
         merged["directory"].update({
             "create_dir": bool(d.get("create_dir", False)),
             "no_R18G_dir": bool(d.get("no_R18G_dir", False)),
+            "no_R18_dir": bool(d.get("no_R18_dir", False)),
             "ai_gen_dir": bool(d.get("ai_gen_dir", False)),
         })
         merged["performance"].update({

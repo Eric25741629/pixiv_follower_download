@@ -189,3 +189,138 @@ def test_migration_missing_files_are_ignored(tmp_path):
     assert (tmp_path / "settings.json").exists()
     data = _read_settings(tmp_path)
     assert data["filter"]["pass_tag"] is True
+
+
+# --- new tests for pid_cooldown_avg, proxy_pool, cookie_proxy_map ---
+
+def test_defaults_include_pid_cooldown_avg(tmp_path):
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert "pid_cooldown_avg" in perf
+    assert perf["pid_cooldown_avg"] == 35
+
+
+def test_defaults_include_proxy_pool(tmp_path):
+    store = SettingsStore(str(tmp_path))
+    auth = store.get_section("auth")
+    assert "proxy_pool" in auth
+    assert auth["proxy_pool"] == []
+
+
+def test_defaults_include_cookie_proxy_map(tmp_path):
+    store = SettingsStore(str(tmp_path))
+    auth = store.get_section("auth")
+    assert "cookie_proxy_map" in auth
+    assert auth["cookie_proxy_map"] == {}
+
+
+def test_migration_derives_avg_from_min_max(tmp_path):
+    import json
+    data = {
+        "performance": {
+            "single_thread_mode": False,
+            "pid_wait_min": 20,
+            "pid_wait_max": 80,
+        },
+        "auth": {},
+    }
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps(data))
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    # average of 20+80 = 50
+    assert perf["pid_cooldown_avg"] == 50
+
+
+def test_migration_clamps_avg_to_300_max(tmp_path):
+    import json
+    data = {
+        "performance": {
+            "pid_wait_min": 500,
+            "pid_wait_max": 700,
+        },
+    }
+    (tmp_path / "settings.json").write_text(json.dumps(data))
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert perf["pid_cooldown_avg"] == 300
+
+
+def test_migration_clamps_avg_to_5_min(tmp_path):
+    import json
+    data = {
+        "performance": {
+            "pid_wait_min": 1,
+            "pid_wait_max": 1,
+        },
+    }
+    (tmp_path / "settings.json").write_text(json.dumps(data))
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert perf["pid_cooldown_avg"] == 5
+
+
+def test_round_trip_pid_cooldown_avg(tmp_path):
+    store = SettingsStore(str(tmp_path))
+    store.update_fields("performance", {"pid_cooldown_avg": 45})
+    perf = store.get_section("performance")
+    assert perf["pid_cooldown_avg"] == 45
+
+
+def test_round_trip_proxy_pool(tmp_path):
+    store = SettingsStore(str(tmp_path))
+    store.update_fields("auth", {"proxy_pool": ["http://1.1.1.1:80"]})
+    auth = store.get_section("auth")
+    assert auth["proxy_pool"] == ["http://1.1.1.1:80"]
+
+
+def test_round_trip_cookie_proxy_map(tmp_path):
+    store = SettingsStore(str(tmp_path))
+    store.update_fields("auth", {"cookie_proxy_map": {"abc": "socks5://x:1080"}})
+    auth = store.get_section("auth")
+    assert auth["cookie_proxy_map"] == {"abc": "socks5://x:1080"}
+
+
+def test_migration_skipped_when_no_legacy(tmp_path):
+    """Empty settings dir gets default avg, not migrated."""
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert perf["pid_cooldown_avg"] == 35
+
+
+def test_migration_skipped_when_avg_already_set(tmp_path):
+    """If pid_cooldown_avg is already saved, do not overwrite from min/max."""
+    import json
+    data = {
+        "performance": {
+            "pid_wait_min": 20,
+            "pid_wait_max": 80,
+            "pid_cooldown_avg": 100,
+        },
+    }
+    (tmp_path / "settings.json").write_text(json.dumps(data))
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert perf["pid_cooldown_avg"] == 100
+
+
+def test_migration_skipped_when_avg_is_default_value_but_explicitly_set(tmp_path):
+    """avg==35 saved explicitly: must NOT be overwritten by migration.
+
+    Guards against a refactor regression where the migration condition
+    becomes ``"pid_cooldown_avg" not in perf or perf == 35`` (which the
+    plan spec originally proposed but is wrong: 35 is also the DEFAULTS
+    value, making it indistinguishable from absence post-merge).
+    """
+    import json
+    data = {
+        "performance": {
+            "pid_wait_min": 20,
+            "pid_wait_max": 80,
+            "pid_cooldown_avg": 35,
+        },
+    }
+    (tmp_path / "settings.json").write_text(json.dumps(data))
+    store = SettingsStore(str(tmp_path))
+    perf = store.get_section("performance")
+    assert perf["pid_cooldown_avg"] == 35  # not 50
