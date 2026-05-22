@@ -40,6 +40,7 @@ class EventLog:
         self._current_date: str | None = None
         with self._lock:
             self._open_today_locked()
+            self._gc_old_files_locked()  # explicit startup scan
             self._write_locked("session.start", pid=os.getpid(),
                                python_version=sys.version.split()[0])
 
@@ -70,6 +71,7 @@ class EventLog:
         today = _today_key()
         if self._fh is not None and self._current_date == today:
             return
+        prev_date = self._current_date  # None on first open after construction or close()
         if self._fh is not None:
             try:
                 self._fh.close()
@@ -79,7 +81,8 @@ class EventLog:
         path = os.path.join(self._dir, _FILENAME_FMT.format(date=today))
         self._fh = open(path, "a", encoding="utf-8", buffering=1)
         self._current_date = today
-        self._gc_old_files_locked()
+        if prev_date is not None:  # only GC on real date-change rotation
+            self._gc_old_files_locked()
 
     def _gc_old_files_locked(self) -> None:
         if self._retention_days <= 0:
@@ -89,6 +92,8 @@ class EventLog:
             for name in os.listdir(self._dir):
                 if not (name.startswith("events-") and name.endswith(".jsonl")):
                     continue
+                if self._current_date and name == _FILENAME_FMT.format(date=self._current_date):
+                    continue  # never GC the currently-open file
                 path = os.path.join(self._dir, name)
                 try:
                     if os.path.getmtime(path) < cutoff:
