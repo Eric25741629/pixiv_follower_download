@@ -63,11 +63,12 @@ def _load_author_list() -> list[str]:
 class RunController:
     """Wires step buttons to worker threads and chains them in Run-All mode."""
 
-    def __init__(self, main_view, event_q: Queue, stats_collector=None):
+    def __init__(self, main_view, event_q: Queue, stats_collector=None, event_log=None):
         self._main_view = main_view
         self._event_q = event_q
         self._run_all_mode = False
         self._stats_collector = stats_collector
+        self._event_log = event_log
 
     def _backup_db(self) -> None:
         try:
@@ -75,7 +76,7 @@ class RunController:
             if not os.path.isfile(db_path):
                 return
             from app.core.metadata_db import MetadataDB
-            MetadataDB(_data_path()).backup_db(max_history=3)
+            MetadataDB(_data_path(), event_log=getattr(self, "_event_log", None)).backup_db(max_history=3)
         except Exception:
             pass
 
@@ -425,6 +426,7 @@ class RunController:
             load_exist_pid_set(path),  # PHASE-A: Phase B → MetadataDB(path).closed_artwork_set()
             bool(perf.get("single_thread_mode", False)),
             stats_collector=self._stats_collector,
+            event_log=self._event_log,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
@@ -507,6 +509,7 @@ class RunController:
             pid_wait_nocookie_max=int(perf.get("pid_wait_nocookie_max", 6)),
             special_like_rules=[],
             stats_collector=self._stats_collector,
+            event_log=self._event_log,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
@@ -558,6 +561,7 @@ class RunController:
             ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
             filename_template=str(dl.get("filename_template", "") or ""),
             stats_collector=self._stats_collector,
+            event_log=self._event_log,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t

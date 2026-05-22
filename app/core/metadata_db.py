@@ -1174,14 +1174,14 @@ class MetadataDB:
         return "".join(digits)
 
 
-def open_metadata_db(path, json_meta=None):
+def open_metadata_db(path, json_meta=None, *, event_log=None):
     """Open MetadataDB at ``path`` and migrate ``json_meta`` once on first run.
 
     Returns the opened DB, or ``None`` on any failure (caller treats DB as
     optional — every callsite guards with ``getattr(self, "_metadata_db", None)``).
     """
     try:
-        db = MetadataDB(path)
+        db = MetadataDB(path, event_log=event_log)
         if isinstance(json_meta, dict) and json_meta and db.meta_count() == 0:
             db.import_meta_dict(json_meta)
         return db

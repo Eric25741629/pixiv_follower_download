@@ -68,9 +68,11 @@ class get_img_url_thread(PauseableThread):
         special_like_rules=None,
         scheduler=None,
         stats_collector=None,
+        event_log=None,
     ):
         super().__init__(q, scheduler=scheduler)
         self._stats_collector = stats_collector
+        self._event_log = event_log
         self._init_basic_options(
             Author_list, Agent, cookies, exist_pid, ban_tag, must_tag,
             like_num, no_to_check, base_path, single_thread_mode, special_like_rules,
@@ -752,7 +754,7 @@ class get_img_url_thread(PauseableThread):
 
     def _init_metadata_db(self, json_meta):
         """Open the SQLite metadata cache; first-run import from JSON."""
-        return open_metadata_db(self.path, json_meta)
+        return open_metadata_db(self.path, json_meta, event_log=getattr(self, "_event_log", None))
 
     def _migrate_pending_pids_from_file(self):
         """First-run migration: import pictures_id.txt into pending_pids when DB is empty."""

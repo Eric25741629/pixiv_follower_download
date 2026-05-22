@@ -81,10 +81,12 @@ class download_thread(PauseableThread):
         jxl_effort=7,
         scheduler=None,
         stats_collector=None,
+        event_log=None,
         *legacy_args,
         **legacy_kwargs,
     ):
         super().__init__(q, scheduler=scheduler)
+        self._event_log = event_log
         self._init_basic_options(
             nogif, notag, notime, create_dir, download_path, cookies, agent,
             download_time, no_R18G_dir, no_R18_dir, single_thread_mode, stats_collector,
@@ -1995,7 +1997,7 @@ class download_thread(PauseableThread):
 
     def _init_metadata_db(self, json_meta):
         """Open the SQLite metadata cache and migrate JSON contents on first use."""
-        return open_metadata_db(self.path, json_meta)
+        return open_metadata_db(self.path, json_meta, event_log=getattr(self, "_event_log", None))
 
     def _emit_metadata_db_stats(self, stage="Step"):
         """Print a one-liner with current SQLite cache size."""

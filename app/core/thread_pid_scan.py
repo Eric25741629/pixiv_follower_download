@@ -31,7 +31,7 @@ pid_len = 0
 
 class get_pixiv_author_imgID_Thread(PauseableThread):
     '''抓取畫師作品下所有圖片的 Pixiv ID'''
-    def __init__(self, q, Author_list, Agent, path, cookies, exist_pid, single_thread_mode=False, scheduler=None, stats_collector=None):
+    def __init__(self, q, Author_list, Agent, path, cookies, exist_pid, single_thread_mode=False, scheduler=None, stats_collector=None, event_log=None):
         super().__init__(q, scheduler=scheduler)
         self.Author_list = Author_list
         self.Agent = Agent
@@ -47,6 +47,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         self._step2_early_skip_pids = set()
         self._step2_skip_lock = threading.Lock()
         self._stats_collector = stats_collector
+        self._event_log = event_log
         self._metadata_db = self._init_metadata_db()
         self._mirror_exist_pid_to_db()
         self._emit_metadata_db_stats(stage="Step2")
@@ -54,7 +55,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
     def _init_metadata_db(self):
         """Open the SQLite metadata cache (no JSON migration here — Step 2 doesn't read it)."""
         try:
-            return MetadataDB(self.path)
+            return MetadataDB(self.path, event_log=getattr(self, "_event_log", None))
         except Exception:
             return None
 

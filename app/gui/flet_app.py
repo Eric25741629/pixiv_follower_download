@@ -18,6 +18,7 @@ from app.gui.views.cookies_view import CookiesView
 from app.gui.views.stats_view import StatsView
 from app.core.stats_collector import StatsCollector
 from app.core.settings_store import SettingsStore
+from app.core.worker_event import WorkerEvent
 
 _log = get_logger("pixiv.gui")
 
@@ -62,6 +63,8 @@ def _save_theme_mode(mode: ft.ThemeMode) -> None:
 # new dispatcher picks up where the old one left off.
 _PERSISTENT_EVENT_Q: queue.Queue = queue.Queue()
 _PERSISTENT_STATS: StatsCollector | None = None
+_PERSISTENT_EVENT_LOG = None  # EventLog singleton; survives session GC
+_PERSISTENT_RECOVERY_COUNT: int = 0  # orphan events recovered at startup
 _PERSISTENT_ACTIVE_THREAD = None  # populated when a worker starts; cleared on finished/next=-1
 _PERSISTENT_LOG_BUFFER: deque = deque(maxlen=300)  # replayed into new main_view on reattach
 
@@ -153,6 +156,12 @@ def _emergency_flush(reason: str = "unknown") -> None:
             _log.exception("emergency wal_checkpoint failed")
         except Exception:
             pass
+    try:
+        el = _PERSISTENT_EVENT_LOG
+        if el is not None:
+            el.close()
+    except Exception:
+        pass
 
 
 def _install_crash_hooks() -> None:
@@ -213,18 +222,65 @@ def main(page: ft.Page) -> None:
     # Reuse the persistent queue + stats so a worker that started in the
     # previous session keeps emitting into the same Queue object after
     # session GC. The first main() call lazily-inits the stats collector.
-    global _PERSISTENT_STATS, _PERSISTENT_ACTIVE_THREAD
+    global _PERSISTENT_STATS, _PERSISTENT_ACTIVE_THREAD, _PERSISTENT_EVENT_LOG, _PERSISTENT_RECOVERY_COUNT
     event_q: queue.Queue = _PERSISTENT_EVENT_Q
     if _PERSISTENT_STATS is None:
         _PERSISTENT_STATS = StatsCollector()
     stats_collector = _PERSISTENT_STATS
+
+    # ── EventLog: one instance per process lifetime ───────────────────────
+    # Constructed only on the first main() call; subsequent calls (Flet
+    # session GC reattach) reuse the existing instance so we don't open a
+    # second writer to the same JSONL file.
+    if _PERSISTENT_EVENT_LOG is None:
+        _base_path = os.path.join(os.getenv("APPDATA", ""), "pixiv_download")
+        os.makedirs(_base_path, exist_ok=True)
+        try:
+            from app.core.event_log import EventLog, recover_tail
+            from app.core.metadata_db import MetadataDB as _MetadataDB
+            _el = EventLog(_base_path)
+            atexit.register(_el.close)
+            _PERSISTENT_EVENT_LOG = _el
+            # Auto recover_tail if the previous session was unclean.
+            # Recovery must run BEFORE any worker thread starts so it
+            # doesn't race with live DB writes.
+            if _el.last_session_was_unclean:
+                try:
+                    _rdb = _MetadataDB(_base_path)
+                    try:
+                        _n = recover_tail(_rdb, _el.log_dir)
+                    finally:
+                        _rdb.close()
+                    if _n > 0:
+                        _log.info(
+                            "event_log: recovered %d orphan events from previous session", _n
+                        )
+                        _PERSISTENT_RECOVERY_COUNT = _n
+                except Exception:
+                    _log.exception("event_log: recover_tail failed")
+        except Exception:
+            _log.exception("event_log: failed to initialise EventLog")
+
+    event_log = _PERSISTENT_EVENT_LOG
+
+    # Surface any crash-recovery count to the UI now that event_q exists.
+    _rc = _PERSISTENT_RECOVERY_COUNT
+    if _rc > 0:
+        _PERSISTENT_RECOVERY_COUNT = 0
+        try:
+            event_q.put(WorkerEvent(
+                "output",
+                f"<p><font color='gray'>偵測到上次未正常結束，已自動補齊 {_rc} 筆事件</font></p>",
+            ))
+        except Exception:
+            pass
 
     main_view = MainView(page, event_q)
     settings_view = SettingsView(page)
     cookies_view = CookiesView(page, event_q)
     stats_view = StatsView(page, stats_collector)
 
-    run_controller = RunController(main_view, event_q, stats_collector)
+    run_controller = RunController(main_view, event_q, stats_collector, event_log=event_log)
     main_view._run_controller = run_controller
 
     # If a worker survived the previous session GC, hand it to the new
@@ -586,6 +642,11 @@ def main(page: ft.Page) -> None:
             except Exception:
                 _log.exception("wal_checkpoint failed during shutdown")
         finally:
+            try:
+                if event_log is not None:
+                    event_log.close()
+            except Exception:
+                pass
             disp.stop()
             # Catch BaseException — asyncio.CancelledError is BaseException
             # in 3.8+ and was previously letting control skip os._exit(0),
