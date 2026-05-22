@@ -12,7 +12,6 @@ from app.core.event_log import EventLog, replay
 from app.core.metadata_db import MetadataDB, DB_FILENAME
 
 
-@pytest.mark.xfail(strict=False, reason="needs Task 6 (MetadataDB emit)")
 def test_replay_roundtrip_from_blank(tmp_path):
     src_dir = tmp_path / "src"
     src_dir.mkdir()
@@ -56,7 +55,6 @@ def test_replay_roundtrip_from_blank(tmp_path):
     assert src_p == dst_p
 
 
-@pytest.mark.xfail(strict=False, reason="needs Task 6 (MetadataDB emit + snapshot event)")
 def test_replay_skips_pre_snapshot_events(tmp_path):
     src_dir = tmp_path / "src"
     src_dir.mkdir()

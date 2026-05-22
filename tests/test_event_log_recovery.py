@@ -29,7 +29,6 @@ def test_recover_tail_zero_on_clean_shutdown(tmp_path):
         log2.close()
 
 
-@pytest.mark.xfail(strict=False, reason="needs Task 6 (MetadataDB emit)")
 def test_recover_tail_applies_orphan_events(tmp_path):
     log = EventLog(str(tmp_path))
     db = MetadataDB(str(tmp_path), event_log=log)
@@ -57,7 +56,6 @@ def test_recover_tail_applies_orphan_events(tmp_path):
         log2.close()
 
 
-@pytest.mark.xfail(strict=False, reason="needs Task 6 (MetadataDB emit)")
 def test_recover_tail_is_idempotent(tmp_path):
     log = EventLog(str(tmp_path))
     db = MetadataDB(str(tmp_path), event_log=log)

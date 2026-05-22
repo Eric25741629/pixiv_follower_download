@@ -166,6 +166,16 @@ class MetadataDB:
         self._initialized = False
         self._event_log = event_log
 
+    def _emit(self, kind: str, **fields) -> None:
+        """Forward to the attached event log, swallowing all errors so a
+        log-write failure never blocks a DB write (degraded mode)."""
+        if self._event_log is None:
+            return
+        try:
+            self._event_log.emit(kind, **fields)
+        except Exception:
+            pass
+
     # ── connection management ─────────────────────────────────────────────
 
     def _conn(self) -> sqlite3.Connection:
@@ -238,6 +248,11 @@ class MetadataDB:
                     os.remove(os.path.join(hist_dir, old))
                 except Exception:
                     pass
+            try:
+                size = os.path.getsize(dst_path)
+            except OSError:
+                size = 0
+            self._emit("snapshot", backup_path=os.path.relpath(dst_path, self._base), db_size=size)
             return True
         except Exception:
             return False
@@ -787,6 +802,12 @@ class MetadataDB:
             return
         rc_int = None if requires_cookie is None else (1 if requires_cookie else 0)
         tags_blob = None if tags is None else json.dumps(list(tags), ensure_ascii=False)
+        self._emit("artwork.upsert", pid=pid_key, discovered_at=discovered_at,
+                   page_count=page_count, like_count=like_count,
+                   tags=list(tags) if tags is not None else None,
+                   img_url_template=img_url_template,
+                   requires_cookie=requires_cookie,
+                   meta_updated_at=meta_updated_at, revoked_at=revoked_at)
         sql = (
             "INSERT INTO artworks (pid, discovered_at, page_count, like_count, "
             "tags, img_url_template, requires_cookie, meta_updated_at, revoked_at) "
@@ -818,6 +839,7 @@ class MetadataDB:
         rows = [(self._coerce_pid(p), ts) for p in (pids or ()) if self._coerce_pid(p)]
         if not rows:
             return 0
+        self._emit("artwork.discovered", pids=[r[0] for r in rows], discovered_at=ts)
         self._bulk_write(
             "INSERT OR IGNORE INTO artworks (pid, discovered_at) VALUES (?, ?)",
             rows,
@@ -859,6 +881,7 @@ class MetadataDB:
         pid_key = self._coerce_pid(pid)
         if not pid_key:
             return
+        self._emit("artwork.revoked", pid=pid_key, revoked_at=revoked_at)
         ts = revoked_at  # None -> use datetime('now')
         sql = (
             "UPDATE artworks SET revoked_at = COALESCE(?, datetime('now')) "
@@ -916,6 +939,10 @@ class MetadataDB:
             pidx = int(page_index)
         except (TypeError, ValueError):
             return
+        self._emit("page.upsert", pid=pid_key, page_index=pidx, status=status,
+                   url=url, file_path=file_path, file_size=file_size,
+                   downloaded_at=downloaded_at, last_attempted_at=last_attempted_at,
+                   failure_reason=failure_reason, bump_attempt=bump_attempt)
         attempt_delta = 1 if bump_attempt else 0
         sql = (
             "INSERT INTO pages (pid, page_index, status, url, file_path, "
@@ -1006,6 +1033,7 @@ class MetadataDB:
             clean.append((pid_key, pidx, status, url, file_path))
         if not clean:
             return 0
+        self._emit("pages.upsert_bulk", rows=[list(r) for r in clean])
         self._bulk_write(
             "INSERT OR IGNORE INTO pages "
             "(pid, page_index, status, url, file_path, attempt_count) "
