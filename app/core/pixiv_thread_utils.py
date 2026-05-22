@@ -224,6 +224,17 @@ def _trash_legacy_exist_pid_files(base_path, legacy_paths):
 def load_exist_pid_set(base_path):
     """Load exist_pid from the canonical JSON file, merged with the SQLite cache.
 
+    PHASE-A: this whole function (and its helpers ``_read_exist_pid_json``,
+    ``_read_legacy_exist_pid_set``, ``_trash_legacy_exist_pid_files``,
+    ``_augment_exist_pid_from_db``) is slated for removal in Phase B. The
+    Phase B replacement at call sites is::
+
+        MetadataDB(base_path).closed_artwork_set()
+
+    Step 4 already uses that directly (``thread_download._load_initial_exist_pid_set``);
+    Step 2/3 still go through here for compatibility while the disk scan
+    shadow-writes both stores.
+
     Automatically migrates legacy formats (exist.json / existPID.txt) to
     exist_pid.json on first run and moves old files to trash/. When a
     sibling ``metadata.sqlite3`` is present, its ``downloaded`` set is
@@ -303,12 +314,67 @@ def _save_folder_file_count_cache(base_path, cache):
         pass
 
 
+# ─── PHASE-A-EXIST-PID-MIGRATION ──────────────────────────────────────────
+# Plan (recorded so the cutover can be done in one focused PR later):
+#
+#   Phase A (current): JSON is still the canonical store; DB shadow-writes
+#                      keep metadata.sqlite3 in sync so externally-dropped
+#                      PIDs land in both places. Reads still go through
+#                      ``load_exist_pid_set`` (JSON ∪ DB).
+#   Phase B (future) : Switch all reads to ``db.closed_artwork_set()``,
+#                      delete the JSON write/read paths + the legacy
+#                      ``exist.json`` / ``existPID.txt`` fallbacks. Hunt
+#                      for "PHASE-A" comments to find every line that
+#                      should disappear or simplify.
+#
+# Every line in this module that's only kept for the JSON path is tagged
+# ``# PHASE-A`` — search for that token to enumerate the removal surface.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _shadow_write_exist_pid_to_db(base_path, scanned_pids):
+    """PHASE-A: mirror disk-scanned PIDs into metadata.sqlite3.
+
+    Best-effort sync so Phase B (DB-only reads) can be enabled by just
+    deleting the JSON write line — the DB will already have the data.
+    Lazily creates the DB file on first call; ``MetadataDB._conn()``
+    runs the schema bootstrap when the sqlite file is opened for the
+    first time. We must NOT gate on ``os.path.isfile(db_file)`` — a
+    fresh profile that runs Step 4 directly after pointing at an
+    existing download folder would silently lose every scanned PID
+    (step 4 reads ``closed_artwork_set()`` from the DB built moments
+    later by ``download_thread.__init__``).
+    """
+    base = str(base_path or "").strip()
+    if not base or not scanned_pids:
+        return
+    try:
+        from app.core.metadata_db import MetadataDB, mirror_exist_pid_set
+    except Exception:
+        return
+    db = None
+    try:
+        db = MetadataDB(base)
+        mirror_exist_pid_set(db, scanned_pids)
+    except Exception:
+        pass
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
 def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_pid=None, recursive=True):
     """
     同步 exist_pid 與下載資料夾，使用檔案數量快取來避免重複掃描。
     只有在資料夾檔案數量變化時才會重新掃描。
+
+    PHASE-A: writes scanned PIDs to BOTH exist_pid.json (canonical for now)
+    AND metadata.sqlite3 (shadow). Phase B will drop the JSON branch.
     """
-    disk_set = load_exist_pid_set(base_path)
+    disk_set = load_exist_pid_set(base_path)  # PHASE-A: JSON+DB union
     merged = set(disk_set)
     merged.update(normalize_pid_set(current_exist_pid))
 
@@ -322,39 +388,22 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
     cached_pids = set(cached_info.get("pids", []))
 
     # 如果檔案數量相同，使用快取的 PID 結果
-    if cached_count == current_file_count and current_file_count > 0:
+    used_cache = cached_count == current_file_count and current_file_count > 0
+    if used_cache:
         scanned_pids = cached_pids
         scanned_files = current_file_count
     else:
         # 檔案數量變化，重新掃描
-        before_scan = set(merged)
-        scanned_pids, scanned_files = scan_download_folder_for_pid_set(download_path, recursive=recursive)
-        merged.update(scanned_pids)
-        added_from_download = len(merged - before_scan)
-        changed_vs_disk = merged != disk_set
-
-        # 更新快取
+        scanned_pids, scanned_files = scan_download_folder_for_pid_set(
+            download_path, recursive=recursive,
+        )
         cache[download_path_norm] = {
             "file_count": current_file_count,
             "pids": list(scanned_pids),
-            "updated_at": datetime.datetime.now().isoformat()
+            "updated_at": datetime.datetime.now().isoformat(),
         }
         _save_folder_file_count_cache(base_path, cache)
 
-        if base_path and changed_vs_disk:
-            json_path = os.path.join(base_path, "exist_pid.json")
-            atomic_write_json(json_path, list(merged), backup=True)
-
-        return {
-            "merged_set": merged,
-            "scanned_files": scanned_files,
-            "scanned_pid_count": len(scanned_pids),
-            "added_from_download": added_from_download,
-            "changed_vs_disk": changed_vs_disk,
-            "used_cache": False,
-        }
-
-    # 使用快取的情況
     before_scan = set(merged)
     merged.update(scanned_pids)
     added_from_download = len(merged - before_scan)
@@ -362,7 +411,11 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
 
     if base_path and changed_vs_disk:
         json_path = os.path.join(base_path, "exist_pid.json")
-        atomic_write_json(json_path, list(merged), backup=True)
+        atomic_write_json(json_path, list(merged), backup=True)  # PHASE-A
+    # PHASE-A: shadow-write the scanned set (not merged — DB already has
+    # closed-artwork rows for every PID workers have downloaded; we only
+    # need to register externally-discovered ones).
+    _shadow_write_exist_pid_to_db(base_path, scanned_pids)
 
     return {
         "merged_set": merged,
@@ -370,7 +423,7 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
         "scanned_pid_count": len(scanned_pids),
         "added_from_download": added_from_download,
         "changed_vs_disk": changed_vs_disk,
-        "used_cache": True,
+        "used_cache": used_cache,
     }
 
 

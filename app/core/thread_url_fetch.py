@@ -1350,14 +1350,53 @@ class get_img_url_thread(PauseableThread):
         self._q.put(WorkerEvent("output", "<p><font color='green'>URL階段採用消費者隊列模式，PID 會在查詢後自動從 pictures_id.txt 移除</font></p>"))
         return task_queue
 
-    def _emit_loop_progress_log(self, pid, processed_count, every):
-        """Per-N-PID progress line during the URL fetch loop."""
-        if processed_count % every != 0:
-            return
+    def _emit_pid_detail_log(self, pid, processed_count):
+        """Per-PID detail line emitted after get_download_url resolves.
+
+        Pulls tag/like/pagecount/requires_cookie from self.url_meta[pid]
+        and the query source from pixiv_info.source. If url_meta has no
+        entry (revoked / exist_pid / network fail), emit a generic line so
+        every PID still produces visible output.
+        """
         try:
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='black'>URL階段進度：{processed_count + 1}/"
-                f"{self.pid_max} (PID {pid})</font></p>"))
+            pid_key = normalize_pid(pid) or str(pid)
+            meta = self.url_meta.get(pid_key) if isinstance(self.url_meta, dict) else None
+            if isinstance(meta, dict):
+                pinfo = meta.get("pixiv_info") if isinstance(meta.get("pixiv_info"), dict) else {}
+                source = pinfo.get("source") or "unknown"
+                source_label = {
+                    "cache": "快取", "network": "網路", "migrated": "舊資料",
+                    "skip": "略過", "unknown": "未知",
+                }.get(str(source), str(source))
+                like = meta.get("like", "?")
+                pagecount = meta.get("pagecount", "?")
+                tags = meta.get("tag", []) if isinstance(meta.get("tag", []), list) else []
+                tag_count = len(tags)
+                tag_preview = "、".join(str(t) for t in tags[:3])
+                if tag_count > 3:
+                    tag_preview += "…"
+                req = meta.get("requires_cookie", None)
+                req_label = "需要" if req is True else ("不需要" if req is False else "未知")
+                filter_pass = meta.get("filter_pass", None)
+                filter_reason = meta.get("filter_reason", "")
+                if filter_pass is False:
+                    reason_label = {
+                        "ban_tag": "命中封鎖標籤", "must_tag": "缺少必含標籤", "like": "愛心數不足",
+                    }.get(str(filter_reason), str(filter_reason) or "未通過")
+                    color = "orange"
+                    extra = f"，過濾未通過（{reason_label}）"
+                else:
+                    color = "black"
+                    extra = ""
+                tag_text = f"標籤 {tag_count} 個" + (f"（{tag_preview}）" if tag_preview else "")
+                self._q.put(WorkerEvent("output",
+                    f"<p><font color='{color}'>處理 PID {processed_count + 1}/{self.pid_max}："
+                    f"{pid_key}（來源={source_label}、愛心={like}、頁數={pagecount}、"
+                    f"{tag_text}、cookie={req_label}）{extra}</font></p>"))
+            else:
+                self._q.put(WorkerEvent("output",
+                    f"<p><font color='gray'>處理 PID {processed_count + 1}/{self.pid_max}："
+                    f"{pid_key}（無 url_meta 資料，可能已失效或已存在）</font></p>"))
         except Exception:
             pass
 
@@ -1415,7 +1454,6 @@ class get_img_url_thread(PauseableThread):
     def _run_processing_loop(self, task_queue):
         results = []
         processed_count = 0
-        progress_every = 100
         # 25 顆粒：100 太肉，崩潰時可能丟掉 5–10 分鐘工作；25 約 1–2 分鐘
         flush_every = 25
 
@@ -1425,14 +1463,14 @@ class get_img_url_thread(PauseableThread):
             except Exception:
                 break
 
-            self._emit_loop_progress_log(pid, processed_count, progress_every)
-
             if self._scheduler is not None:
                 one, stop = self._fetch_one_pid_via_scheduler(pid)
                 if stop:
                     break
             else:
                 one = self.get_download_url(self.path, self.Agent, 1, pid)
+
+            self._emit_pid_detail_log(pid, processed_count)
 
             results.append(self._normalize_loop_result(one))
 

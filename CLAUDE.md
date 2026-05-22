@@ -98,6 +98,14 @@ Helpers in `app/core/metadata_db.py`: `upsert_artwork`, `upsert_artworks` (bulk)
 
 **Legacy tables (`pids`, `downloaded`, `pending_urls`, `pending_pids`) are still written by shadow-write helpers** for one more transition phase. They no longer drive read decisions and will be dropped in a future revision. JSON / text files `exist_pid.json`, `all_url.txt`, `pictures_id.txt`, `err_url.txt` likewise persist for compatibility but the canonical state lives in SQLite.
 
+#### `exist_pid` DB-only migration (in progress — search `PHASE-A`)
+
+Phase A (current): `sync_exist_pid_with_download_folder` writes scanned PIDs to BOTH `exist_pid.json` AND `metadata.sqlite3` via `_shadow_write_exist_pid_to_db` → `mirror_exist_pid_set` → sentinel rows in `artworks` that `v_closed_artworks` picks up. Steps 2/3 still read `load_exist_pid_set(path)` (JSON ∪ DB). Step 4 already uses `db.closed_artwork_set()` directly.
+
+Phase B (planned): switch `run_actions._build_step2/_build_step3` to `MetadataDB(path).closed_artwork_set()`, drop the JSON `atomic_write_json` in `sync_exist_pid_with_download_folder`, delete `load_exist_pid_set` + its `_read_exist_pid_json` / `_read_legacy_exist_pid_set` / `_trash_legacy_exist_pid_files` / `_augment_exist_pid_from_db` helpers, and stop maintaining the `exist.json` / `existPID.txt` fallback paths.
+
+`grep PHASE-A` enumerates the migration surface — both the shadow-write hooks added in Phase A and the JSON-only branches that should disappear in Phase B.
+
 Migration utility: `python tools/db_migration.py [--dry-run]` (idempotent — re-running picks up nothing on a fresh DB). `python tools/dump_state.py` snapshots all sources as JSON for diff. `python tools/verify_consistency.py` cross-checks legacy vs new tables.
 
 ### JXL post-processing

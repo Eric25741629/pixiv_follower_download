@@ -422,7 +422,7 @@ class RunController:
             agent,
             path,
             self._attach_aliases(valid_cookies, auth),
-            load_exist_pid_set(path),
+            load_exist_pid_set(path),  # PHASE-A: Phase B → MetadataDB(path).closed_artwork_set()
             bool(perf.get("single_thread_mode", False)),
             stats_collector=self._stats_collector,
         )
@@ -496,7 +496,7 @@ class RunController:
             Author_list=authors,
             Agent=agent,
             cookies=self._attach_aliases(valid_cookies, auth),
-            exist_pid=load_exist_pid_set(path),
+            exist_pid=load_exist_pid_set(path),  # PHASE-A: Phase B → MetadataDB(path).closed_artwork_set()
             ban_tag=list(dl.get("ban_tag", [])),
             must_tag=list(dl.get("must_tag", [])),
             like_num=int(dl.get("like_num", 0)),
