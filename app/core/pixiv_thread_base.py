@@ -1,3 +1,4 @@
+import random as pyrandom
 import threading
 import queue as _queue
 import time
@@ -11,6 +12,7 @@ from app.core.pixiv_thread_utils import (
     format_cookie_usage_summary,
     normalize_cookie_entries,
     normalize_cookie_pool,
+    normalize_pid,
 )
 # Backward-compatible aliases — implementations live in pixiv_thread_utils
 _normalize_cookie_entries = normalize_cookie_entries
@@ -159,6 +161,101 @@ class PauseableThread(threading.Thread):
 
     def _on_stop_hook(self):
         pass
+
+    def __del__(self):
+        # Best-effort shutdown of a subclass-attached ThreadPoolExecutor.
+        # ``wait=False`` lets us return immediately; pending tasks finish
+        # on their own.  Swallow everything — __del__ on a dying interpreter
+        # cannot raise.
+        try:
+            executor = getattr(self, "executor", None)
+            if executor is not None:
+                executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+    def _record_cookie_usage(self, stage, pid, cookie_value):
+        """Increment the per-stage cookie-usage counter for ``cookie_value``
+        and return its display label.  Counts each PID once per stage; relies
+        on subclass-initialized ``_cookie_usage_counts`` / ``_cookie_usage_seen``
+        dicts (keyed by stage string)."""
+        stage_key = str(stage or "").strip().lower()
+        if stage_key not in self._cookie_usage_counts:
+            return ""
+        cookie_text = str(cookie_value or "").strip()
+        label = cookie_usage_label(cookie_text, self.cookie_pool, self._cookie_alias_map)
+        if not cookie_text:
+            return label
+        pid_key = normalize_pid(pid) or str(pid)
+        try:
+            seen = self._cookie_usage_seen.setdefault(stage_key, set())
+            if pid_key in seen:
+                return label
+            seen.add(pid_key)
+            counts = self._cookie_usage_counts.setdefault(stage_key, {})
+            counts[label] = int(counts.get(label, 0)) + 1
+        except Exception:
+            pass
+        return label
+
+    def _emit_cookie_usage_summary(self, stage, title):
+        """Push a one-line summary (e.g. ``[Step3 Cookie統計] foo×12 bar×3``)
+        of the per-stage usage counts to the worker queue."""
+        try:
+            stage_key = str(stage or "").strip().lower()
+            counts = self._cookie_usage_counts.get(stage_key, {}) if isinstance(self._cookie_usage_counts, dict) else {}
+            summary = format_cookie_usage_summary(counts, self.cookie_pool, self._cookie_alias_map)
+            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[{title}] {summary}</font></p>"))
+        except Exception:
+            pass
+
+    def _select_cookie_for_pid(self, pid):
+        """Pick a cookie for ``pid`` and cache it so the same PID always
+        retries with the same cookie.  Falls back to ``self.cookies`` when
+        the pool is empty.  Requires subclass-initialized
+        ``_pid_cookie_selection`` dict; the alias-map cache
+        ``_pid_cookie_alias_selection`` is updated when present."""
+        pid_key = normalize_pid(pid) or str(pid)
+        try:
+            if pid_key in self._pid_cookie_selection:
+                return self._pid_cookie_selection.get(pid_key, "")
+        except Exception:
+            pass
+        if self.cookie_pool:
+            selected = pyrandom.choice(self.cookie_pool)
+        else:
+            selected = str(self.cookies or "").strip()
+        try:
+            self._pid_cookie_selection[pid_key] = selected
+            alias_cache = getattr(self, "_pid_cookie_alias_selection", None)
+            if alias_cache is not None:
+                alias_cache[pid_key] = cookie_usage_label(selected, self.cookie_pool, self._cookie_alias_map)
+        except Exception:
+            pass
+        return selected
+
+    def _get_meta(self, pid_key):
+        """Return metadata for ``pid_key``: in-memory ``self.url_meta`` first,
+        then SQLite ``self._metadata_db`` lookup.  Returns ``{}`` when nothing
+        is known about the PID."""
+        pid_key = str(pid_key)
+        cached = self.url_meta.get(pid_key) if isinstance(getattr(self, "url_meta", None), dict) else None
+        if isinstance(cached, dict) and cached:
+            return cached
+        db = getattr(self, "_metadata_db", None)
+        if db is not None:
+            try:
+                meta = db.get_meta(pid_key)
+                if isinstance(meta, dict) and meta:
+                    return meta
+            except Exception:
+                pass
+        return {}
+
+    def _load_initial_url_meta(self):
+        """Default: empty dict.  Steps 3/4 use DB-on-demand reads via
+        ``_get_meta``; the in-memory dict is a write-through cache only."""
+        return {}
 
     def _sleep_with_countdown(self, delay):
         """Sleep with pause/stop support; emits countdown ticks."""

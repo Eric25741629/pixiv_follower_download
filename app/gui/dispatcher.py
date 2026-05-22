@@ -4,7 +4,10 @@ import queue
 import threading
 from typing import Any, Callable
 
+from app.core.app_logging import get_logger
 from app.core.worker_event import WorkerEvent
+
+_log = get_logger("pixiv.dispatcher")
 
 
 class EventDispatcher:
@@ -34,15 +37,31 @@ class EventDispatcher:
                     try:
                         handler(ev.data)
                     except Exception:
-                        pass
+                        _log.exception("handler %r raised", ev.type)
                 updated = True
         except queue.Empty:
             pass
         if updated:
             try:
                 self._page.update()
+            except RuntimeError as err:
+                # Flet GCs the session if the window is blurred for several
+                # minutes (observed: ~6 min). The page's underlying session
+                # becomes invalid and every page.update() then raises
+                # "An attempt to fetch destroyed session." A fresh main()
+                # starts a NEW dispatcher with a NEW page; the old one has
+                # nothing useful to do, so self-stop instead of spamming
+                # ~20 ERROR lines/second forever.
+                if "destroyed session" in str(err):
+                    _log.warning(
+                        "dispatcher self-stopping: session destroyed "
+                        "(new main() will spin up a fresh dispatcher)"
+                    )
+                    self._stop_event.set()
+                else:
+                    _log.exception("page.update() in dispatcher failed")
             except Exception:
-                pass
+                _log.exception("page.update() in dispatcher failed")
 
     async def run(self) -> None:
         while not self._stop_event.is_set():

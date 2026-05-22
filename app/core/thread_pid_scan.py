@@ -1,3 +1,4 @@
+import contextlib
 import time
 import json
 import os
@@ -7,7 +8,7 @@ import requests
 import random as pyrandom
 import threading
 from pixiv_api import *
-from app.core.metadata_db import MetadataDB
+from app.core.metadata_db import MetadataDB, emit_db_stats, mirror_exist_pid_set
 from app.core.worker_event import WorkerEvent
 from app.core.pixiv_thread_utils import (
     atomic_write_text,
@@ -59,39 +60,25 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
 
     def _mirror_exist_pid_to_db(self):
         """Best-effort copy of exist_pid into the SQLite cache."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            if self.exist_pid:
-                db.import_downloaded_set(self.exist_pid)
-        except Exception:
-            pass
+        mirror_exist_pid_set(getattr(self, "_metadata_db", None), self.exist_pid)
 
     def _emit_metadata_db_stats(self, stage="Step2"):
         """Print a one-liner with current SQLite cache size."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            meta_n = db.meta_count()
-            dl_n = db.downloaded_count()
-        except Exception:
-            return
-        try:
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[{stage} SQLite] metadata.sqlite3 載入 "
-                f"{meta_n} 筆 meta、{dl_n} 筆已下載</font></p>"
-            ))
-        except Exception:
-            pass
+        emit_db_stats(getattr(self, "_metadata_db", None), self._q, stage=stage)
 
     def flush_for_shutdown(self):
-        """Synchronously close SQLite cache for the window-close hook.
+        """Synchronously persist in-progress state and close SQLite for shutdown.
 
-        Step 2 doesn't own url_meta but does own a MetadataDB connection per
-        thread; close it so a clean checkpoint runs before os._exit(0).
+        Originally only closed the DB connection. Now also flushes any PIDs
+        the artist scan has accumulated in memory so a crash mid-run doesn't
+        lose them. Safe to call from any path (window close, crash hook,
+        atexit) — silent-failure throughout so it can't shadow the
+        triggering exception.
         """
+        try:
+            self._flush_step2_incremental(reason="shutdown")
+        except Exception:
+            pass
         db = getattr(self, "_metadata_db", None)
         if db is not None:
             try:
@@ -99,18 +86,37 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             except Exception:
                 pass
 
-    def __del__(self):
+    # 增量儲存：每 N 個作者完成後寫一次，保證崩潰時最多只丟 < 1 分鐘工作。
+    # 沒有 in-progress 收集（_collected_pids 還沒初始化）就直接 no-op。
+    _STEP2_INCREMENTAL_EVERY = 5
+
+    def _flush_step2_incremental(self, reason: str = "incremental") -> None:
+        """Best-effort incremental save of pictures_id + author_progress.
+
+        Safe to call from any thread (executor worker, main thread, crash
+        hook). All file writes go through atomic helpers; pictures_id is
+        merge-appended so concurrent callers can't truncate each other.
+        """
+        if not hasattr(self, "_collected_pids"):
+            return
+        lock = getattr(self, "_step2_flush_lock", None)
+        if lock is None:
+            return
+        if not lock.acquire(blocking=False):
+            return
         try:
-            executor = getattr(self, 'executor', None)
-            if executor is not None:
-                executor.shutdown(wait=False)
-        except Exception:
-            pass
-        try:
-            self.wait()
-        except Exception:
-            pass
-    
+            try:
+                progress_file = os.path.join(self.path, "author_progress.json")
+                self._persist_author_progress(progress_file)
+            except Exception:
+                pass
+            try:
+                self._write_step2_pictures_id([])
+            except Exception:
+                pass
+        finally:
+            lock.release()
+
     def _record_step2_cookie_usage(self, aid, cookie_value):
         cookie_text = str(cookie_value or "").strip()
         label = _cookie_usage_label(cookie_text, self.cookie_pool, self._cookie_alias_map)
@@ -258,6 +264,9 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         except Exception:
             self._collected_pids = []
             self._collected_pids_lock = threading.Lock()
+        # 增量寫入用：避免兩個 worker 同時 flush；用 try-acquire 跳過已在跑的呼叫
+        self._step2_flush_lock = threading.Lock()
+        self._step2_artists_done = 0
 
     def _load_author_progress(self):
         progress_file = os.path.join(self.path, 'author_progress.json')
@@ -323,11 +332,31 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                         self._q.put(WorkerEvent("output", f"<p><font color='red'>畫師 {aid} 取得 PID 失敗：{e}</font></p>"))
                     except Exception:
                         pass
+                self._step2_artists_done += 1
+                if self._step2_artists_done % self._STEP2_INCREMENTAL_EVERY == 0:
+                    self._flush_step2_incremental(reason="loop")
                 # No explicit sleep — scheduler.release() set cooldown for next acquire()
         else:
             max_workers = 2
+            results = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as self.executor:
-                results = list(self.executor.map(self._run_step2_with_random_cookie, work_list))
+                futures = [self.executor.submit(self._run_step2_with_random_cookie, aid) for aid in work_list]
+                for fut in concurrent.futures.as_completed(futures):
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        try:
+                            self._q.put(WorkerEvent("output", f"<p><font color='red'>畫師取得 PID 失敗：{e}</font></p>"))
+                        except Exception:
+                            pass
+                        res = None
+                    if isinstance(res, list):
+                        results.append(res)
+                    self._step2_artists_done += 1
+                    if self._step2_artists_done % self._STEP2_INCREMENTAL_EVERY == 0:
+                        self._flush_step2_incremental(reason="loop")
         return results
 
     def _persist_author_progress(self, progress_file):
@@ -386,42 +415,38 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             existing_seen.add(spid)
         return existing_list, new_candidates
 
+    def _append_new_pids_to_file(self, pics_file: str, new_candidates: list[str]) -> None:
+        try:
+            with open(pics_file, 'a+', encoding='utf-8') as pf:
+                for text in new_candidates:
+                    pf.write(str(text) + '\n')
+        except Exception as e2:
+            self._emit_output(f"<p><font color='red'>寫入 pictures_id 失敗：{e2}</font></p>")
+
+    def _persist_pending_pids_to_db(self, new_candidates: list[str]) -> None:
+        db = getattr(self, "_metadata_db", None)
+        if db is None or not new_candidates:
+            return
+        with contextlib.suppress(Exception):
+            db.upsert_pending_pids(new_candidates)
+
     def _write_step2_pictures_id(self, end):
         """concern 2：合併 collected pids 並寫入 pictures_id.txt。"""
         pics_file = os.path.join(self.path, 'pictures_id.txt')
-        try:
+        with contextlib.suppress(Exception):
             os.makedirs(self.path, exist_ok=True)
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             with open(pics_file, 'a+', encoding='utf-8'):
                 pass
-        except Exception:
-            pass
         combined = self._collect_step2_pids_from_queue(end)
         existing_list, new_candidates = self._merge_step2_pids_with_existing(pics_file, combined)
         if new_candidates:
-            try:
-                with open(pics_file, 'a+', encoding='utf-8') as pf:
-                    for text in new_candidates:
-                        pf.write(str(text) + '\n')
-            except Exception as e2:
-                try:
-                    self._q.put(WorkerEvent("output",f"<p><font color='red'>寫入 pictures_id 失敗：{e2}</font></p>"))
-                except Exception:
-                    pass
-        db = getattr(self, "_metadata_db", None)
-        if db is not None and new_candidates:
-            try:
-                db.upsert_pending_pids(new_candidates)
-            except Exception:
-                pass
-        try:
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>pictures_id 既有 {len(existing_list)} 筆，新增 {len(new_candidates)} 筆，合計 {len(existing_list) + len(new_candidates)} 筆</font></p>"
-            ))
-        except Exception:
-            pass
+            self._append_new_pids_to_file(pics_file, new_candidates)
+        self._persist_pending_pids_to_db(new_candidates)
+        self._emit_output(
+            f"<p><font color='gray'>pictures_id 既有 {len(existing_list)} 筆，"
+            f"新增 {len(new_candidates)} 筆，合計 {len(existing_list) + len(new_candidates)} 筆</font></p>"
+        )
 
     def _write_step2_skip_pids(self):
         """concern 3：寫入 step2_skip_pid.txt 提前跳過清單。"""

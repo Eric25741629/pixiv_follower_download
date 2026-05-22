@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import queue
 import threading
 import time
@@ -85,11 +86,49 @@ class MainView:
         self._loading_lock = threading.Lock()
 
         self._log_lines: list[ft.Text] = []
+        self._auto_scroll_enabled = True
+        self._scroll_pending = False
+        self._last_scroll_pixels: float | None = None
+        # auto_scroll stays False forever — we manually call scroll_to(offset=-1)
+        # via _schedule_scroll_to_bottom().  Toggling auto_scroll at runtime
+        # rebuilds Flutter's ScrollController and breaks mouse-wheel scrolling
+        # mid-session.  build_controls_on_demand=False is required for
+        # scroll_to to work on a ListView (the Flet docstring explicitly says
+        # scroll_to is ineffective when items are built lazily).
         self._log_list = ft.ListView(
             controls=self._log_lines,
             expand=True,
             spacing=1,
-            auto_scroll=True,
+            auto_scroll=False,
+            build_controls_on_demand=False,
+            on_scroll=self._on_log_scroll,
+            scroll_interval=200,
+        )
+        # The pill overlay used to be an expand=True Container with alignment,
+        # but that wrapped a transparent Container over the full Stack area —
+        # Flet's Container always supports on_hover so Flutter wraps it in a
+        # MouseRegion that absorbs pointer events (including mouse wheel and
+        # click), blocking the ListView underneath AND the inner pill.
+        # Solution: use a Row positioned only along the bottom strip via
+        # Stack positioning (left/right/bottom).  Row doesn't paint nor hit
+        # test its empty space, so wheel events above the strip reach the
+        # ListView, and clicks on either side of the pill pass through too.
+        self._pill_overlay = ft.Row(
+            [
+                ft.Container(
+                    content=ft.Text("↓ 跳到最新", size=11, color=ft.Colors.WHITE),
+                    bgcolor=ft.Colors.with_opacity(0.75, ft.Colors.BLUE_GREY_700),
+                    border_radius=20,
+                    padding=ft.padding.symmetric(horizontal=16, vertical=7),
+                    on_click=self._on_scroll_to_bottom,
+                    ink=True,
+                ),
+            ],
+            alignment=ft.MainAxisAlignment.CENTER,
+            left=0,
+            right=0,
+            bottom=15,
+            visible=False,
         )
 
     def _make_step_card(self, index: int) -> ft.Card:
@@ -121,6 +160,67 @@ class MainView:
         self._log_lines.append(ft.Text(spans=spans, size=12))
         if len(self._log_lines) > _MAX_LOG_LINES:
             self._log_lines.pop(0)
+        # Only schedule a scroll_to when the ListView is still attached to a
+        # live page tree. After a nav-rail switch the MainView is detached
+        # (its subtree was replaced inside content_area); calling scroll_to
+        # then sends an _invoke_method round-trip to a widget the client no
+        # longer renders, which piles awaited tasks on the event loop and
+        # makes the rapid-tab-switch session-GC scenario worse. Re-attach
+        # happens transparently on the next log line after the user returns
+        # to MainView.
+        if self._auto_scroll_enabled and getattr(self._log_list, "page", None) is not None:
+            self._schedule_scroll_to_bottom()
+
+    def _schedule_scroll_to_bottom(self) -> None:
+        """Coalesce scroll requests within one event-loop tick — many
+        log lines can land in the same dispatcher poll, but we only need
+        one scroll_to per render."""
+        if self._scroll_pending:
+            return
+        self._scroll_pending = True
+        try:
+            asyncio.create_task(self._do_scroll_to_bottom())
+        except RuntimeError:
+            # No running loop (called outside event loop) — drop quietly.
+            self._scroll_pending = False
+
+    async def _do_scroll_to_bottom(self) -> None:
+        try:
+            await self._log_list.scroll_to(offset=-1, duration=0)
+        except Exception:
+            pass
+        finally:
+            self._scroll_pending = False
+
+    def _on_log_scroll(self, e: ft.OnScrollEvent) -> None:
+        # Don't trust ScrollType.USER + direction for wheel events — Flutter's
+        # pointerScroll path does not always fire UserScrollNotification, and
+        # when it does the direction enum value is unreliable across platforms.
+        # Use UPDATE events with pixel-delta tracking instead.
+        if e.event_type != ft.ScrollType.UPDATE:
+            return
+        prev = self._last_scroll_pixels
+        self._last_scroll_pixels = e.pixels
+        if self._auto_scroll_enabled:
+            # User scrolled up if pixels decreased by >10px AND we're now
+            # more than 30px from the bottom.  The pixel-delta filter rules
+            # out the spurious decreases caused by pop(0) when the log hits
+            # _MAX_LOG_LINES (those shift content up but stay near bottom).
+            if prev is not None and e.pixels < prev - 10 and e.extent_after > 30:
+                self._auto_scroll_enabled = False
+                self._pill_overlay.visible = True
+        elif e.extent_after <= 20:
+            self._enable_auto_scroll()
+
+    def _enable_auto_scroll(self) -> None:
+        self._auto_scroll_enabled = True
+        self._pill_overlay.visible = False
+        # Actively jump to bottom — setting a flag alone won't move the
+        # viewport until the next log line arrives.
+        self._schedule_scroll_to_bottom()
+
+    def _on_scroll_to_bottom(self, e: ft.ControlEvent) -> None:
+        self._enable_auto_scroll()
 
     def update_progress(self, delta: int, total: int) -> None:
         # Workers emit (delta, total) per step, with delta == 0 marking a reset
@@ -184,13 +284,6 @@ class MainView:
         self._countdown_text.value = f"倒數：{r} 秒" if r > 0 else ""
         try:
             self._countdown_text.update()
-        except Exception:
-            pass
-        # Defensive belt-and-suspenders: ensure the change is flushed even if
-        # the dispatcher's batched page.update() is racing with this control's
-        # own update from a background thread.
-        try:
-            self._page.update()
         except Exception:
             pass
 
@@ -296,6 +389,13 @@ class MainView:
             self._btn_pause.update()
         except Exception:
             pass
+        # Mirror pause state to the persistent UI snapshot so a post-GC
+        # successor main() can restore the "▶ 繼續" button + paused worker
+        # state instead of resetting the toggle to "暫停".
+        try:
+            self._event_q.put(WorkerEvent("pause_state", self._is_paused))
+        except Exception:
+            pass
 
     def _on_stop(self, e: ft.ControlEvent) -> None:
         t = self._active_thread
@@ -354,12 +454,19 @@ class MainView:
                 self._phase_row,
                 ft.Divider(),
                 ft.Text("即時 Log", size=12, weight=ft.FontWeight.BOLD),
-                ft.Container(
-                    content=self._log_list,
+                ft.Stack(
+                    controls=[
+                        ft.Container(
+                            content=self._log_list,
+                            expand=True,
+                            border=ft.border.all(1, ft.Colors.OUTLINE_VARIANT),
+                            border_radius=4,
+                            padding=4,
+                        ),
+                        self._pill_overlay,
+                    ],
                     expand=True,
-                    border=ft.border.all(1, ft.Colors.OUTLINE_VARIANT),
-                    border_radius=4,
-                    padding=4,
+                    fit=ft.StackFit.EXPAND,
                 ),
             ],
             expand=True,

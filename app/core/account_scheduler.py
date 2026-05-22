@@ -53,6 +53,7 @@ class AccountScheduler:
         emit: Callable[[str], None] | None = None,
         q: Any = None,
         on_disable: Callable[[AccountState], None] | None = None,
+        on_first_success: Callable[[AccountState], None] | None = None,
     ) -> None:
         self._accounts = list(accounts)
         self._get_cooldown_avg = get_cooldown_avg
@@ -64,6 +65,10 @@ class AccountScheduler:
         # caller can persist the cookie's status (e.g., "失效") to settings
         # — the next run won't trust the cached "有效" any more.
         self._on_disable = on_disable
+        # Called the first time each cookie succeeds in a run, so the caller
+        # can refresh last_tested_at — extending the 30-day trust window.
+        self._on_first_success = on_first_success
+        self._used_cookies: set[str] = set()
         self._lock = threading.Lock()
         self._next_emit_at = 0.0  # global throughput gate
         self._stagger_initial_cooldowns()
@@ -164,6 +169,39 @@ class AccountScheduler:
             except Exception:
                 pass
 
+    def _mark_failure_locked(self, account: AccountState) -> Callable[[AccountState], None] | None:
+        """Disable + emit; caller must hold ``self._lock``. Returns the
+        on_disable callback to invoke outside the lock (or None)."""
+        account.disabled_reason = "proxy_dead"
+        alias = account.alias or account.cookie[:20]
+        proxy = account.proxy_url or "本機IP"
+        self._emit(
+            f"<p><font color='red'>Cookie「{alias}」proxy「{proxy}」"
+            f"連不通，本輪禁用</font></p>"
+        )
+        return self._on_disable
+
+    def _mark_success_locked(self, account: AccountState) -> Callable[[AccountState], None] | None:
+        """Schedule per-account cooldown; caller must hold ``self._lock``.
+        Returns on_first_success callback the first time this cookie wins."""
+        avg = self._get_cooldown_avg()
+        n = max(1, len([a for a in self._accounts if a.disabled_reason is None]))
+        per_account = max(1.0, avg * math.log(n + 1))
+        account.cooldown_until = time.monotonic() + per_account
+        if account.cookie in self._used_cookies:
+            return None
+        self._used_cookies.add(account.cookie)
+        return self._on_first_success
+
+    @staticmethod
+    def _safe_call(cb: Callable[[AccountState], None] | None, account: AccountState) -> None:
+        if cb is None:
+            return
+        try:
+            cb(account)
+        except Exception:
+            pass
+
     def release(self, account: AccountState, ok: bool = True) -> None:
         """Record outcome after a unit of work completes.
 
@@ -174,30 +212,10 @@ class AccountScheduler:
         ok=False -> disable account (proxy unreachable).
         """
         with self._lock:
-            if not ok:
-                account.disabled_reason = "proxy_dead"
-                alias = account.alias or account.cookie[:20]
-                proxy = account.proxy_url or "本機IP"
-                self._emit(
-                    f"<p><font color='red'>Cookie「{alias}」proxy「{proxy}」"
-                    f"連不通，本輪禁用</font></p>"
-                )
-                disable_cb = self._on_disable
-                disabled_account = account
-            else:
-                avg = self._get_cooldown_avg()
-                n = max(1, len([a for a in self._accounts if a.disabled_reason is None]))
-                per_account = max(1.0, avg * math.log(n + 1))
-                account.cooldown_until = time.monotonic() + per_account
-                disable_cb = None
-                disabled_account = None
-        # Call on_disable callback outside the lock — it does file I/O
-        # and we don't want to block other acquire/release threads.
-        if disable_cb is not None and disabled_account is not None:
-            try:
-                disable_cb(disabled_account)
-            except Exception:
-                pass
+            cb = self._mark_failure_locked(account) if not ok else self._mark_success_locked(account)
+        # Callback runs outside the lock — it does file I/O and we don't
+        # want to block other acquire/release threads.
+        self._safe_call(cb, account)
 
     def disable(self, account: AccountState, reason: str) -> None:
         with self._lock:

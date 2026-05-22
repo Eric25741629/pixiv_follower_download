@@ -41,3 +41,41 @@ def test_plain_string_input_has_no_status():
     out = normalize_cookie_entries(["c1", "c2"])
     assert all("status" not in e for e in out)
     assert all("last_tested_at" not in e for e in out)
+
+
+def test_omits_enabled_when_absent_or_true():
+    """Missing or True `enabled` defaults to enabled (key not emitted)."""
+    raw = [
+        {"cookie": "c1", "alias": "A"},
+        {"cookie": "c2", "alias": "B", "enabled": True},
+    ]
+    out = normalize_cookie_entries(raw)
+    assert all("enabled" not in e for e in out)
+
+
+def test_preserves_enabled_false():
+    raw = [{"cookie": "c1", "alias": "A", "enabled": False}]
+    out = normalize_cookie_entries(raw)
+    assert out[0]["enabled"] is False
+
+
+def test_dedupe_explicit_disabled_wins():
+    """If any duplicate has enabled=False, the merged entry stays disabled."""
+    raw = [
+        {"cookie": "c1", "alias": "A"},
+        {"cookie": "c1", "alias": "", "enabled": False},
+    ]
+    out = normalize_cookie_entries(raw)
+    assert len(out) == 1
+    assert out[0]["enabled"] is False
+
+
+def test_dedupe_explicit_disabled_first_then_default():
+    """Explicit False on the first dupe survives a later default-enabled entry."""
+    raw = [
+        {"cookie": "c1", "alias": "A", "enabled": False},
+        {"cookie": "c1", "alias": ""},
+    ]
+    out = normalize_cookie_entries(raw)
+    assert len(out) == 1
+    assert out[0]["enabled"] is False

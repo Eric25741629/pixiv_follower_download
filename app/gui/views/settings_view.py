@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 import os
 import threading
 import flet as ft
@@ -30,6 +31,7 @@ class SettingsView:
         perf = store.get_section("performance")
         jxl = store.get_section("jxl")
         directory = store.get_section("directory")
+        self._n_cookies: int = max(1, len(auth.get("cookies_pool", []) or []))
 
         self._tf_account = ft.TextField(label="帳號", value=auth.get("account", ""), width=300)
         self._tf_password = ft.TextField(label="密碼", value=auth.get("password", ""), width=300, password=True, can_reveal_password=True)
@@ -208,8 +210,25 @@ class SettingsView:
             avg_f = max(1.0, float(avg))
         except (TypeError, ValueError):
             avg_f = 35.0
-        multiplier = 60.0 / avg_f
-        return f"相當於倍率 {multiplier:.1f}x；推薦 >= 30 秒"
+        n = self._n_cookies
+        throughput = avg_f * math.log(n + 1) / n
+        suffix = "；推薦 >= 30 秒"
+        if n == 1:
+            return f"1 個 cookie：每請求約 {throughput:.0f} 秒{suffix}"
+        speedup = math.log(2) * n / math.log(n + 1)
+        return f"{n} 個 cookie：每請求約 {throughput:.1f} 秒（比單 cookie 快 {speedup:.1f}x）{suffix}"
+
+    def reload_cookie_count(self) -> None:
+        """Re-read cookie count from store; refresh hint label in-place."""
+        auth = _store().get_section("auth")
+        self._n_cookies = max(1, len(auth.get("cookies_pool", []) or []))
+        avg = self._safe_int_cooldown()
+        self._label_cooldown_hint.value = self._cooldown_hint(avg)
+        self._label_cooldown_hint.color = ft.Colors.RED_600 if avg < 30 else ft.Colors.GREY_600
+        try:
+            self._label_cooldown_hint.update()
+        except Exception:
+            pass
 
     def _on_cooldown_slider_change(self, e: ft.ControlEvent) -> None:
         try:
@@ -419,7 +438,7 @@ class SettingsView:
                 title=ft.Text(title),
                 controls=[ft.Container(
                     content=ft.Column(controls, spacing=8),
-                    padding=ft.padding.only(left=16, bottom=12),
+                    padding=ft.padding.only(left=16, top=10, bottom=12),
                 )],
             )
 

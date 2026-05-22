@@ -3,9 +3,12 @@ import os
 import queue
 import threading
 import flet as ft
+from app.core.app_logging import get_logger
 from app.core.settings_store import SettingsStore
 from app.core.pixiv_thread_utils import normalize_cookie_entries
 from app.core.worker_event import WorkerEvent
+
+_log = get_logger("pixiv.cookies_view")
 
 DEFAULT_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -74,6 +77,7 @@ class CookiesView:
         self._table = ft.DataTable(
             columns=[
                 ft.DataColumn(ft.Text("選取")),
+                ft.DataColumn(ft.Text("啟用")),
                 ft.DataColumn(ft.Text("別名")),
                 ft.DataColumn(ft.Text("狀態")),
                 ft.DataColumn(ft.Text("上次檢查")),
@@ -146,12 +150,19 @@ class CookiesView:
         preview = cookie[:30] + "..." if len(cookie) > 30 else cookie
         status_color = _STATUS_COLORS.get(status, ft.Colors.GREY_600)
         tested_text = _format_tested_at(entry.get("last_tested_at"))
+        enabled = entry.get("enabled") is not False
+        alias_color = None if enabled else ft.Colors.GREY_500
         return ft.DataRow(cells=[
             ft.DataCell(ft.Checkbox(
                 value=cookie in self._selected,
                 on_change=lambda e, c=cookie: self._on_toggle_row(c, e.control.value),
             )),
-            ft.DataCell(ft.Text(alias)),
+            ft.DataCell(ft.Switch(
+                value=enabled,
+                tooltip="關閉後本次任務不使用此 Cookie",
+                on_change=lambda e, c=cookie: self._on_toggle_enabled(c, e.control.value),
+            )),
+            ft.DataCell(ft.Text(alias, color=alias_color)),
             ft.DataCell(ft.Text(status, color=status_color, weight=ft.FontWeight.BOLD)),
             ft.DataCell(ft.Text(tested_text, size=11, color=ft.Colors.GREY_700)),
             ft.DataCell(ft.Text(preview, size=11, font_family="monospace")),
@@ -189,6 +200,34 @@ class CookiesView:
             bool(all_cookies) and self._selected.issuperset(all_cookies)
         )
         self._btn_test_selected.disabled = self._testing or not self._selected
+        try:
+            self._page.update()
+        except Exception:
+            pass
+
+    def _on_toggle_enabled(self, cookie: str, value: bool) -> None:
+        """Persist the per-cookie enable flag and refresh the row's alias color.
+
+        Skip a full _refresh_table() so the user's switch click is not
+        visually replaced (same pattern as _on_toggle_row), and the Switch
+        keeps the new state without flicker.
+        """
+        for i, entry in enumerate(self._entries):
+            if entry.get("cookie", "") != cookie:
+                continue
+            if value:
+                entry.pop("enabled", None)
+            else:
+                entry["enabled"] = False
+            self._save_entries()
+            try:
+                row = self._table.rows[i]
+                alias_text = row.cells[2].content
+                if isinstance(alias_text, ft.Text):
+                    alias_text.color = None if value else ft.Colors.GREY_500
+            except Exception:
+                pass
+            break
         try:
             self._page.update()
         except Exception:
@@ -347,14 +386,21 @@ class CookiesView:
     def reload_from_settings(self) -> None:
         """Reload entries + proxy_pool from settings (e.g., after settings tab edit).
 
-        Safe to call from the event loop only.
+        Safe to call from the event loop only. Exceptions are logged but
+        never re-raised — propagating them to Flet's click dispatch has
+        previously caused the entire session to reset, killing any
+        running download.
         """
-        self._load_entries()
-        self._refresh_table()
+        try:
+            self._load_entries()
+            self._refresh_table()
+        except Exception:
+            _log.exception("reload_from_settings failed")
+            return
         try:
             self._page.update()
         except Exception:
-            pass
+            _log.exception("page.update in reload_from_settings failed")
 
     def build(self) -> ft.Column:
         header = ft.Row([

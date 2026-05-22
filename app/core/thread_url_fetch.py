@@ -12,19 +12,24 @@ from pixiv_api import *
 from app.core.worker_event import WorkerEvent
 import tag_edit
 import pixiv_api
-from app.core.metadata_db import MetadataDB
+from app.core.metadata_db import MetadataDB, emit_db_stats, open_metadata_db
 from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
     atomic_write_json,
     atomic_write_text,
     canonicalize_pximg_url_for_storage,
     cookie_usage_label,
+    count_text_lines,
     init_cookie_fields,
+    mirror_meta_dict_to_db,
+    normalize_filter_tags,
     normalize_pid,
     normalize_pid_set,
     output_err,
     read_pid_lines,
     safe_read_json,
+    to_int_lenient,
+    write_all_url_file,
 )
 from app.core.pixiv_thread_base import (
     PauseableThread,
@@ -165,26 +170,6 @@ class get_img_url_thread(PauseableThread):
         self._pending_pid_lock = threading.Lock()
         self._pending_pid_remaining = set()
 
-    def _load_initial_url_meta(self):
-        """Step 3 uses DB-on-demand reads; in-memory dict is write-through cache only."""
-        return {}
-
-    def _get_meta(self, pid_key: str) -> dict:
-        """Return metadata for pid_key: in-memory cache first, then DB lookup."""
-        pid_key = str(pid_key)
-        cached = self.url_meta.get(pid_key) if isinstance(self.url_meta, dict) else None
-        if isinstance(cached, dict) and cached:
-            return cached
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                meta = db.get_meta(pid_key)
-                if isinstance(meta, dict) and meta:
-                    return meta
-            except Exception:
-                pass
-        return {}
-
     def _load_cookie_requirement_cache(self):
         """Populate self._cookie_requirement_map from the saved trace JSON."""
         try:
@@ -217,22 +202,10 @@ class get_img_url_thread(PauseableThread):
             pass
 
     def _count_text_lines(self, file_path):
-        try:
-            with open(file_path, encoding="utf-8", errors="ignore") as f:
-                return sum(1 for line in f if str(line).strip())
-        except Exception:
-            return 0
+        return count_text_lines(file_path)
 
     def _to_int(self, value, default=None):
-        try:
-            if isinstance(value, str):
-                s = value.strip().replace(",", "").replace("_", "")
-                if not s:
-                    return default
-                return int(float(s))
-            return int(value)
-        except Exception:
-            return default
+        return to_int_lenient(value, default)
 
     def _cookie_requirement_primary_paths(self):
         """Candidate paths for the canonical pixiv_cookie_requirement.json file."""
@@ -408,19 +381,7 @@ class get_img_url_thread(PauseableThread):
             pass
 
     def _normalize_filter_tags(self, tags):
-        out = []
-        if not isinstance(tags, list):
-            return out
-        try:
-            tags = tag_edit.Tag(tags)
-        except Exception:
-            pass
-        for t in tags:
-            s = str(t).strip()
-            if not s:
-                continue
-            out.append(s.lower())
-        return list(dict.fromkeys(out))
+        return normalize_filter_tags(tags)
 
     def _normalize_artwork_tags(self, tag):
         if isinstance(tag, list):
@@ -637,6 +598,12 @@ class get_img_url_thread(PauseableThread):
             return
         self._revoked_pid_set.add(pid_key)
         self._revoked_pid_new.add(pid_key)
+        db = getattr(self, "_metadata_db", None)
+        if db is not None:
+            try:
+                db.mark_artwork_revoked(pid_key)
+            except Exception:
+                pass
         try:
             self._q.put(WorkerEvent("output",
                 f"<p><font color='orange'>PID {pid_key} 已標記為失效（{reason}），後續會自動略過</font></p>"
@@ -678,28 +645,6 @@ class get_img_url_thread(PauseableThread):
         high = max(low, int(avg * 1.3))
         return pyrandom.randint(low, high)
 
-    def _sleep_with_pause_aware_countdown(self, delay):
-        """Count down ``delay`` seconds, honouring stop and pause events at 0.5s+1s ticks."""
-        for elapsed in range(delay):
-            if self._stop_event.is_set():
-                break
-            while not self._pause_event.is_set():
-                if self._stop_event.is_set():
-                    break
-                self._pause_event.wait(timeout=0.5)
-            if self._stop_event.is_set():
-                break
-            try:
-                self._q.put(WorkerEvent("countdown", delay - elapsed))
-            except Exception:
-                pass
-            if self._stop_event.wait(timeout=1.0):
-                break
-        try:
-            self._q.put(WorkerEvent("countdown", 0))
-        except Exception:
-            pass
-
     def _sleep_ultra_slow(self, pid, need_cookie=None):
         pid_key = normalize_pid(pid) or str(pid)
         try:
@@ -719,7 +664,7 @@ class get_img_url_thread(PauseableThread):
             if need_cookie is False
             else self._calc_cookie_required_delay()
         )
-        self._sleep_with_pause_aware_countdown(delay)
+        self._sleep_with_countdown(delay)
 
     def _extract_pid_from_url(self, url):
         try:
@@ -780,52 +725,6 @@ class get_img_url_thread(PauseableThread):
                 return label
         return self._cookie_label_default(need_cookie)
 
-    def _select_cookie_for_pid(self, pid):
-        pid_key = normalize_pid(pid) or str(pid)
-        try:
-            if pid_key in self._pid_cookie_selection:
-                return self._pid_cookie_selection.get(pid_key, "")
-        except Exception:
-            pass
-        if self.cookie_pool:
-            selected = pyrandom.choice(self.cookie_pool)
-        else:
-            selected = str(self.cookies or "").strip()
-        try:
-            self._pid_cookie_selection[pid_key] = selected
-            self._pid_cookie_alias_selection[pid_key] = cookie_usage_label(selected, self.cookie_pool, self._cookie_alias_map)
-        except Exception:
-            pass
-        return selected
-
-    def _record_cookie_usage(self, stage, pid, cookie_value):
-        stage_key = str(stage or "").strip().lower()
-        if stage_key not in self._cookie_usage_counts:
-            return ""
-        cookie_text = str(cookie_value or "").strip()
-        label = _cookie_usage_label(cookie_text, self.cookie_pool, self._cookie_alias_map)
-        if not cookie_text:
-            return label
-        pid_key = normalize_pid(pid) or str(pid)
-        try:
-            seen = self._cookie_usage_seen.setdefault(stage_key, set())
-            if pid_key in seen:
-                return label
-            seen.add(pid_key)
-            counts = self._cookie_usage_counts.setdefault(stage_key, {})
-            counts[label] = int(counts.get(label, 0)) + 1
-        except Exception:
-            pass
-        return label
-
-    def _emit_cookie_usage_summary(self, stage, title):
-        try:
-            stage_key = str(stage or "").strip().lower()
-            counts = self._cookie_usage_counts.get(stage_key, {}) if isinstance(self._cookie_usage_counts, dict) else {}
-            summary = _format_cookie_usage_summary(counts, self.cookie_pool, self._cookie_alias_map)
-            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[{title}] {summary}</font></p>"))
-        except Exception:
-            pass
 
     def _refresh_cookie_requirement(self, pid, fallback=None):
         pid_key = normalize_pid(pid)
@@ -851,27 +750,9 @@ class get_img_url_thread(PauseableThread):
             pass
         return latest
 
-    def __del__(self):
-        try:
-            executor = getattr(self, 'executor', None)
-            if executor is not None:
-                executor.shutdown(wait=False)
-        except Exception:
-            pass
-        try:
-            self.wait()
-        except Exception:
-            pass
-
     def _init_metadata_db(self, json_meta):
         """Open the SQLite metadata cache; first-run import from JSON."""
-        try:
-            db = MetadataDB(self.path)
-            if isinstance(json_meta, dict) and json_meta and db.meta_count() == 0:
-                db.import_meta_dict(json_meta)
-            return db
-        except Exception:
-            return None
+        return open_metadata_db(self.path, json_meta)
 
     def _migrate_pending_pids_from_file(self):
         """First-run migration: import pictures_id.txt into pending_pids when DB is empty."""
@@ -894,32 +775,11 @@ class get_img_url_thread(PauseableThread):
 
     def _emit_metadata_db_stats(self, stage="Step3"):
         """Print a one-liner with current SQLite cache size."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            meta_n = db.meta_count()
-            dl_n = db.downloaded_count()
-        except Exception:
-            return
-        try:
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[{stage} SQLite] metadata.sqlite3 載入 "
-                f"{meta_n} 筆 meta、{dl_n} 筆已下載</font></p>"
-            ))
-        except Exception:
-            pass
+        emit_db_stats(getattr(self, "_metadata_db", None), self._q, stage=stage)
 
     def _mirror_url_meta_to_db(self):
         """Best-effort bulk-mirror of self.url_meta into the SQLite cache."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            if isinstance(self.url_meta, dict) and self.url_meta:
-                db.import_meta_dict(self.url_meta)
-        except Exception:
-            pass
+        mirror_meta_dict_to_db(getattr(self, "_metadata_db", None), self.url_meta)
 
     def _flush_url_meta_snapshot(self):
         self._mirror_url_meta_to_db()
@@ -970,58 +830,7 @@ class get_img_url_thread(PauseableThread):
         self._emit_gif_cookie_usage_signal(pid_key, source)
 
     def _write_all_url_file(self, urls, reason="unknown"):
-        file_path = os.path.join(self.path, "all_url.txt")
-        safe_lines = [str(x) for x in (urls or [])]
-        before_count = self._count_text_lines(file_path)
-        self._diag(
-            "all_url_write_attempt",
-            reason=reason,
-            before_count=before_count,
-            target_count=len(safe_lines),
-        )
-        try:
-            atomic_write_text(file_path, safe_lines, backup=True)
-            after_count = self._count_text_lines(file_path)
-            self._diag(
-                "all_url_write_done",
-                reason=reason,
-                success=True,
-                before_count=before_count,
-                after_count=after_count,
-            )
-            return True
-        except Exception as err:
-            self._diag(
-                "all_url_write_primary_failed",
-                reason=reason,
-                error=str(err),
-            )
-            try:
-                from safe_io import backup_file
-                backup_file(file_path)
-            except Exception:
-                pass
-            try:
-                with open(file_path, "w+", encoding="utf-8") as f:
-                    f.writelines([line + "\n" for line in safe_lines])
-                after_count = self._count_text_lines(file_path)
-                self._diag(
-                    "all_url_write_done",
-                    reason=reason,
-                    success=True,
-                    via="fallback",
-                    before_count=before_count,
-                    after_count=after_count,
-                )
-                return True
-            except Exception as fallback_err:
-                self._diag(
-                    "all_url_write_done",
-                    reason=reason,
-                    success=False,
-                    error=str(fallback_err),
-                )
-                return False
+        return write_all_url_file(self.path, urls, reason=reason, diag=self._diag)
 
     def _read_existing_all_url_lines(self):
         """Read the current all_url.txt; return [] on any error."""
@@ -1482,10 +1291,7 @@ class get_img_url_thread(PauseableThread):
         self._step3_wait_applied_count = 0
 
     def _load_and_filter_pid_list(self):
-        try:
-            self._q.put(WorkerEvent("output", "<p><font color='gray'>[Step3] 讀取 pictures_id.txt 並比對既有檔案...</font></p>"))
-        except Exception:
-            pass
+        self._emit_output("<p><font color='gray'>[Step3] 讀取 pictures_id.txt 並比對既有檔案...</font></p>")
         pictures_id = self.check_exist()
         if not isinstance(pictures_id, list):
             self._q.put(WorkerEvent("output", "<p><font color='red'>pictures_id 讀取失敗，無法開始 URL 階段</font></p>"))
@@ -1514,10 +1320,7 @@ class get_img_url_thread(PauseableThread):
             cached_fallback_network=0,
             pending_count=self.pid_max,
         )
-        try:
-            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[TaskFilter][Step3] input={raw_pid_count}, skipped_no_to_check={skipped_no_to_check}, skipped_exist={skipped_exist}, skipped_revoked={skipped_revoked}, duplicate={duplicate_count}, invalid={invalid_count}, cached_hit_pid={0}, cached_generated_url={0}, cached_filtered={0}, cached_fallback_network={0}, pending_network={self.pid_max}</font></p>"))
-        except Exception:
-            pass
+        self._emit_output(f"<p><font color='gray'>[TaskFilter][Step3] input={raw_pid_count}, skipped_no_to_check={skipped_no_to_check}, skipped_exist={skipped_exist}, skipped_revoked={skipped_revoked}, duplicate={duplicate_count}, invalid={invalid_count}, cached_hit_pid={0}, cached_generated_url={0}, cached_filtered={0}, cached_fallback_network={0}, pending_network={self.pid_max}</font></p>")
         self._q.put(WorkerEvent("output", f"<p><font color='red'>Total pending network PID: {self.pid_max}</font></p>"))
         try:
             self._q.put(WorkerEvent("output", "<p><font color='gray'>URL 輸出檔案: {}</font></p>".format(os.path.join(self.path, "all_url.txt"))))
@@ -1613,7 +1416,8 @@ class get_img_url_thread(PauseableThread):
         results = []
         processed_count = 0
         progress_every = 100
-        flush_every = 100
+        # 25 顆粒：100 太肉，崩潰時可能丟掉 5–10 分鐘工作；25 約 1–2 分鐘
+        flush_every = 25
 
         while (not task_queue.empty()) and not self._stop_event.is_set():
             try:
@@ -1732,11 +1536,7 @@ class get_img_url_thread(PauseableThread):
         self._emit_cookie_usage_summary("step3", "Step3 Cookie統計")
         free = int(self._step3_cookie_req_counts.get("free", 0))
         if free > 0:
-            try:
-                self._q.put(WorkerEvent("output",
-                    f"<p><font color='teal'>免 Cookie 查詢：{free} 次</font></p>"))
-            except Exception:
-                pass
+            self._emit_output(f"<p><font color='teal'>免 Cookie 查詢：{free} 次</font></p>")
 
     def _finalize_on_complete(self, results):
         self._step3_emit("<p><font color='gray'>[Step3完成] 整理結果並寫入 all_url.txt...</font></p>")

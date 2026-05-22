@@ -748,6 +748,55 @@ code-review-skill 掃描後新增 3 個 Blocking/Important Phase：
 
 ---
 
+---
+
+## Session 12 — 2026-05-16 (drift 控制：feature 引入的 C 級複雜度降回)
+
+近期 feature work 在三個函式上累積了新的 C 級複雜度，逐項收回：
+
+### Phase 41 ✅ — `AccountScheduler.release` C(13) → A
+**位置：** `app/core/account_scheduler.py:172`
+
+**Smell：** ok/fail 兩條分支各自手動 set 4 個變數（`disable_cb` / `disabled_account` / `first_success_cb` / `first_success_account`），再在 lock 外重複的 try/except/pass 呼叫；新加的 `on_first_success` 路徑與 `on_disable` 結構對稱卻沒共用。
+
+**修法：** 鎖內各分支只算「待呼叫的 callback list」`pending: list[(cb, account)]`，鎖外用單一 helper `_safe_call(cb, account)` 跑完。**目標：CC ≤ 6。**
+
+### Phase 42 ✅ — `download_thread._drain_jxl_queue` C(11) → A/B
+**位置：** `app/core/thread_download.py:1257`
+
+**Smell：** 4 個獨立 `try/except/pass` 區塊（drain、join、put sentinel、task_done loop）。用 `contextlib.suppress(Exception)` 攤平；抽 `_discard_pending_jxl_items()`。順手把 `_jxl_worker_loop` 內的 3 個 try/except 也用 suppress 化簡。
+
+### Phase 43 ✅ — `download_thread._finalize_downloads` C(11) → A
+### Phase 43-bonus ✅ — `thread_pid_scan._write_step2_pictures_id` C(11) → A(2)
+### Phase 43-bonus ✅ — `stats_view._update_chart` C(12) → A
+
+---
+
+## Session 13 — 2026-05-16 (大規模消除重複；pylint 9.97 → 10.00)
+
+從 pylint duplicate-code 出發，系統性消除跨檔案重複實作。
+
+### Phase 44 ✅ — `pixiv_thread_utils.py` ↔ `safe_io.py` 120 行 wholesale duplicate
+- 後者改 re-export 前者；74 個 import 點 zero-touch
+
+### Phase 45 ✅ — `_write_all_url_file` 56 行雙份 → `write_all_url_file()` helper
+### Phase 46 ✅ — `_to_int` / `_normalize_filter_tags` / `_sync_meta_to_db` / `_mirror_url_meta_to_db` 4 個小 helper
+### Phase 47 ✅ — `__del__` executor shutdown 拉到 PauseableThread + 砍 Qt5 `self.wait()` 死碼
+### Phase 48 ✅ — 刪除 `_sleep_with_pause_aware_countdown`，url_fetch 改用 base `_sleep_with_countdown`
+### Phase 49 ✅ — MetadataDB 樣板 (`open_metadata_db` / `emit_db_stats` / `mirror_exist_pid_set`)
+### Phase 50 ✅ — cookie usage 追蹤 (`_record_cookie_usage` / `_emit_cookie_usage_summary`) 拉到 base
+### Phase 51 ✅ — `_select_cookie_for_pid` / `_get_meta` / `_load_initial_url_meta` 拉到 base
+### Phase 52 ✅ — 7 處 try/q.put 改 `_emit_output`（保守版，剩餘 multi-line 不動）
+
+**結果：pylint duplicate-code = 10.00/10；avg complexity 3.94；0 C+ 級函式；549 tests pass**
+**位置：** `app/core/thread_download.py:2174`
+
+**Smell：** Phase 40 抽完是 A(5)，後來加入 SQLite mark-done 區塊（11 行 + try/except）讓 CC 又長到 11。抽 `_mark_completed_urls_in_db(fail_records)` 把該段移出。
+
+**驗證（共用）：** `pytest -m "not integration"` 持綠（baseline 549）；`radon cc app/ -n C` 三函式皆掉出 C+。
+
+---
+
 ### Phase 29-B — _isPause: int → threading.Event 🔒 deferred
 **優先級: 🟢 LOW（風險高、收益小於 28-B/C）**
 

@@ -6,6 +6,15 @@ import shutil
 import sys
 import traceback
 
+# Atomic write / backup primitives live in safe_io.py — re-exported here so
+# callers can continue importing them from pixiv_thread_utils.
+from app.core.safe_io import (  # noqa: F401  (public re-export)
+    atomic_write_text,
+    atomic_write_json,
+    atomic_append_text,
+    backup_file,
+)
+
 
 def safe_json(res, *keys, default=None):
     """Walk res.json()[k1][k2]... defensively.
@@ -390,56 +399,6 @@ def invalidate_folder_file_count_cache(base_path, download_path=None):
         pass
 
 
-def _ensure_history_dir(file_path):
-    try:
-        d = os.path.dirname(file_path) or os.getcwd()
-        hist = os.path.join(d, 'history')
-        os.makedirs(hist, exist_ok=True)
-        return hist
-    except Exception:
-        return None
-
-
-def _next_unique_history_path(hist, base, ts):
-    """Return a backup path that doesn't exist yet (appends .1, .2, ... on collision)."""
-    dst = os.path.join(hist, f"{base}.{ts}")
-    if not os.path.exists(dst):
-        return dst
-    idx = 1
-    while True:
-        candidate = os.path.join(hist, f"{base}.{ts}.{idx}")
-        if not os.path.exists(candidate):
-            return candidate
-        idx += 1
-
-
-def _prune_history_backups(hist, base, max_history):
-    """Keep at most ``max_history`` files in ``hist`` whose name starts with ``base.``."""
-    try:
-        files = [f for f in os.listdir(hist) if f.startswith(base + '.')]
-        files.sort(key=lambda x: os.path.getmtime(os.path.join(hist, x)), reverse=True)
-        while len(files) > max_history:
-            os.remove(os.path.join(hist, files.pop()))
-    except Exception:
-        pass
-
-
-def backup_file(file_path, max_history=10):
-    try:
-        if not os.path.exists(file_path):
-            return
-        hist = _ensure_history_dir(file_path)
-        if not hist:
-            return
-        base = os.path.basename(file_path)
-        ts = datetime.datetime.now().strftime('%Y%m%d')
-        dst = _next_unique_history_path(hist, base, ts)
-        shutil.copy2(file_path, dst)
-        _prune_history_backups(hist, base, max_history)
-    except Exception:
-        pass
-
-
 def append_diagnostic_event(base_path, event, **fields):
     """
     Append one JSON-line diagnostic event under user data folder.
@@ -461,56 +420,6 @@ def append_diagnostic_event(base_path, event, **fields):
         return log_path
     except Exception:
         return None
-
-
-def atomic_write_text(file_path, lines, encoding='utf-8', backup=True):
-    try:
-        if backup:
-            try:
-                backup_file(file_path)
-            except Exception:
-                pass
-        tmp = file_path + '.tmp'
-        dirp = os.path.dirname(file_path)
-        if dirp:
-            os.makedirs(dirp, exist_ok=True)
-        with open(tmp, 'w', encoding=encoding) as f:
-            if isinstance(lines, (list, tuple)):
-                f.writelines([str(x) + '\n' for x in lines])
-            else:
-                f.write(str(lines))
-        os.replace(tmp, file_path)
-    except Exception:
-        try:
-            with open(file_path, 'w', encoding=encoding) as f:
-                if isinstance(lines, (list, tuple)):
-                    f.writelines([str(x) + '\n' for x in lines])
-                else:
-                    f.write(str(lines))
-        except Exception:
-            pass
-
-
-def atomic_write_json(file_path, obj, encoding='utf-8', backup=True):
-    try:
-        if backup:
-            try:
-                backup_file(file_path)
-            except Exception:
-                pass
-        tmp = file_path + '.tmp'
-        dirp = os.path.dirname(file_path)
-        if dirp:
-            os.makedirs(dirp, exist_ok=True)
-        with open(tmp, 'w', encoding=encoding) as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, file_path)
-    except Exception:
-        try:
-            with open(file_path, 'w', encoding=encoding) as f:
-                json.dump(obj, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
 
 
 def _normalize_pid_lines(line_iter):
@@ -678,11 +587,13 @@ def _parse_cookie_entry(item):
         alias = str(item.get("alias", "") or "").strip()
         status = str(item.get("status", "") or "").strip()
         last_tested_at = item.get("last_tested_at", None)
+        enabled_raw = item.get("enabled", None)
     else:
         text = str(item or "").strip()
         alias = ""
         status = ""
         last_tested_at = None
+        enabled_raw = None
 
     if not text:
         return None
@@ -695,11 +606,15 @@ def _parse_cookie_entry(item):
         entry["status"] = status
     if last_tested_at is not None:
         entry["last_tested_at"] = last_tested_at
+    # Only persist `enabled` when explicitly disabled; missing key means
+    # enabled (the default), so legacy entries stay free of the key.
+    if enabled_raw is False:
+        entry["enabled"] = False
     return entry
 
 
 def _merge_duplicate_entry(existing, duplicate):
-    """Carry alias / status / last_tested_at forward when the dedupe target is missing them."""
+    """Carry alias / status / last_tested_at / enabled forward when the dedupe target is missing them."""
     alias_text = str(duplicate.get("alias", "") or "").strip()
     if alias_text and not str(existing.get("alias", "")).strip():
         existing["alias"] = alias_text
@@ -707,6 +622,9 @@ def _merge_duplicate_entry(existing, duplicate):
         existing["status"] = duplicate["status"]
     if "last_tested_at" in duplicate and existing.get("last_tested_at") is None:
         existing["last_tested_at"] = duplicate["last_tested_at"]
+    # Explicit `enabled=False` on either side wins (safer default: keep disabled).
+    if duplicate.get("enabled") is False or existing.get("enabled") is False:
+        existing["enabled"] = False
 
 
 def _dedupe_cookie_entries(entries):
@@ -729,6 +647,8 @@ def _dedupe_cookie_entries(entries):
             new_entry["status"] = item["status"]
         if "last_tested_at" in item:
             new_entry["last_tested_at"] = item["last_tested_at"]
+        if item.get("enabled") is False:
+            new_entry["enabled"] = False
         deduped.append(new_entry)
     return deduped
 
@@ -879,3 +799,112 @@ def fetch_with_cookie_retry(http_get, url, headers, cookies, retry_statuses=(403
         trace["final_status"] = retry_status
         return retry_response, trace, first_response
     return first_response, trace, None
+
+
+def count_text_lines(file_path):
+    """Count non-blank lines in a UTF-8 text file; returns 0 on any error."""
+    try:
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
+            return sum(1 for line in f if str(line).strip())
+    except Exception:
+        return 0
+
+
+def to_int_lenient(value, default=None):
+    """Best-effort int coercion: strips commas/underscores, accepts numeric
+    strings via float→int.  Returns ``default`` on any failure."""
+    try:
+        if isinstance(value, str):
+            s = value.strip().replace(",", "").replace("_", "")
+            if not s:
+                return default
+            return int(float(s))
+        return int(value)
+    except Exception:
+        return default
+
+
+def normalize_filter_tags(tags):
+    """Lowercase + dedupe a tag-filter list.  Returns ``[]`` for non-list
+    input.  Best-effort routes through ``tag_edit.Tag`` for alias expansion
+    when available."""
+    out = []
+    if not isinstance(tags, list):
+        return out
+    try:
+        import tag_edit
+        tags = tag_edit.Tag(tags)
+    except Exception:
+        pass
+    for t in tags:
+        s = str(t).strip()
+        if s:
+            out.append(s.lower())
+    return list(dict.fromkeys(out))
+
+
+def mirror_meta_dict_to_db(db, url_meta):
+    """Bulk-import ``url_meta`` into the SQLite metadata cache via
+    ``db.import_meta_dict``.  No-op when ``db`` is None or ``url_meta`` is
+    not a non-empty dict.  Silently swallows exceptions (best-effort sync)."""
+    if db is None:
+        return
+    try:
+        if isinstance(url_meta, dict) and url_meta:
+            db.import_meta_dict(url_meta)
+    except Exception:
+        pass
+
+
+def write_all_url_file(path, urls, *, reason, diag):
+    """Write ``urls`` to ``path/all_url.txt`` with atomic-write + raw-write
+    fallback, emitting diag events at each stage.
+
+    Returns True on success.  ``diag`` is invoked as ``diag(event, **fields)``
+    — callers usually pass the worker's bound ``_diag`` method.
+    """
+    file_path = os.path.join(path, "all_url.txt")
+    safe_lines = [str(x) for x in (urls or [])]
+    before_count = count_text_lines(file_path)
+    diag(
+        "all_url_write_attempt",
+        reason=reason,
+        before_count=before_count,
+        target_count=len(safe_lines),
+    )
+    try:
+        atomic_write_text(file_path, safe_lines, backup=True)
+        diag(
+            "all_url_write_done",
+            reason=reason,
+            success=True,
+            before_count=before_count,
+            after_count=count_text_lines(file_path),
+        )
+        return True
+    except Exception as err:
+        diag("all_url_write_primary_failed", reason=reason, error=str(err))
+    try:
+        backup_file(file_path)
+    except Exception:
+        pass
+    try:
+        with open(file_path, "w+", encoding="utf-8") as f:
+            f.writelines([line + "\n" for line in safe_lines])
+        diag(
+            "all_url_write_done",
+            reason=reason,
+            success=True,
+            via="fallback",
+            before_count=before_count,
+            after_count=count_text_lines(file_path),
+        )
+        return True
+    except Exception as fallback_err:
+        diag(
+            "all_url_write_done",
+            reason=reason,
+            success=False,
+            error=str(fallback_err),
+        )
+        return False

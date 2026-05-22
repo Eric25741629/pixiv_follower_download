@@ -412,3 +412,130 @@ Phase 23-26 需安裝工具（vulture / pylint / radon / lizard / xenon / wily /
 
 ### 驗證
 - `pytest -m "not integration"`: **119 passed**
+
+---
+
+## Session 12 — 2026-05-16 (drift control: feature 引入的 C 級複雜度降回)
+
+### Baseline
+- `pytest -q -m "not integration"`: **549 passed**（含 WIP）
+- `radon cc app/ -n C`: 5 個 C+ 級函式，多為近期 feature 加入後 drift
+
+### Phase 41 ✅ — `AccountScheduler.release` C(13) → A(2)
+- 抽 `_mark_failure_locked` / `_mark_success_locked` / `_safe_call`（@staticmethod）
+- 對稱化 ok/fail 兩條分支：鎖內各自決定要呼叫的 callback，鎖外統一 `_safe_call`
+- 消除手動 4 變數 set 的重複 boilerplate
+- 行為等價：on_disable / on_first_success 觸發時機與順序保留
+
+### Phase 42 ✅ — `download_thread._drain_jxl_queue` C(11) → A(4)
+- `import contextlib` 加入 thread_download.py
+- 4 個 try/except/pass 改 `with contextlib.suppress(Exception):`
+- 抽 `_discard_pending_jxl_items()`：stop 時 drain 邏輯獨立
+- 行為等價：`_jxl_worker_loop` 的 `None` sentinel 退出語意保留；`_stop_event.is_set()` 才丟掉佇列
+
+### Phase 43 ✅ — `download_thread._finalize_downloads` C(11) → A
+- 抽 `_mark_completed_urls_in_db(fail_records)`：把 SQLite mark-done 區塊（11 行 + try/except）獨立
+- 主函式回到 ~10 行 orchestrator
+- 行為等價：fail_url_set 計算 + `_attempted_urls_lock` 取 attempted set + `db.mark_urls_done` 全保留
+
+### 順便：`thread_pid_scan._write_step2_pictures_id` C(11) → A(2)
+- `import contextlib`；4 個 try/except/pass 攤平
+- 抽 `_emit_output(html)` / `_append_new_pids_to_file(...)` / `_persist_pending_pids_to_db(...)`
+- 主函式回到 12 行 orchestrator
+
+### 順便：`stats_view._update_chart` C(12) → A
+- `import contextlib`；2 個 update try/except 改 suppress
+- 抽 `_safe_chart_update()` 與 `_build_cookie_bar_rows(cookie_requests)` (@staticmethod)
+- 主函式從 49 行縮到 14 行
+
+### 終局狀態
+- `radon cc app/ -n C`: **0 個 C+ 級函式**（主流程）
+- Average complexity: **A (4.05)**
+- `pytest -m "not integration"`: **549 passed**（無 regression）
+- `vulture app/ vulture_whitelist.py --min-confidence 80`: **clean**
+- `ruff check app/`: 207 → 194（SIM105 因 contextlib.suppress 自然下降）
+
+### 動到的檔案
+- `app/core/account_scheduler.py`（已是 WIP，順便對 release 收尾）
+- `app/core/thread_download.py`（已是 WIP，順便對 jxl/finalize 收尾）
+- `app/core/thread_pid_scan.py`
+- `app/gui/views/stats_view.py`
+- `task_plan.md`, `progress.md`
+
+---
+
+## Session 13 — 2026-05-16 (Phase 44-52: 大規模消除重複)
+
+使用者要求「找出共用但沒共用的程式碼並修復」。從 pylint duplicate-code 掃描出發，逐項消除。
+
+### Phase 44 ✅ — `pixiv_thread_utils.py` ↔ `safe_io.py` 完全重複
+- `_ensure_history_dir` / `_next_unique_history_path` / `_prune_history_backups` / `backup_file` / `atomic_write_text` / `atomic_write_json` 共 120 行原樣複製在兩個模組
+- 改：`pixiv_thread_utils.py` 移除這些實作，改 `from app.core.safe_io import ...` 重新匯出
+- `pixiv_thread_utils.py` 從 ~960 行降到 790 行（-170 包括 Phase 46 新加的 helper）
+- 74 個既有 import 點 zero-touch
+
+### Phase 45 ✅ — `_write_all_url_file` 56 行雙份
+- `thread_download.py:411` 與 `thread_url_fetch.py:972` 完全相同的 56 行 atomic-write + raw-fallback + diag emit 邏輯
+- 抽 `write_all_url_file(path, urls, *, reason, diag)` + `count_text_lines(file_path)` 至 `pixiv_thread_utils`
+- 兩 class 改成 1 行 delegating method
+- **112 行 → 4 行**
+
+### Phase 46 ✅ — `_to_int` / `_normalize_filter_tags` / `_sync_meta_to_db` / `_mirror_url_meta_to_db`
+- 4 個小型 helper 在 download/url_fetch 完全相同
+- 抽 `to_int_lenient` / `normalize_filter_tags` / `mirror_meta_dict_to_db` 至 `pixiv_thread_utils`
+- 子類別保留 1-2 行 delegating method（保留 `self._to_int` 以維持 callable 介面與 test mock 相容）
+
+### Phase 47 ✅ — `__del__` executor shutdown 拉到 PauseableThread + 砍 self.wait() 死碼
+- 3 個 thread 子類別 (`thread_download` / `thread_pid_scan` / `thread_url_fetch`) 各有相同 9 行 `__del__`
+- 內含 `self.wait()` —— Qt5 `QThread.wait()` 遺跡。`threading.Thread` 無此 method，永遠丟 AttributeError 被吞掉
+- 改：`PauseableThread` 加 base `__del__`（只做 `executor.shutdown(wait=False)`），子類別全砍
+- 同時：`thread_pid_scan._emit_output` 我前一輪新加的，base 已有同名，刪除子類版本
+- **30+ 行死碼/重複 → 1 個 base method**
+
+### Phase 48 ✅ — `_sleep_with_pause_aware_countdown` 改用基類
+- `thread_url_fetch._sleep_with_pause_aware_countdown` (20 行) 與 `PauseableThread._sleep_with_countdown` 功能完全相同（一個 for elapsed 一個 for remaining，emit 值相同）
+- 直接刪 + 呼叫端改 `_sleep_with_countdown`
+
+### Phase 49 ✅ — MetadataDB 樣板共用化
+- `_init_metadata_db` / `_emit_metadata_db_stats` / `_mirror_exist_pid_to_db` 在 3 個 thread 檔案重複
+- 在 `metadata_db.py` 新增 3 個 module-level helper：`open_metadata_db(path, json_meta=None)` / `emit_db_stats(db, q, stage)` / `mirror_exist_pid_set(db, exist_pid)`
+- 3 個 thread 檔案改成 1 行 delegator
+- **約 85 行重複 → 3 個共用 helper + 9 行 delegator**
+
+### Phase 50 ✅ — cookie usage 追蹤共用到 PauseableThread
+- `_record_cookie_usage(stage, pid, cookie_value)` 19 行 + `_emit_cookie_usage_summary(stage, title)` 8 行
+- 在 download/url_fetch 兩處完全相同
+- 移到 `PauseableThread` base；子類別只保留 `_cookie_usage_counts` / `_cookie_usage_seen` 的初始化（stages 不同）
+
+### Phase 51 ✅ — `_select_cookie_for_pid` 與 `_get_meta` / `_load_initial_url_meta` 共用到 base
+- 3 個 method 共 ~35 行在 download/url_fetch 完全相同
+- 移到 `PauseableThread` base
+- `_select_cookie_for_pid` 額外處理：url_fetch 多 1 行 `_pid_cookie_alias_selection` 更新；base 用 `getattr(self, "_pid_cookie_alias_selection", None)` 條件式 set，兼容兩種子類別
+
+### Phase 52 ✅ — try/q.put → _emit_output（保守版）
+- 30+ 處 `try: self._q.put(WorkerEvent("output", ...)) except Exception: pass` 等價於 `self._emit_output(html)`
+- 第一次正則太貪婪斷掉多行 payload —— `git checkout` 回退並重做
+- 第二次用嚴格 regex（只配對單一 string token），thread_download 替換 4 處、thread_url_fetch 3 處
+- 剩餘 multi-line payload 不動，避免風險
+
+### 終局狀態
+- **pylint duplicate-code: 9.97 → 10.00/10** 滿分
+- **0 個 C+ 級函式**
+- **Avg complexity: A (3.94)**（比 Session 12 結束的 4.05 還低）
+- **549 tests pass** —— Phase 44-52 全程無 regression
+- **vulture: clean**
+- **ruff: 188 → 182**
+
+### 動到的檔案
+- `app/core/pixiv_thread_utils.py` ←→ `app/core/safe_io.py`（Phase 44；前者瘦身 170 行）
+- `app/core/pixiv_thread_utils.py`（Phase 45-46；新增 `count_text_lines` / `write_all_url_file` / `to_int_lenient` / `normalize_filter_tags` / `mirror_meta_dict_to_db`）
+- `app/core/metadata_db.py`（Phase 49；新增 `open_metadata_db` / `emit_db_stats` / `mirror_exist_pid_set`）
+- `app/core/pixiv_thread_base.py`（Phase 47-51；新增 `__del__` / `_record_cookie_usage` / `_emit_cookie_usage_summary` / `_select_cookie_for_pid` / `_get_meta` / `_load_initial_url_meta`）
+- `app/core/thread_download.py`（消費全部新 helper；刪 ~230 行重複）
+- `app/core/thread_url_fetch.py`（消費全部新 helper；刪 ~210 行重複）
+- `app/core/thread_pid_scan.py`（消費新 MetadataDB helper）
+- `task_plan.md`, `progress.md`
+
+### 教訓
+- WIP changes 在 working tree 時 `git checkout file` 會直接覆寫，沒有 reflog 救援。下次先 stash 再實驗。
+- 機械式 sed/regex 替換用 `re.DOTALL` 配對 try block 太危險；先 dry-run 印出將要動的範圍再 apply。

@@ -80,6 +80,26 @@ Note: the root `pixiv_api.py`, `pixiv_thread.py`, and `download_img.py` are stil
 
 All persisted settings and progress live under `%APPDATA%/pixiv_download/` (e.g. `cookies.json`, `othersettings.json`, `pictures_id.txt`, `pixiv_info_cache.json`). `safe_io.atomic_write_*` with `backup=True` (the default) copies the previous version into a sibling `history/` directory named `filename.YYYYMMDD[.N]`, keeping the latest 10; callers that should not leave a backup trail (notably `cookies.json`) pass `backup=False`.
 
+### Canonical persistence schema (`metadata.sqlite3`)
+
+`%APPDATA%/pixiv_download/metadata.sqlite3` is the canonical store. Two tables drive every workflow decision:
+
+- `artworks (pid PK, discovered_at, page_count, like_count, tags, img_url_template, requires_cookie, meta_updated_at, revoked_at)` — one row per Pixiv ID the app has ever seen. `meta_updated_at IS NULL` means Step 3 still needs to fetch meta; `revoked_at IS NOT NULL` means the PID was 404'd by Pixiv (or imported as "do not process").
+- `pages (pid, page_index, status, url, file_path, file_size, downloaded_at, last_attempted_at, attempt_count, failure_reason) PK (pid, page_index)` — one row per (PID, page) tuple. `status ∈ {pending, downloaded, failed, revoked}`. Step 4's queue is `WHERE status='pending'`.
+
+Three views provide the decisions Step 3 / Step 4 consult:
+
+- `v_pending_artworks` — PIDs Step 3 still needs to fetch meta for (`meta_updated_at IS NULL AND revoked_at IS NULL`).
+- `v_pending_pages` — `(pid, page_index, url)` tuples for Step 4 to download.
+- `v_complete_artworks` — PIDs whose meta is known *and* every page is on disk; used to short-circuit re-downloads.
+- `v_closed_artworks` — superset of `v_complete_artworks` plus revoked PIDs plus legacy-sentinel PIDs (imported from `exist_pid.json` with no evidence of pending work). This is the set Step 4 uses as `exist_pid` for filtering.
+
+Helpers in `app/core/metadata_db.py`: `upsert_artwork`, `upsert_artworks` (bulk), `mark_artwork_revoked`, `upsert_page`, `mark_page_downloaded`, `mark_page_failed`, `mark_page_pending`, `upsert_pages_bulk`, `get_pending_pages`, `get_pending_urls_filtered`, `closed_artwork_set`, `is_pid_closed`, `is_pid_complete`, `page_status_counts`.
+
+**Legacy tables (`pids`, `downloaded`, `pending_urls`, `pending_pids`) are still written by shadow-write helpers** for one more transition phase. They no longer drive read decisions and will be dropped in a future revision. JSON / text files `exist_pid.json`, `all_url.txt`, `pictures_id.txt`, `err_url.txt` likewise persist for compatibility but the canonical state lives in SQLite.
+
+Migration utility: `python tools/db_migration.py [--dry-run]` (idempotent — re-running picks up nothing on a fresh DB). `python tools/dump_state.py` snapshots all sources as JSON for diff. `python tools/verify_consistency.py` cross-checks legacy vs new tables.
+
 ### JXL post-processing
 
 `thread_download` optionally converts downloaded images to JPEG XL using an external `cjxl.exe`. `_find_default_cjxl_path()` in `app/core/thread_download.py` searches known Windows paths (`~/Downloads/jxl*/bin/cjxl.exe`) as fallback; the settings view field `jxl_cjxl_path` overrides it; persisted `othersettings.json.jxl_*` keys are the final fallback. Keep behavior optional — absence of `cjxl.exe` must not break downloads (`tests/test_jxl_fallback.py`).

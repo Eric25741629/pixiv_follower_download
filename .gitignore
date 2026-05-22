@@ -87,3 +87,6 @@ manual_download/
 
 # 規劃文件
 docs/superpowers/
+
+# 個人歸檔（舊版 PyQt5 UI、notebooks、archive、driver zip 等）
+other/

@@ -1,9 +1,15 @@
 from __future__ import annotations
+import atexit
 import os
 import queue
 import sqlite3
+import sys
+import threading
+import time
+from collections import deque
 import flet as ft
 
+from app.core.app_logging import init_logging, get_logger
 from app.gui.dispatcher import EventDispatcher
 from app.gui.run_actions import RunController
 from app.gui.views.main_view import MainView
@@ -12,8 +18,165 @@ from app.gui.views.cookies_view import CookiesView
 from app.gui.views.stats_view import StatsView
 from app.core.stats_collector import StatsCollector
 
+_log = get_logger("pixiv.gui")
+
+# ── cross-session persistence ──────────────────────────────────────────────
+# Flet 0.84 desktop GCs the server-side session if the flutter client
+# disconnects/reconnects — observed when (a) the window is blurred for
+# several minutes, or (b) rapid nav-rail clicks block the event loop with
+# sync file I/O long enough for the flutter client to drop the TCP socket
+# and reopen it. When that happens Flet calls main(page) again with a
+# fresh page; without persistence, the new main() would build a brand-new
+# event_q and the running worker thread (which still holds a ref to the
+# OLD event_q) would be orphaned — its events flow to a queue nobody
+# polls, and the new UI shows the app reset to idle.
+#
+# Keep these alive across main() calls so a session GC doesn't kill a
+# running download. The worker thread keeps the same Queue object; the
+# new dispatcher picks up where the old one left off.
+_PERSISTENT_EVENT_Q: queue.Queue = queue.Queue()
+_PERSISTENT_STATS: StatsCollector | None = None
+_PERSISTENT_ACTIVE_THREAD = None  # populated when a worker starts; cleared on finished/next=-1
+_PERSISTENT_LOG_BUFFER: deque = deque(maxlen=300)  # replayed into new main_view on reattach
+
+# Mirror of MainView's transient UI state so the post-GC main_view can show
+# the worker's actual progress / current step instead of resetting to 0.
+# Updated in the event handlers; restored before main_view.build() runs.
+_PERSISTENT_UI_STATE: dict = {
+    "progress_value": 0,
+    "progress_total": 0,
+    "progress_started_at": None,
+    "step_states": ["idle", "idle", "idle", "idle"],
+    "phase": "",
+    "countdown": 0,
+    # Transient UI bits that were not restored before — the old reattach
+    # path left the new MainView with default "暫停" button text and no
+    # loading dialog even when a worker was paused or stopping. A user
+    # caught in either of those states during a rapid-nav session GC saw
+    # the UI "reset" to a wrong state.
+    "is_paused": False,
+    "loading_open": False,
+    "loading_message": "",
+}
+
+
+def _activate_view(views: list, idx: int) -> int:
+    """Show one view while keeping every view mounted in the Flet tree."""
+    try:
+        active_idx = int(idx)
+    except (TypeError, ValueError):
+        active_idx = 0
+    if active_idx < 0 or active_idx >= len(views):
+        active_idx = 0
+    for i, view in enumerate(views):
+        view.visible = i == active_idx
+    return active_idx
+
+# ── crash-safe flush ───────────────────────────────────────────────────────
+# Without this, an unhandled exception (in main thread, in any worker, or
+# during interpreter shutdown via a non-window-close path) tears the
+# process down without giving the active worker a chance to flush its
+# in-memory state (exist_pid set, url_meta dict, author_progress, the
+# Step 2 collected PIDs, etc.) back to disk. flush_for_shutdown() is
+# already implemented on every worker — we just need to make sure it
+# actually fires on every exit path, not only on window-close.
+_HOOKS_INSTALLED = False
+_EMERGENCY_FLUSH_LOCK = threading.Lock()
+_EMERGENCY_FLUSH_DONE = False
+
+
+def _emergency_flush(reason: str = "unknown") -> None:
+    """Idempotent best-effort flush. Safe to call from any path/thread.
+
+    MUST NOT raise — that would mask the original crash traceback.
+    """
+    global _EMERGENCY_FLUSH_DONE
+    with _EMERGENCY_FLUSH_LOCK:
+        if _EMERGENCY_FLUSH_DONE:
+            return
+        _EMERGENCY_FLUSH_DONE = True
+    t = _PERSISTENT_ACTIVE_THREAD
+    # 沒有 active worker 也沒有可 checkpoint 的 DB 時，整個函式 no-op，
+    # 避免在 atexit 路徑（stdout 可能已被 pytest 等收尾關閉）製造 logging
+    # I/O 錯誤。實作上：只在有東西要做時才寫 log。
+    if t is not None and hasattr(t, "flush_for_shutdown"):
+        try:
+            _log.warning("_emergency_flush entered: reason=%s", reason)
+        except Exception:
+            pass
+        try:
+            t.flush_for_shutdown()
+        except Exception:
+            try:
+                _log.exception("emergency flush_for_shutdown failed")
+            except Exception:
+                pass
+    try:
+        from app.core.metadata_db import DB_FILENAME
+        _db_path = os.path.join(
+            os.getenv("APPDATA", "") or "", "pixiv_download", DB_FILENAME
+        )
+        if os.path.isfile(_db_path):
+            _c = sqlite3.connect(_db_path, timeout=3.0, isolation_level=None)
+            try:
+                _c.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            finally:
+                _c.close()
+    except Exception:
+        try:
+            _log.exception("emergency wal_checkpoint failed")
+        except Exception:
+            pass
+
+
+def _install_crash_hooks() -> None:
+    """Wire sys.excepthook / threading.excepthook / atexit into emergency flush.
+
+    Called from main(page). Module-level guard ensures we don't stack hooks
+    when Flet re-invokes main(page) after session GC.
+    """
+    global _HOOKS_INSTALLED
+    if _HOOKS_INSTALLED:
+        return
+    _HOOKS_INSTALLED = True
+
+    prev_sys_excepthook = sys.excepthook
+
+    def _sys_excepthook(exc_type, exc, tb):
+        _emergency_flush(reason=f"sys.excepthook:{exc_type.__name__}")
+        try:
+            prev_sys_excepthook(exc_type, exc, tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _sys_excepthook
+
+    prev_threading_excepthook = getattr(threading, "excepthook", None)
+
+    def _threading_excepthook(args):
+        exc_type = getattr(args, "exc_type", None)
+        name = exc_type.__name__ if exc_type else "Exception"
+        _emergency_flush(reason=f"threading.excepthook:{name}")
+        try:
+            if prev_threading_excepthook is not None:
+                prev_threading_excepthook(args)
+        except Exception:
+            pass
+
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _threading_excepthook
+
+    atexit.register(_emergency_flush, "atexit")
+
 
 def main(page: ft.Page) -> None:
+    init_logging()
+    _install_crash_hooks()
+    _log.info(
+        "main(page) session start: web=%s platform=%s",
+        getattr(page, "web", "?"),
+        getattr(page, "platform", "?"),
+    )
     page.title = "Pixiv 下載器"
     page.theme_mode = ft.ThemeMode.SYSTEM
     page.theme = ft.Theme(color_scheme_seed="#0096FA")
@@ -21,35 +184,136 @@ def main(page: ft.Page) -> None:
     page.window.height = 750
     page.padding = 0
 
-    event_q: queue.Queue = queue.Queue()
+    # Reuse the persistent queue + stats so a worker that started in the
+    # previous session keeps emitting into the same Queue object after
+    # session GC. The first main() call lazily-inits the stats collector.
+    global _PERSISTENT_STATS, _PERSISTENT_ACTIVE_THREAD
+    event_q: queue.Queue = _PERSISTENT_EVENT_Q
+    if _PERSISTENT_STATS is None:
+        _PERSISTENT_STATS = StatsCollector()
+    stats_collector = _PERSISTENT_STATS
 
     main_view = MainView(page, event_q)
     settings_view = SettingsView(page)
     cookies_view = CookiesView(page, event_q)
-    stats_collector = StatsCollector()
     stats_view = StatsView(page, stats_collector)
 
     run_controller = RunController(main_view, event_q, stats_collector)
     main_view._run_controller = run_controller
 
+    # If a worker survived the previous session GC, hand it to the new
+    # main_view so pause/stop still work and the UI shows "running".
+    # Replay the buffered log lines + restore progress/step/phase state
+    # so the user sees the worker's actual progress instead of a reset
+    # 0/0 panel.
+    if _PERSISTENT_ACTIVE_THREAD is not None and _PERSISTENT_ACTIVE_THREAD.is_alive():
+        main_view._active_thread = _PERSISTENT_ACTIVE_THREAD
+        # Restore progress + step indicators BEFORE set_running so the UI
+        # reflects "worker still at PID N/M" not "fresh start at 0/M".
+        # Direct attribute assignment is safe here: build() hasn't run
+        # yet, so update() isn't called on detached controls.
+        try:
+            main_view._progress_value = int(_PERSISTENT_UI_STATE.get("progress_value", 0))
+            main_view._progress_total = int(_PERSISTENT_UI_STATE.get("progress_total", 0))
+            main_view._progress_started_at = _PERSISTENT_UI_STATE.get("progress_started_at")
+            for i, st in enumerate(_PERSISTENT_UI_STATE.get("step_states", [])[:4]):
+                main_view.set_step_state(i, st)
+            phase = str(_PERSISTENT_UI_STATE.get("phase", "") or "")
+            if phase:
+                main_view.set_phase(phase)
+            # Restore the countdown text + pause button label. Direct
+            # attribute assignment only — set_running() will not be called
+            # again for the existing worker, so we must paint the toggled
+            # state ourselves. Both controls' update() raises before build()
+            # runs and is swallowed by the surrounding try/except.
+            cd = int(_PERSISTENT_UI_STATE.get("countdown", 0) or 0)
+            if cd > 0:
+                main_view._countdown_text.value = f"倒數：{cd} 秒"
+            if bool(_PERSISTENT_UI_STATE.get("is_paused", False)):
+                main_view._is_paused = True
+                main_view._btn_pause.content = "▶ 繼續"
+        except Exception:
+            _log.exception("failed to restore persisted UI state")
+        main_view.set_running(True)
+        for html in list(_PERSISTENT_LOG_BUFFER):
+            try:
+                main_view.append_log(html)
+            except Exception:
+                pass
+        _log.warning(
+            "reattached active worker thread to new session: %s (progress=%s/%s)",
+            _PERSISTENT_ACTIVE_THREAD,
+            main_view._progress_value, main_view._progress_total,
+        )
+    elif _PERSISTENT_ACTIVE_THREAD is not None:
+        _PERSISTENT_ACTIVE_THREAD = None
+
+    # Capture the active worker into the module global whenever
+    # RunController spins one up, so a session GC mid-download still
+    # leaves us with a handle to pause/stop it after the new main()
+    # reattaches.
+    _orig_start_step = run_controller._start_step
+    def _start_step_with_tracking(n: int) -> None:
+        _orig_start_step(n)
+        global _PERSISTENT_ACTIVE_THREAD
+        _PERSISTENT_ACTIVE_THREAD = main_view._active_thread
+        # Snapshot the step-state list right after the new step's "running"
+        # flag has been set, so a session GC during this step preserves
+        # which step is currently active.
+        _PERSISTENT_UI_STATE["step_states"] = list(main_view._step_states)
+    run_controller._start_step = _start_step_with_tracking
+
     views_built = [main_view.build(), settings_view.build(), cookies_view.build(), stats_view.build()]
+    _activate_view(views_built, 0)
 
     content_area = ft.Column(
-        controls=[views_built[0]],
+        controls=views_built,
         expand=True,
     )
 
-    def on_nav_change(e: ft.ControlEvent) -> None:
-        idx = e.control.selected_index
-        content_area.controls = [views_built[idx]]
-        if idx == 2:
-            cookies_view.reload_from_settings()
-        page.update()
+    # Debounce nav clicks <150ms apart. All views stay mounted and nav only
+    # toggles visibility; otherwise worker progress/stat updates can target
+    # controls that were removed from the client tree and destabilize the
+    # Flet desktop session during downloads.
+    _nav_state = {"idx": -1, "ts": 0.0}
+    _nav_lock = threading.Lock()
 
-    # Stats auto-refresh runs for the whole session — controls only flush
-    # when their parent is on screen, but the stats values keep updating
-    # in the background so they're already current the moment the user
-    # navigates to the tab.
+    async def _reload_views_on_loop(idx: int) -> None:
+        try:
+            if idx == 1:
+                settings_view.reload_cookie_count()
+            elif idx == 2:
+                cookies_view.reload_from_settings()
+        except Exception:
+            _log.exception("nav async reload failed for idx=%s", idx)
+
+    def on_nav_change(e: ft.ControlEvent) -> None:
+        # Exceptions here must not bubble into Flet's event loop — Flet may
+        # respond to an unhandled error by resetting the session, which
+        # silently kills any running download. Log and swallow instead.
+        try:
+            idx = e.control.selected_index
+            now = time.monotonic()
+            with _nav_lock:
+                if idx == _nav_state["idx"] and (now - _nav_state["ts"]) < 0.15:
+                    _log.info("nav change → idx=%s (debounced)", idx)
+                    return
+                _nav_state["idx"] = idx
+                _nav_state["ts"] = now
+            _log.info("nav change → idx=%s", idx)
+            idx = _activate_view(views_built, idx)
+            page.update()
+            # These helpers update Flet controls, so they must run on the
+            # event-loop page thread. Running them on a daemon thread can
+            # enqueue patches from the wrong thread and trigger session GC.
+            if idx in (1, 2):
+                page.run_task(_reload_views_on_loop, idx)
+        except Exception:
+            _log.exception("on_nav_change failed")
+
+    # Stats auto-refresh runs for the whole session. The stats page remains
+    # mounted even while hidden, so its updates no longer race against nav
+    # removing/re-adding the statistics controls.
     stats_view.start_auto_refresh()
 
     nav_rail = ft.NavigationRail(
@@ -81,40 +345,95 @@ def main(page: ft.Page) -> None:
     )
 
     def handle_output(data: str) -> None:
+        # Buffer log lines so a session-GC'd successor main() can replay
+        # them into its fresh main_view (otherwise the user sees an empty
+        # log panel after Flet drops the session, even though the worker
+        # is still running fine in the background).
+        try:
+            _PERSISTENT_LOG_BUFFER.append(str(data))
+        except Exception:
+            pass
         main_view.append_log(data)
 
     def handle_progress(data: tuple) -> None:
         current, total = data
         main_view.update_progress(current, total)
+        # Mirror to module global so a post-GC successor main() can
+        # restore the bar instead of resetting to 0.
+        _PERSISTENT_UI_STATE["progress_value"] = main_view._progress_value
+        _PERSISTENT_UI_STATE["progress_total"] = main_view._progress_total
+        _PERSISTENT_UI_STATE["progress_started_at"] = main_view._progress_started_at
 
     def handle_countdown(data: int) -> None:
         main_view.update_countdown(data)
+        try:
+            _PERSISTENT_UI_STATE["countdown"] = int(data)
+        except (TypeError, ValueError):
+            pass
 
     def handle_finished(data: str) -> None:
+        global _PERSISTENT_ACTIVE_THREAD
         main_view.append_log(f"<p><font color='green'>{data}</font></p>")
         for i, st in enumerate(main_view._step_states):
             if st == "running":
                 main_view.set_step_state(i, "done")
         main_view.set_running(False)
+        _PERSISTENT_ACTIVE_THREAD = None
+        # Run finished — reset persisted state so a future new main()
+        # won't show stale "running" UI from this completed run.
+        _PERSISTENT_UI_STATE["step_states"] = list(main_view._step_states)
+        _PERSISTENT_UI_STATE["progress_value"] = 0
+        _PERSISTENT_UI_STATE["progress_total"] = 0
+        _PERSISTENT_UI_STATE["progress_started_at"] = None
+        _PERSISTENT_UI_STATE["phase"] = ""
+        _PERSISTENT_UI_STATE["countdown"] = 0
+        _PERSISTENT_UI_STATE["is_paused"] = False
+        _PERSISTENT_UI_STATE["loading_open"] = False
+        _PERSISTENT_UI_STATE["loading_message"] = ""
 
     def handle_next(data: int) -> None:
+        global _PERSISTENT_ACTIVE_THREAD
         if data == -1:
             for i, st in enumerate(main_view._step_states):
                 if st == "running":
                     main_view.set_step_state(i, "error")
+            _PERSISTENT_ACTIVE_THREAD = None
             main_view.set_running(False)
+            _PERSISTENT_UI_STATE["step_states"] = list(main_view._step_states)
+            _PERSISTENT_UI_STATE["progress_value"] = 0
+            _PERSISTENT_UI_STATE["progress_total"] = 0
+            _PERSISTENT_UI_STATE["progress_started_at"] = None
+            _PERSISTENT_UI_STATE["is_paused"] = False
+            _PERSISTENT_UI_STATE["loading_open"] = False
+            _PERSISTENT_UI_STATE["loading_message"] = ""
+            _PERSISTENT_UI_STATE["countdown"] = 0
+            _PERSISTENT_UI_STATE["phase"] = ""
             return
         for i, st in enumerate(main_view._step_states):
             if st == "running":
                 main_view.set_step_state(i, "done")
+        _PERSISTENT_UI_STATE["step_states"] = list(main_view._step_states)
         run_controller.on_next(data)
 
     def handle_loading(data) -> None:
         if isinstance(data, tuple) and len(data) == 2:
             busy, message = data
-            main_view.set_loading(bool(busy), str(message) if message else "正在啟動...")
+            msg_str = str(message) if message else "正在啟動..."
+            main_view.set_loading(bool(busy), msg_str)
+            _PERSISTENT_UI_STATE["loading_open"] = bool(busy)
+            _PERSISTENT_UI_STATE["loading_message"] = msg_str if bool(busy) else ""
         else:
             main_view.set_loading(bool(data))
+            _PERSISTENT_UI_STATE["loading_open"] = bool(data)
+            if not bool(data):
+                _PERSISTENT_UI_STATE["loading_message"] = ""
+
+    def handle_pause_state(data) -> None:
+        # Mirror MainView._is_paused after the user toggled the pause button.
+        # No UI action here — the button text was already updated inside
+        # MainView; this handler exists only to keep persistence current
+        # for a possible post-GC reattach.
+        _PERSISTENT_UI_STATE["is_paused"] = bool(data)
 
     def handle_cookie_status(data) -> None:
         if isinstance(data, tuple):
@@ -127,6 +446,11 @@ def main(page: ft.Page) -> None:
                 cookie, status = data
                 cookies_view.apply_cookie_test_result(str(cookie), str(status))
 
+    def handle_phase(data) -> None:
+        text = str(data) if data else ""
+        main_view.set_phase(text)
+        _PERSISTENT_UI_STATE["phase"] = text
+
     disp = EventDispatcher(page, event_q, {
         "output":        handle_output,
         "progress":      handle_progress,
@@ -135,7 +459,8 @@ def main(page: ft.Page) -> None:
         "next":          handle_next,
         "loading":       handle_loading,
         "cookie_status": handle_cookie_status,
-        "phase":         lambda data: main_view.set_phase(str(data) if data else ""),
+        "phase":         handle_phase,
+        "pause_state":   handle_pause_state,
     })
 
     def toggle_theme(e: ft.ControlEvent) -> None:
@@ -165,6 +490,20 @@ def main(page: ft.Page) -> None:
             expand=True,
         )
     )
+
+    # Restore the modal loading dialog AFTER page.add — set_loading() relies
+    # on page.show_dialog() which needs the page's session to be live and
+    # attached. If a session GC fired while a worker was being stopped
+    # (which holds the "正在停止，等待清理完成..." dialog for up to 60 s)
+    # we need to put it back on the new page; otherwise the buttons stay
+    # disabled-looking and the user thinks the app is frozen.
+    if bool(_PERSISTENT_UI_STATE.get("loading_open", False)):
+        msg = str(_PERSISTENT_UI_STATE.get("loading_message", "") or "正在啟動...")
+        try:
+            main_view.set_loading(True, msg)
+        except Exception:
+            _log.exception("failed to restore loading dialog")
+
     # IMPORTANT: dispatcher must run as a task on the asyncio event loop so
     # control.update() and page.update() actually flush to the client. With
     # page.run_thread() patches end up on an asyncio.Queue from the wrong
@@ -175,7 +514,8 @@ def main(page: ft.Page) -> None:
     # Without this, closing the window leaves the dispatcher polling and any
     # in-flight worker thread (incl. its concurrent.futures pool with 30 s
     # request timeouts) blocking interpreter exit via atexit hooks.
-    async def _shutdown_and_destroy() -> None:
+    async def _shutdown_and_destroy(reason: str) -> None:
+        _log.warning("_shutdown_and_destroy entered: reason=%s", reason)
         try:
             t = getattr(main_view, "_active_thread", None)
             if t is not None:
@@ -183,12 +523,12 @@ def main(page: ft.Page) -> None:
                     try:
                         t.flush_for_shutdown()
                     except Exception:
-                        pass
+                        _log.exception("flush_for_shutdown failed")
                 if hasattr(t, "stop"):
                     try:
                         t.stop()
                     except Exception:
-                        pass
+                        _log.exception("active_thread.stop() failed")
             # Merge any un-checkpointed WAL pages into the main DB file so the
             # on-disk state is consistent before os._exit(0) bypasses atexit.
             # PASSIVE mode is non-blocking: checkpoints what it can without
@@ -203,25 +543,44 @@ def main(page: ft.Page) -> None:
                     _c.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     _c.close()
             except Exception:
-                pass
+                _log.exception("wal_checkpoint failed during shutdown")
         finally:
             disp.stop()
+            # Catch BaseException — asyncio.CancelledError is BaseException
+            # in 3.8+ and was previously letting control skip os._exit(0),
+            # which left the Python process alive but with the active
+            # download thread already stopped: app appeared to "reset to
+            # home" with downloads silently killed.
             try:
                 await page.window.destroy()
-            except Exception:
-                pass
+            except BaseException:
+                _log.exception("page.window.destroy() failed (continuing to exit)")
+            _log.warning("calling os._exit(0)")
             # concurrent.futures registers an atexit hook that joins its
             # daemon workers; an in-flight requests.get with a 30 s timeout
             # would otherwise block the process from exiting.
             os._exit(0)
 
     async def on_window_event(e) -> None:
-        if getattr(e, "type", None) == ft.WindowEventType.CLOSE:
-            await _shutdown_and_destroy()
+        ev_type = getattr(e, "type", None)
+        _log.info("window event: %s", ev_type)
+        if ev_type == ft.WindowEventType.CLOSE:
+            await _shutdown_and_destroy("window_close")
 
     async def on_disconnect(e) -> None:
-        # Web mode: tab/window closed.
-        await _shutdown_and_destroy()
+        # Flet's docs say on_disconnect only fires on web tab close. In
+        # desktop mode it should never fire during normal use — if it does,
+        # the previous behaviour (stop active thread + os._exit) wiped any
+        # running download, so we now log-and-ignore on desktop and only
+        # tear down on actual web disconnects.
+        is_web = bool(getattr(page, "web", False))
+        _log.warning(
+            "on_disconnect fired: web=%s — %s",
+            is_web,
+            "tearing down" if is_web else "ignoring (desktop)",
+        )
+        if is_web:
+            await _shutdown_and_destroy("web_disconnect")
 
     page.window.prevent_close = True
     page.window.on_event = on_window_event

@@ -211,11 +211,15 @@ def _setup_filtered_db(tmp_path):
 
 def test_filtered_no_like_min_excludes_downloaded(tmp_path):
     db = _setup_filtered_db(tmp_path)
-    db.mark_downloaded("1001")
+    # New schema: marking a URL done flips its page to status='downloaded',
+    # which is what the filter excludes (per-page granularity). The legacy
+    # ``mark_downloaded(pid)`` only touches the deprecated downloaded table
+    # and isn't a reliable signal in the new world.
+    db.mark_url_done("https://i.pximg.net/img-original/img/2024/01/01/12/00/00/1001_p0.jpg")
 
     rows = db.get_pending_urls_filtered(like_min=0)
     pids = {pid for _, pid in rows}
-    assert "1001" not in pids   # downloaded → excluded
+    assert "1001" not in pids   # page downloaded → excluded
     assert "1002" in pids
     assert "1003" in pids
     assert "1004" in pids
@@ -223,11 +227,11 @@ def test_filtered_no_like_min_excludes_downloaded(tmp_path):
 
 def test_filtered_like_min_500_excludes_low_and_downloaded(tmp_path):
     db = _setup_filtered_db(tmp_path)
-    db.mark_downloaded("1001")
+    db.mark_url_done("https://i.pximg.net/img-original/img/2024/01/01/12/00/00/1001_p0.jpg")
 
     rows = db.get_pending_urls_filtered(like_min=500)
     pids = {pid for _, pid in rows}
-    assert "1001" not in pids   # downloaded
+    assert "1001" not in pids   # page downloaded → excluded
     assert "1002" not in pids   # likes=300 < 500
     assert "1003" not in pids   # likes=50 < 500
     assert "1004" in pids       # no metadata → kept (IS NULL)

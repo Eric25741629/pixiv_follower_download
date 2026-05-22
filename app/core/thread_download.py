@@ -1,3 +1,4 @@
+import contextlib
 import time
 import json
 import os
@@ -13,7 +14,7 @@ import zipfile
 import shutil
 import subprocess
 import tempfile
-from queue import Queue
+from queue import Queue, Empty
 from PIL import Image
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
@@ -23,15 +24,20 @@ from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
     atomic_write_json,
     atomic_write_text,
+    count_text_lines,
     fetch_with_cookie_retry,
     init_cookie_fields,
     load_exist_pid_set,
+    mirror_meta_dict_to_db,
+    normalize_filter_tags,
     normalize_pid,
     output_err,
     safe_read_json,
+    to_int_lenient,
     trash_file,
+    write_all_url_file,
 )
-from app.core.metadata_db import MetadataDB
+from app.core.metadata_db import MetadataDB, emit_db_stats, mirror_exist_pid_set, open_metadata_db
 from app.core.pixiv_thread_base import (
     PauseableThread,
     _normalize_special_like_rules,
@@ -108,9 +114,12 @@ class download_thread(PauseableThread):
 
         if not os.path.exists(self.download_path):
             os.mkdir(self.download_path)
-        self.exist_pid = self._load_initial_exist_pid_set()
+        # Order matters: ``_load_initial_exist_pid_set`` now reads from
+        # ``v_closed_artworks`` in the SQLite cache, so ``_metadata_db``
+        # has to be initialised first.
         self.url_meta = self._load_initial_url_meta()
         self._metadata_db = self._init_metadata_db(self.url_meta)
+        self.exist_pid = self._load_initial_exist_pid_set()
         self._mirror_exist_pid_to_db()
         self._emit_metadata_db_stats(stage="Step4")
         self._warn_if_meta_empty_with_like_filter()
@@ -194,6 +203,12 @@ class download_thread(PauseableThread):
         self._jxl_fail_count = 0
         self._jxl_src_total_bytes = 0
         self._jxl_dst_total_bytes = 0
+        # Background JXL conversion: a single worker thread drains a FIFO
+        # queue so cjxl runs do not block downloads.  All counter mutations
+        # stay on this single worker (no lock needed); the main thread only
+        # reads them after _drain_jxl_queue() in finalize.
+        self._jxl_queue: Queue = Queue()
+        self._jxl_worker_thread: threading.Thread | None = None
 
     def _init_filter_state(self, like_num, ban_tag, must_tag, special_like_rules,
                            filename_template=""):
@@ -237,32 +252,25 @@ class download_thread(PauseableThread):
         self._cookie_usage_seen = {"step4": set()}
 
     def _load_initial_exist_pid_set(self):
-        """Union the canonical exist_pid set with PIDs found in the download folder."""
+        """Compute the 'do not redownload' PID set.
+
+        Reads from the SQLite ``v_closed_artworks`` view: complete artworks
+        (meta + every page on disk), Pixiv-revoked artworks, and legacy
+        imports with no pending work. Critically this view excludes
+        partial-download PIDs (some pages on disk, some still pending) so
+        Bug 2 — failed pages becoming permanently invisible because the
+        PID looked "downloaded" — cannot recur.
+
+        Externally-dropped files (added to download_path outside the app)
+        get picked up by ``_sync_exist_pid_from_download_folder`` before
+        Step 3, which updates the DB. We deliberately do *not* run a disk
+        scan here — that scan was the original source of Bug 2.
+        """
         try:
-            base_exist = load_exist_pid_set(self.path)
-            return base_exist.union(set(self.splitID(self.get_filelist(self.download_path))))
+            db = getattr(self, "_metadata_db", None)
+            return db.closed_artwork_set() if db is not None else set()
         except Exception:
-            return set(self.splitID(self.get_filelist(self.download_path)))
-
-    def _load_initial_url_meta(self):
-        """Step 4 uses DB-on-demand reads; in-memory dict is write-through cache only."""
-        return {}
-
-    def _get_meta(self, pid_key: str) -> dict:
-        """Return metadata for pid_key: in-memory cache first, then DB lookup."""
-        pid_key = str(pid_key)
-        cached = self.url_meta.get(pid_key) if isinstance(self.url_meta, dict) else None
-        if isinstance(cached, dict) and cached:
-            return cached
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                meta = db.get_meta(pid_key)
-                if isinstance(meta, dict) and meta:
-                    return meta
-            except Exception:
-                pass
-        return {}
+            return set()
 
     def _warn_if_meta_empty_with_like_filter(self):
         """Surface a clear warning when meta is missing/empty AND a like filter
@@ -329,6 +337,7 @@ class download_thread(PauseableThread):
                     f"<p><font color='gray'>從 DB 讀取 {len(self.allurl)} 筆待下載 URL"
                     f"（SQL 預篩：exist_pid 已排除"
                     f"{f'、like<{like_min} 已排除' if like_min > 0 else ''}）</font></p>"))
+                self._enqueue_retriable_failures(db)
                 return
             except Exception:
                 pass
@@ -341,6 +350,44 @@ class download_thread(PauseableThread):
             print("正在過濾已存在的 PID...")
         except Exception:
             self._q.put(WorkerEvent("finished", 'Task finished'))
+
+    def _enqueue_retriable_failures(self, db) -> None:
+        """Append URLs from prior failed pages back into ``self.allurl``.
+
+        Each retried page is flipped to ``status='pending'`` so the rest of
+        the pipeline (filter, download, success/fail marking) is unaware of
+        the auto-retry. ``mark_page_pending`` preserves ``attempt_count`` and
+        ``last_attempted_at`` via COALESCE, so the cooldown check on the
+        next run remains accurate if the retry fails again.
+        """
+        try:
+            from app.core.pid_filesystem import parse_pid_and_page_from_url
+            retry_rows = db.get_retriable_failed_pages()
+        except Exception:
+            return
+        if not retry_rows:
+            return
+        retry_urls: list[str] = []
+        for url, pid in retry_rows:
+            self._requeue_failed_page(db, url, pid, parse_pid_and_page_from_url)
+            retry_urls.append(url)
+        if not retry_urls:
+            return
+        self.allurl.extend(retry_urls)
+        self._q.put(WorkerEvent("output",
+            f"<p><font color='gray'>{len(retry_urls)} 筆 URL 自先前失敗紀錄重新加入下載佇列</font></p>"))
+
+    @staticmethod
+    def _requeue_failed_page(db, url, pid, parser) -> None:
+        """Flip one failed page row back to pending; tolerate any single-row error."""
+        try:
+            parsed_pid, pidx = parser(str(url))
+            target_pid = parsed_pid or pid
+            if target_pid is None or pidx is None:
+                return
+            db.mark_page_pending(target_pid, pidx, url=str(url))
+        except Exception:
+            pass
 
     def _emit_step4_init_diag(self, raw_allurl_count):
         """Append a step4_init record with the post-filter task summary."""
@@ -359,35 +406,6 @@ class download_thread(PauseableThread):
             single_mode=bool(self.single_mode_flag),
         )
 
-    def _record_cookie_usage(self, stage, pid, cookie_value):
-        stage_key = str(stage or "").strip().lower()
-        if stage_key not in self._cookie_usage_counts:
-            return ""
-        cookie_text = str(cookie_value or "").strip()
-        label = _cookie_usage_label(cookie_text, self.cookie_pool, self._cookie_alias_map)
-        if not cookie_text:
-            return label
-        pid_key = normalize_pid(pid) or str(pid)
-        try:
-            seen = self._cookie_usage_seen.setdefault(stage_key, set())
-            if pid_key in seen:
-                return label
-            seen.add(pid_key)
-            counts = self._cookie_usage_counts.setdefault(stage_key, {})
-            counts[label] = int(counts.get(label, 0)) + 1
-        except Exception:
-            pass
-        return label
-
-    def _emit_cookie_usage_summary(self, stage, title):
-        try:
-            stage_key = str(stage or "").strip().lower()
-            counts = self._cookie_usage_counts.get(stage_key, {}) if isinstance(self._cookie_usage_counts, dict) else {}
-            summary = _format_cookie_usage_summary(counts, self.cookie_pool, self._cookie_alias_map)
-            self._q.put(WorkerEvent("output", f"<p><font color='gray'>[{title}] {summary}</font></p>"))
-        except Exception:
-            pass
-
     def _diag(self, event, **fields):
         try:
             append_diagnostic_event(self.path, event, stage="step4", **fields)
@@ -395,65 +413,10 @@ class download_thread(PauseableThread):
             pass
 
     def _count_text_lines(self, file_path):
-        try:
-            with open(file_path, encoding="utf-8", errors="ignore") as f:
-                return sum(1 for line in f if str(line).strip())
-        except Exception:
-            return 0
+        return count_text_lines(file_path)
 
     def _write_all_url_file(self, urls, reason="unknown"):
-        file_path = os.path.join(self.path, "all_url.txt")
-        safe_lines = [str(x) for x in (urls or [])]
-        before_count = self._count_text_lines(file_path)
-        self._diag(
-            "all_url_write_attempt",
-            reason=reason,
-            before_count=before_count,
-            target_count=len(safe_lines),
-        )
-        try:
-            atomic_write_text(file_path, safe_lines, backup=True)
-            after_count = self._count_text_lines(file_path)
-            self._diag(
-                "all_url_write_done",
-                reason=reason,
-                success=True,
-                before_count=before_count,
-                after_count=after_count,
-            )
-            return True
-        except Exception as err:
-            self._diag(
-                "all_url_write_primary_failed",
-                reason=reason,
-                error=str(err),
-            )
-            try:
-                from safe_io import backup_file
-                backup_file(file_path)
-            except Exception:
-                pass
-            try:
-                with open(file_path, "w+", encoding="utf-8") as f:
-                    f.writelines([line + "\n" for line in safe_lines])
-                after_count = self._count_text_lines(file_path)
-                self._diag(
-                    "all_url_write_done",
-                    reason=reason,
-                    success=True,
-                    via="fallback",
-                    before_count=before_count,
-                    after_count=after_count,
-                )
-                return True
-            except Exception as fallback_err:
-                self._diag(
-                    "all_url_write_done",
-                    reason=reason,
-                    success=False,
-                    error=str(fallback_err),
-                )
-                return False
+        return write_all_url_file(self.path, urls, reason=reason, diag=self._diag)
 
     def _normalize_pixiv_info(self, info):
         """Normalize Pixiv_info result to (tag, like, pagecount, img_url)."""
@@ -469,29 +432,10 @@ class download_thread(PauseableThread):
         return None
 
     def _to_int(self, value, default=None):
-        try:
-            if isinstance(value, str):
-                s = value.strip().replace(",", "").replace("_", "")
-                if not s:
-                    return default
-                return int(float(s))
-            return int(value)
-        except Exception:
-            return default
+        return to_int_lenient(value, default)
 
     def _normalize_filter_tags(self, tags):
-        out = []
-        if not isinstance(tags, list):
-            return out
-        try:
-            tags = tag_edit.Tag(tags)
-        except Exception:
-            pass
-        for t in tags:
-            s = str(t).strip()
-            if s:
-                out.append(s.lower())
-        return list(dict.fromkeys(out))
+        return normalize_filter_tags(tags)
 
     def _normalize_artwork_tags(self, tags):
         if isinstance(tags, list):
@@ -572,11 +516,7 @@ class download_thread(PauseableThread):
         if self._step4_filter_skip_notice_emitted:
             return
         self._step4_filter_skip_notice_emitted = True
-        try:
-            self._q.put(WorkerEvent("output",
-                "<p><font color='gray'>[Step4過濾] 已啟用精簡輸出，將改為摘要顯示</font></p>"))
-        except Exception:
-            pass
+        self._emit_output("<p><font color='gray'>[Step4過濾] 已啟用精簡輸出，將改為摘要顯示</font></p>")
 
     def _maybe_emit_step4_skip_summary(self, total):
         try:
@@ -646,23 +586,6 @@ class download_thread(PauseableThread):
             pass
         return latest
 
-    def _select_cookie_for_pid(self, pid):
-        pid_key = normalize_pid(pid) or str(pid)
-        try:
-            if pid_key in self._pid_cookie_selection:
-                return self._pid_cookie_selection.get(pid_key, "")
-        except Exception:
-            pass
-        if self.cookie_pool:
-            selected = pyrandom.choice(self.cookie_pool)
-        else:
-            selected = str(self.cookies or "").strip()
-        try:
-            self._pid_cookie_selection[pid_key] = selected
-        except Exception:
-            pass
-        return selected
-
     def _has_any_cookie(self):
         if self.cookie_pool:
             return True
@@ -712,6 +635,13 @@ class download_thread(PauseableThread):
             info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/' + pid, self.agent, cookie=pid_cookie)
         else:
             info = pixiv_api.Pixiv_info('https://www.pixiv.net/artworks/' + pid, self.agent)
+        if info == [404]:
+            db = getattr(self, "_metadata_db", None)
+            if db is not None:
+                try:
+                    db.mark_artwork_revoked(pid)
+                except Exception:
+                    pass
         return self._normalize_pixiv_info(info)
 
     def _build_artwork_headers(self, pid, pid_cookie, need_cookie, *, honour_pid_used=False):
@@ -829,6 +759,13 @@ class download_thread(PauseableThread):
             info = self._fetch_filter_meta_via_scheduler(pid_key, url, need_cookie)
         else:
             info = self._fetch_filter_meta_direct(pid_key, url, need_cookie)
+        if info == [404]:
+            db = getattr(self, "_metadata_db", None)
+            if db is not None:
+                try:
+                    db.mark_artwork_revoked(pid_key)
+                except Exception:
+                    pass
         normalized = self._normalize_pixiv_info(info)
         if not normalized:
             return None
@@ -1202,6 +1139,69 @@ class download_thread(PauseableThread):
         src_path = str(src_path)
         ok, reason = self._jxl_run_conversion(src_path, dst_path, ext)
         self._jxl_record_outcome(src_path, dst_path, ok, reason)
+
+    def _start_jxl_worker_if_needed(self):
+        """Lazily spawn the background cjxl worker on first enqueue."""
+        if self._jxl_worker_thread is not None and self._jxl_worker_thread.is_alive():
+            return
+        t = threading.Thread(target=self._jxl_worker_loop, daemon=True, name="jxl-worker")
+        t.start()
+        self._jxl_worker_thread = t
+
+    def _jxl_worker_loop(self):
+        """Process queued source paths one at a time.  Exits cleanly on the
+        ``None`` sentinel pushed by ``_drain_jxl_queue``."""
+        while True:
+            src_path = self._jxl_queue.get()
+            if src_path is None:
+                with contextlib.suppress(Exception):
+                    self._jxl_queue.task_done()
+                return
+            try:
+                with contextlib.suppress(Exception):
+                    self._convert_file_to_jxl(src_path)
+            finally:
+                with contextlib.suppress(Exception):
+                    self._jxl_queue.task_done()
+
+    def _enqueue_jxl(self, src_path):
+        """Hand a source file off to the background worker.  Non-blocking;
+        falls through silently when JXL is disabled or the path is empty."""
+        if not self.jxl_enable or not src_path:
+            return
+        self._start_jxl_worker_if_needed()
+        with contextlib.suppress(Exception):
+            self._jxl_queue.put(str(src_path))
+
+    def _discard_pending_jxl_items(self):
+        """Drain queued items without running cjxl (used on user stop so the
+        user is not left waiting on a long backlog).  Does not interrupt
+        the in-flight conversion."""
+        while True:
+            try:
+                self._jxl_queue.get_nowait()
+            except (Empty, Exception):
+                return
+            with contextlib.suppress(Exception):
+                self._jxl_queue.task_done()
+
+    def _drain_jxl_queue(self):
+        """Wait for queued conversions to finish, then shut the worker down.
+
+        On normal completion, blocks until every enqueued file has been
+        processed so the JXL summary is accurate.  On a user-initiated stop,
+        discards pending items first (keeps in-flight conversion only) so
+        the user is not left waiting minutes for a long backlog."""
+        worker = self._jxl_worker_thread
+        if worker is None or not worker.is_alive():
+            return
+        if self._stop_event.is_set():
+            self._discard_pending_jxl_items()
+        with contextlib.suppress(Exception):
+            self._jxl_queue.join()
+        with contextlib.suppress(Exception):
+            self._jxl_queue.put(None)
+            worker.join(timeout=5.0)
 
     def _normalize_ugoira_frames(self, frame_blobs):
         loaded_frames = []
@@ -1826,10 +1826,7 @@ class download_thread(PauseableThread):
         )
         self._emit_step4_filter_skip_final_summary()
         self._emit_cookie_usage_summary("step4", "Step4 Cookie統計")
-        try:
-            self._q.put(WorkerEvent("output", "<p><font color='orange'>Step4 無待下載 URL，保留現有 all_url.txt 不改寫</font></p>"))
-        except Exception:
-            pass
+        self._emit_output("<p><font color='orange'>Step4 無待下載 URL，保留現有 all_url.txt 不改寫</font></p>")
         if self._stopped_by_request or self._stop_event.is_set():
             self._q.put(WorkerEvent("finished", 'Task finished'))
             self._q.put(WorkerEvent("next", -1))
@@ -1869,11 +1866,7 @@ class download_thread(PauseableThread):
         failed_nested = []
         for idx, pid in enumerate(pid_order, start=1):
             if self._stop_after_group:
-                try:
-                    self._q.put(WorkerEvent("output",
-                        "<p><font color='orange'>收到中止要求：已在上一個 PID 組完成後停止</font></p>"))
-                except Exception:
-                    pass
+                self._emit_output("<p><font color='orange'>收到中止要求：已在上一個 PID 組完成後停止</font></p>")
                 break
             if self._stop_event.is_set():
                 break
@@ -1893,11 +1886,18 @@ class download_thread(PauseableThread):
                 failed_nested.append(self._download_pid_group(pid, urls))
 
             self._active_group_pid = None
-            self._maybe_flush_exist_pid(pid)
+            # Bug 1 fix: only mark the PID as downloaded when the whole
+            # group succeeded. Previously this ran unconditionally, so
+            # multi-page artworks where some pages failed got the entire
+            # PID stamped as downloaded — the remaining pages then became
+            # invisible to subsequent runs.
+            if not failed_nested[-1]:
+                self._maybe_flush_exist_pid(pid)
             done = getattr(self, "_step4_pid_done", 0) + 1
             self._step4_pid_done = done
             total = getattr(self, "_step4_pid_total", len(pid_order))
             self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
+            self._maybe_flush_url_meta_periodically(done)
             if self._stop_event.is_set():
                 break
             # _sleep_between_downloads is a no-op when scheduler is set;
@@ -1926,6 +1926,7 @@ class download_thread(PauseableThread):
                 done += 1
                 self._step4_pid_done = done
                 self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
+                self._maybe_flush_url_meta_periodically(done)
         return failed_nested
 
     def _execute_downloads(self, pid_order, pid_groups):
@@ -1994,53 +1995,19 @@ class download_thread(PauseableThread):
 
     def _init_metadata_db(self, json_meta):
         """Open the SQLite metadata cache and migrate JSON contents on first use."""
-        try:
-            db = MetadataDB(self.path)
-            if isinstance(json_meta, dict) and json_meta and db.meta_count() == 0:
-                db.import_meta_dict(json_meta)
-            return db
-        except Exception:
-            return None
+        return open_metadata_db(self.path, json_meta)
 
     def _emit_metadata_db_stats(self, stage="Step"):
         """Print a one-liner with current SQLite cache size."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            meta_n = db.meta_count()
-            dl_n = db.downloaded_count()
-        except Exception:
-            return
-        try:
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[{stage} SQLite] metadata.sqlite3 載入 "
-                f"{meta_n} 筆 meta、{dl_n} 筆已下載</font></p>"
-            ))
-        except Exception:
-            pass
+        emit_db_stats(getattr(self, "_metadata_db", None), self._q, stage=stage)
 
     def _mirror_exist_pid_to_db(self):
         """Best-effort copy of the in-memory exist_pid set into the SQLite cache."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            if self.exist_pid:
-                db.import_downloaded_set(self.exist_pid)
-        except Exception:
-            pass
+        mirror_exist_pid_set(getattr(self, "_metadata_db", None), self.exist_pid)
 
     def _sync_meta_to_db(self):
         """Mirror the in-memory ``self.url_meta`` into the SQLite cache."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            if isinstance(self.url_meta, dict) and self.url_meta:
-                db.import_meta_dict(self.url_meta)
-        except Exception:
-            pass
+        mirror_meta_dict_to_db(getattr(self, "_metadata_db", None), self.url_meta)
 
     @staticmethod
     def _meta_to_db_kwargs(meta):
@@ -2088,34 +2055,61 @@ class download_thread(PauseableThread):
             if lock is not None:
                 lock.release()
 
+    def _mark_completed_urls_in_db(self, fail_records):
+        """Mark URLs that were attempted and didn't fail as done in SQLite.
+        Silently skips if the DB is not wired or anything goes wrong — this
+        is purely an optimisation for subsequent runs."""
+        db = getattr(self, "_metadata_db", None)
+        if db is None:
+            return
+        try:
+            fail_url_set = {str(u) for u, _ in fail_records}
+            with self._attempted_urls_lock:
+                attempted = set(self._attempted_urls)
+            done_urls = [u for u in self.allurl if u in attempted and u not in fail_url_set]
+            db.mark_urls_done(done_urls)
+        except Exception:
+            pass
+
     def _finalize_downloads(self, failed_nested):
         fail_records = self._classify_download_results(failed_nested)
         if fail_records:
             err_lines = [f"{url_text} {info_text}" for url_text, info_text in fail_records]
             atomic_write_text(self.path + "/err_url.txt", err_lines, backup=False)
+            self._shadow_mark_failures(fail_records)
         self._diag("step4_fail_records", fail_record_count=len(fail_records))
         stop_to_download = [self.q.get() for _ in range(self.q.qsize())]
         remaining_urls = self._compute_remaining_urls(stop_to_download, fail_records)
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                fail_url_set = {str(u) for u, _ in fail_records}
-                with self._attempted_urls_lock:
-                    attempted = set(self._attempted_urls)
-                done_urls = [
-                    u for u in self.allurl
-                    if u in attempted and u not in fail_url_set
-                ]
-                db.mark_urls_done(done_urls)
-            except Exception:
-                pass
+        self._mark_completed_urls_in_db(fail_records)
         self._write_all_url_file(remaining_urls, reason="step4_remaining")
-        try:
-            self._q.put(WorkerEvent("output", f"<p><font color='gray'>已更新 all_url.txt，剩餘 {len(remaining_urls)} 筆待下載</font></p>"))
-        except Exception:
-            pass
+        self._emit_output(f"<p><font color='gray'>已更新 all_url.txt，剩餘 {len(remaining_urls)} 筆待下載</font></p>")
         self._persist_url_meta()
         return remaining_urls
+
+    def _shadow_mark_failures(self, fail_records) -> None:
+        """Mirror err_url.txt writes into ``pages(status='failed')``.
+
+        ``fail_records`` is the list of ``[url, info]`` produced by
+        ``_classify_download_results``; we parse each URL into (pid, page)
+        and call ``mark_page_failed`` so Phase 6's auto-retry path can
+        pick them up.  Silent on any failure — shadow write is best-effort.
+        """
+        db = getattr(self, "_metadata_db", None)
+        if db is None:
+            return
+        try:
+            from app.core.pid_filesystem import parse_pid_and_page_from_url
+            for url_text, info_text in fail_records:
+                pid, pidx = parse_pid_and_page_from_url(str(url_text))
+                if pid is None or pidx is None:
+                    continue
+                db.mark_page_failed(
+                    pid, pidx,
+                    failure_reason=str(info_text),
+                    url=str(url_text),
+                )
+        except Exception:
+            pass
 
     def _maybe_flush_exist_pid(self, pid: str) -> None:
         """Add pid to exist_pid and mark downloaded in DB immediately."""
@@ -2128,6 +2122,25 @@ class download_thread(PauseableThread):
                     db.mark_downloaded(pid_key)
                 except Exception:
                     pass
+
+    # 每 N 個 PID 組之後額外 flush url_meta；exist_pid + DB 已逐筆寫，
+    # 這裡只是把每組 cookie_used / requires_cookie 等 url_meta 變動推到 DB。
+    _STEP4_URL_META_FLUSH_EVERY = 10
+
+    def _maybe_flush_url_meta_periodically(self, done_count: int) -> None:
+        """Best-effort periodic url_meta DB sync. Idempotent under concurrent calls."""
+        try:
+            every = int(self._STEP4_URL_META_FLUSH_EVERY)
+        except Exception:
+            every = 10
+        if every <= 0 or done_count <= 0:
+            return
+        if done_count % every != 0:
+            return
+        try:
+            self._persist_url_meta()
+        except Exception:
+            pass
 
     def _refresh_and_write_exist_pid(self):
         # Merge disk state into memory (full scan catches PIDs from previous runs)
@@ -2149,6 +2162,13 @@ class download_thread(PauseableThread):
 
     def _emit_step4_summary_and_finalize(self, remaining_urls):
         if self.jxl_enable:
+            # Wait for any backlog the background worker still has — counters
+            # used in the summary below are written only by that worker, so
+            # we must drain before reading.  On user-stop, drain discards
+            # pending items so the summary fires promptly.
+            if self._jxl_worker_thread is not None and self._jxl_worker_thread.is_alive():
+                self._emit_output("<p><font color='gray'>等待背景 JXL 轉檔完成...</font></p>")
+            self._drain_jxl_queue()
             try:
                 total_saved = int(self._jxl_src_total_bytes) - int(self._jxl_dst_total_bytes)
                 total_ratio = 0.0
@@ -2303,18 +2323,6 @@ class download_thread(PauseableThread):
             return 0
         is_ugoira = 'ugoira' in resolved_url
         return self._dispatch_download(original_url, resolved_url, session, is_ugoira)
-    def __del__(self):
-        try:
-            executor = getattr(self, 'executor', None)
-            if executor is not None:
-                executor.shutdown(wait=False)
-        except Exception:
-            pass
-        try:
-            self.wait()
-        except Exception:
-            pass
-
     def _stamp_step4_gif_cookie_usage(self, pid_key, source):
         """Mark requires_cookie + cookie_used on the in-memory url_meta entry and DB."""
         try:
@@ -2529,7 +2537,7 @@ class download_thread(PauseableThread):
             self._save_ugoira_gif(frame_blobs, saved_gif_path, delay_info)
             if self._stats_collector is not None:
                 self._stats_collector.report_file(True)
-            self._convert_file_to_jxl(saved_gif_path)
+            self._enqueue_jxl(saved_gif_path)
             return 0
         except (requests.exceptions.ProxyError,
                 requests.exceptions.ConnectTimeout,
@@ -2602,6 +2610,12 @@ class download_thread(PauseableThread):
             raise ValueError("Pixiv_info 回傳格式異常")
         tag, like, pagecount, img_url = normalized
         if like == 404 and tag == 404:
+            db = getattr(self, "_metadata_db", None)
+            if db is not None:
+                try:
+                    db.mark_artwork_revoked(pid)
+                except Exception:
+                    pass
             return 0  # treat as success — nothing to download
         page, picture_format = self._jpg_extract_page_and_format(url)
         headers = self._jpg_build_headers(pid, pid_cookie, need_cookie)
@@ -2624,7 +2638,7 @@ class download_thread(PauseableThread):
         if self._stats_collector is not None:
             self._stats_collector.report_bytes(size)
             self._stats_collector.report_file(True)
-        self._convert_file_to_jxl(filepath)
+        self._enqueue_jxl(filepath)
         return 0
 
     def jpg_download(self, url, session=None):
@@ -2676,10 +2690,7 @@ class download_thread(PauseableThread):
             # 若目前在暫停中，先解除暫停，才能在當前 PID 組完成後停下
             if not self._pause_event.is_set():
                 self._pause_event.set()
-                try:
-                    self._q.put(WorkerEvent("output", "<p><font color='orange'>收到中止要求：已解除暫停，將在當前 PID 組完成後停止</font></p>"))
-                except Exception:
-                    pass
+                self._emit_output("<p><font color='orange'>收到中止要求：已解除暫停，將在當前 PID 組完成後停止</font></p>")
             try:
                 if self._active_group_pid is not None:
                     self._q.put(WorkerEvent("output", f"<p><font color='orange'>收到中止要求：目前正在處理 PID {self._active_group_pid}，將在此組完成後停止</font></p>"))

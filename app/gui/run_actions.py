@@ -16,6 +16,7 @@ from app.core.account_scheduler import AccountState, AccountScheduler
 from app.core.proxy_utils import parse_proxy_url
 from app.core.pixiv_thread_utils import (
     safe_read_json, load_exist_pid_set, normalize_cookie_entries, backup_file,
+    sync_exist_pid_with_download_folder,
 )
 from app.core.metadata_db import DB_FILENAME
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
@@ -100,7 +101,12 @@ class RunController:
     def _extract_cookie_entries(self, auth: dict) -> list[dict]:
         """Pull configured cookie entries (cookie + alias + status +
         last_tested_at) from auth settings, normalising whatever shape
-        the user has saved."""
+        the user has saved.
+
+        Entries explicitly disabled (``enabled is False``) are dropped
+        from the result so disabled accounts never reach the validator
+        or scheduler, and a gray skip notice is logged for each one.
+        """
         raw = auth.get("cookies_entries") or auth.get("cookies_pool") or []
         if not raw:
             single = str(auth.get("cookies", "") or "").strip()
@@ -109,7 +115,17 @@ class RunController:
         alias_map = auth.get("cookies_aliases") or {}
         if not isinstance(alias_map, dict):
             alias_map = {}
-        return normalize_cookie_entries(raw, alias_map=alias_map)
+        entries = normalize_cookie_entries(raw, alias_map=alias_map)
+        kept: list[dict] = []
+        for e in entries:
+            if e.get("enabled") is False:
+                alias = (e.get("alias") or "").strip() or "Cookie"
+                self._log(
+                    f"<p><font color='gray'>Cookie「{alias}」已停用，本次跳過</font></p>"
+                )
+                continue
+            kept.append(e)
+        return kept
 
     @staticmethod
     def _cookie_cache_is_fresh(entry, now):
@@ -235,6 +251,35 @@ class RunController:
         except Exception:
             pass
 
+    def _refresh_cookie_timestamp(self, cookie: str) -> None:
+        """Extend the trust-cache window for a cookie that just had its
+        first successful network request this run.  Only touches
+        last_tested_at — never changes status — so a subsequent
+        _invalidate_cookie_status() call still overwrites with 失效."""
+        if not cookie:
+            return
+        import time as _time
+        try:
+            store = _store()
+            auth = store.get_section("auth")
+            entries = auth.get("cookies_entries") or []
+            if not isinstance(entries, list):
+                return
+            now = _time.time()
+            new_entries = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    new_entries.append(e)
+                    continue
+                c = str(e.get("cookie", "")).strip()
+                if c == cookie.strip() and e.get("status") == "有效":
+                    new_entries.append({**e, "last_tested_at": now})
+                else:
+                    new_entries.append(e)
+            store.update_section("auth", {**auth, "cookies_entries": new_entries})
+        except Exception:
+            pass
+
     def _invalidate_cookie_status(self, cookie: str) -> None:
         """Mark a single cookie as 失效 in settings (called from the
         scheduler's on_disable callback when proxy/auth fails at
@@ -312,6 +357,7 @@ class RunController:
             emit=self._log,
             q=self._event_q,
             on_disable=lambda acc: self._invalidate_cookie_status(acc.cookie),
+            on_first_success=lambda acc: self._refresh_cookie_timestamp(acc.cookie),
         )
 
     def _start_step(self, n: int) -> None:
@@ -383,11 +429,68 @@ class RunController:
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
 
+    def _legacy_scan_paths(self) -> list[str]:
+        """Optional list of legacy download folders to also scan for already-
+        downloaded PIDs. Configured via settings.json
+        ``download.legacy_scan_paths: [str]`` — useful when the user changes
+        download path; without this, previously-downloaded PIDs in the old
+        folder aren't tracked and Step 3/4 re-fetch them.
+        """
+        try:
+            dl_section = _store().get_section("download")
+            raw = dl_section.get("legacy_scan_paths") or []
+        except Exception:
+            return []
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for p in raw:
+            s = str(p or "").strip()
+            if s and os.path.isdir(s):
+                out.append(s)
+        return out
+
+    def _sync_exist_pid_from_download_folder(self, dl_path: str, base_path: str, step_num: int) -> None:
+        """Recursively scan the configured download folder (plus any
+        ``download.legacy_scan_paths`` extras) and union newly-detected PIDs
+        into exist_pid.json. Legacy paths are scanned with the same cached
+        file-count optimisation, so re-runs are cheap once the cache warms up.
+        Replaces the legacy _sync_exist_pid_before_step34 helper that was
+        lost during the PyQt5→Flet migration.
+        """
+        primary = (dl_path or "").strip()
+        extras = self._legacy_scan_paths()
+        targets = ([primary] if primary else []) + extras
+        if not targets:
+            return
+        for target in targets:
+            label = "（主路徑）" if target == primary else "（舊路徑）"
+            try:
+                result = sync_exist_pid_with_download_folder(
+                    base_path,
+                    target,
+                    recursive=True,
+                )
+                tag = "[快取]" if result.get("used_cache") else "[掃描]"
+                self._log(
+                    f"<p><font color='gray'>[exist_pid] {tag} 步驟 {step_num} 前掃描{label}："
+                    f"檔案={result.get('scanned_files', 0)}, "
+                    f"PID={result.get('scanned_pid_count', 0)}, "
+                    f"新增={result.get('added_from_download', 0)}</font></p>"
+                )
+            except Exception as err:
+                self._log(
+                    f"<p><font color='red'>[exist_pid] 掃描{label}失敗（{target}）：{err}</font></p>"
+                )
+
     def _build_step3(self, auth, agent, dl, perf, path):
         authors = _load_author_list()
         valid_cookies = self._validate_cookies_for_step(auth, agent, 3)
         if not valid_cookies:
             return None
+        self._sync_exist_pid_from_download_folder(
+            str(dl.get("path", "")), path, step_num=3,
+        )
         t = thread_url_fetch.get_img_url_thread(
             q=self._event_q,
             Author_list=authors,
@@ -428,6 +531,7 @@ class RunController:
         valid_cookies = self._validate_cookies_for_step(auth, agent, 4)
         if not valid_cookies:
             return None
+        self._sync_exist_pid_from_download_folder(dl_path, _data_path(), step_num=4)
         t = thread_download.download_thread(
             q=self._event_q,
             nogif=bool(flt.get("nogif", False)),
