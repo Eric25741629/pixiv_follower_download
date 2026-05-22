@@ -332,7 +332,7 @@ def _save_folder_file_count_cache(base_path, cache):
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _shadow_write_exist_pid_to_db(base_path, scanned_pids):
+def _shadow_write_exist_pid_to_db(base_path, scanned_pids, *, event_log=None):
     """PHASE-A: mirror disk-scanned PIDs into metadata.sqlite3.
 
     Best-effort sync so Phase B (DB-only reads) can be enabled by just
@@ -354,7 +354,7 @@ def _shadow_write_exist_pid_to_db(base_path, scanned_pids):
         return
     db = None
     try:
-        db = MetadataDB(base)
+        db = MetadataDB(base, event_log=event_log)
         mirror_exist_pid_set(db, scanned_pids)
     except Exception:
         pass
@@ -366,7 +366,7 @@ def _shadow_write_exist_pid_to_db(base_path, scanned_pids):
                 pass
 
 
-def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_pid=None, recursive=True):
+def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_pid=None, recursive=True, *, event_log=None):
     """
     同步 exist_pid 與下載資料夾，使用檔案數量快取來避免重複掃描。
     只有在資料夾檔案數量變化時才會重新掃描。
@@ -415,7 +415,7 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
     # PHASE-A: shadow-write the scanned set (not merged — DB already has
     # closed-artwork rows for every PID workers have downloaded; we only
     # need to register externally-discovered ones).
-    _shadow_write_exist_pid_to_db(base_path, scanned_pids)
+    _shadow_write_exist_pid_to_db(base_path, scanned_pids, event_log=event_log)
 
     return {
         "merged_set": merged,

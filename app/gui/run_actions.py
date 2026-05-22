@@ -63,6 +63,10 @@ def _load_author_list() -> list[str]:
 class RunController:
     """Wires step buttons to worker threads and chains them in Run-All mode."""
 
+    # Class-level default so tests that do ``RunController.__new__(RunController)``
+    # (bypassing __init__) can still read ``self._event_log`` without AttributeError.
+    _event_log = None
+
     def __init__(self, main_view, event_q: Queue, stats_collector=None, event_log=None):
         self._main_view = main_view
         self._event_q = event_q
@@ -76,7 +80,7 @@ class RunController:
             if not os.path.isfile(db_path):
                 return
             from app.core.metadata_db import MetadataDB
-            MetadataDB(_data_path(), event_log=getattr(self, "_event_log", None)).backup_db(max_history=3)
+            MetadataDB(_data_path(), event_log=self._event_log).backup_db(max_history=3)
         except Exception:
             pass
 
@@ -472,6 +476,7 @@ class RunController:
                     base_path,
                     target,
                     recursive=True,
+                    event_log=self._event_log,
                 )
                 tag = "[快取]" if result.get("used_cache") else "[掃描]"
                 self._log(
