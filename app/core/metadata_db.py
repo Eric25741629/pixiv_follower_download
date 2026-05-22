@@ -158,12 +158,13 @@ _VALID_PAGE_STATUSES = frozenset({
 class MetadataDB:
     """Thread-safe SQLite cache for Pixiv metadata + downloaded-PID set."""
 
-    def __init__(self, base_path: str):
+    def __init__(self, base_path: str, *, event_log=None):
         self._base = str(base_path or "").strip()
         self._path = os.path.join(self._base, DB_FILENAME)
         self._lock = threading.RLock()
         self._local = threading.local()
         self._initialized = False
+        self._event_log = event_log
 
     # ── connection management ─────────────────────────────────────────────
 
