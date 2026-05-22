@@ -79,8 +79,27 @@ class EventLog:
         path = os.path.join(self._dir, _FILENAME_FMT.format(date=today))
         self._fh = open(path, "a", encoding="utf-8", buffering=1)
         self._current_date = today
+        self._gc_old_files_locked()
+
+    def _gc_old_files_locked(self) -> None:
+        if self._retention_days <= 0:
+            return
+        cutoff = datetime.datetime.now().timestamp() - self._retention_days * 86400
+        try:
+            for name in os.listdir(self._dir):
+                if not (name.startswith("events-") and name.endswith(".jsonl")):
+                    continue
+                path = os.path.join(self._dir, name)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
     def _write_locked(self, kind: str, **fields) -> None:
+        self._open_today_locked()  # cheap; no-op if same day
         if self._fh is None:
             return
         payload = {"t": _now_iso(), "k": kind}
