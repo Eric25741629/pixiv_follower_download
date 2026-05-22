@@ -9,12 +9,39 @@ from app.core.worker_event import WorkerEvent
 
 
 STEP_LABELS = ["步驟 1\n抓追蹤", "步驟 2\n抓 PID", "步驟 3\n抓 URL", "步驟 4\n下載"]
-_STATE_COLORS = {
-    "idle":    ft.Colors.GREY_400,
-    "running": ft.Colors.BLUE_600,
-    "done":    ft.Colors.GREEN_600,
-    "error":   ft.Colors.RED_600,
+
+# Two palettes — light uses saturated 600-level bg + white text; dark uses
+# softer 400/800-level bg + dark text so colors don't look neon on black.
+_STATE_COLORS_LIGHT: dict[str, tuple[str, str]] = {
+    "idle":    (ft.Colors.GREY_300,  ft.Colors.BLACK),
+    "running": (ft.Colors.BLUE_600,  ft.Colors.WHITE),
+    "done":    (ft.Colors.GREEN_700, ft.Colors.WHITE),
+    "error":   (ft.Colors.RED_600,   ft.Colors.WHITE),
 }
+_STATE_COLORS_DARK: dict[str, tuple[str, str]] = {
+    "idle":    (ft.Colors.GREY_800,         ft.Colors.GREY_300),
+    "running": (ft.Colors.BLUE_400,         ft.Colors.BLACK),
+    "done":    (ft.Colors.TEAL_400,         ft.Colors.BLACK),
+    "error":   (ft.Colors.DEEP_ORANGE_400,  ft.Colors.BLACK),
+}
+
+
+def _is_dark_mode(page: ft.Page) -> bool:
+    mode = getattr(page, "theme_mode", None)
+    if mode == ft.ThemeMode.DARK:
+        return True
+    if mode == ft.ThemeMode.LIGHT:
+        return False
+    try:
+        return page.platform_brightness == ft.Brightness.DARK
+    except Exception:
+        return False
+
+
+def _state_palette(page: ft.Page) -> dict[str, tuple[str, str]]:
+    return _STATE_COLORS_DARK if _is_dark_mode(page) else _STATE_COLORS_LIGHT
+
+
 _MAX_LOG_LINES = 2000
 
 
@@ -29,16 +56,14 @@ class MainView:
         self._step_states: list[str] = ["idle", "idle", "idle", "idle"]
 
         self._step_card_containers: list[ft.Container] = []
+        self._step_card_texts: list[ft.Text] = []
         self._step_cards = [self._make_step_card(i) for i in range(4)]
 
         self._btn_run_all = ft.FilledButton("▶ 一鍵執行", on_click=self._on_run_all)
-        self._btn_step = [
-            ft.OutlinedButton(f"步驟 {i+1}", on_click=lambda e, n=i+1: self._on_run_step(n))
-            for i in range(4)
-        ]
         self._btn_pause = ft.OutlinedButton("⏸ 暫停", on_click=self._on_pause_toggle, disabled=True)
         self._btn_stop = ft.OutlinedButton("⏹ 停止", on_click=self._on_stop, disabled=True)
         self._is_paused = False
+        self._cards_disabled = False
 
         self._progress_bar = ft.ProgressBar(value=0, expand=True)
         self._progress_text = ft.Text("", size=12, color=ft.Colors.GREY_600, width=120)
@@ -60,7 +85,12 @@ class MainView:
         self._progress_started_at: float | None = None
 
         self._phase_ring = ft.ProgressRing(width=14, height=14, stroke_width=2)
-        self._phase_label = ft.Text("", size=11, color=ft.Colors.BLUE_700, expand=True)
+        self._phase_label = ft.Text(
+            "",
+            size=11,
+            color=ft.Colors.BLUE_300 if _is_dark_mode(page) else ft.Colors.BLUE_700,
+            expand=True,
+        )
         self._phase_row = ft.Row(
             controls=[self._phase_ring, self._phase_label],
             spacing=6,
@@ -89,6 +119,7 @@ class MainView:
         self._auto_scroll_enabled = True
         self._scroll_pending = False
         self._last_scroll_pixels: float | None = None
+        self._last_max_scroll_extent: float | None = None
         # auto_scroll stays False forever — we manually call scroll_to(offset=-1)
         # via _schedule_scroll_to_bottom().  Toggling auto_scroll at runtime
         # rebuilds Flutter's ScrollController and breaks mouse-wheel scrolling
@@ -132,25 +163,65 @@ class MainView:
         )
 
     def _make_step_card(self, index: int) -> ft.Card:
+        palette = _state_palette(self._page)
+        bg, fg = palette["idle"]
+        text = ft.Text(
+            STEP_LABELS[index],
+            text_align=ft.TextAlign.CENTER,
+            size=13,
+            color=fg,
+        )
         container = ft.Container(
-            content=ft.Text(
-                STEP_LABELS[index],
-                text_align=ft.TextAlign.CENTER,
-                size=13,
-            ),
+            content=text,
             padding=12,
-            bgcolor=_STATE_COLORS["idle"],
+            bgcolor=bg,
             border_radius=8,
             width=110,
             alignment=ft.Alignment(x=0, y=0),
+            ink=True,
+            on_click=lambda e, n=index + 1: self._on_run_step(n),
         )
         self._step_card_containers.append(container)
+        self._step_card_texts.append(text)
         return ft.Card(content=container)
 
     def set_step_state(self, index: int, state: str) -> None:
         """Update step card color. state: 'idle'|'running'|'done'|'error'"""
         self._step_states[index] = state
-        self._step_card_containers[index].bgcolor = _STATE_COLORS.get(state, _STATE_COLORS["idle"])
+        palette = _state_palette(self._page)
+        bg, fg = palette.get(state, palette["idle"])
+        self._step_card_containers[index].bgcolor = bg
+        self._step_card_texts[index].color = fg
+
+    def refresh_theme(self) -> None:
+        """Re-apply theme-dependent colors after a light/dark toggle.
+
+        Step cards, phase label — anything that picks colors from
+        ``_is_dark_mode(page)`` rather than auto-themed Flet components.
+        Best-effort: swallows ``update()`` errors on detached controls.
+        """
+        palette = _state_palette(self._page)
+        for i, state in enumerate(self._step_states):
+            bg, fg = palette.get(state, palette["idle"])
+            self._step_card_containers[i].bgcolor = bg
+            self._step_card_texts[i].color = fg
+        self._phase_label.color = (
+            ft.Colors.BLUE_300 if _is_dark_mode(self._page) else ft.Colors.BLUE_700
+        )
+        for c in self._step_card_containers:
+            try:
+                c.update()
+            except Exception:
+                pass
+        for t in self._step_card_texts:
+            try:
+                t.update()
+            except Exception:
+                pass
+        try:
+            self._phase_label.update()
+        except Exception:
+            pass
 
     def append_log(self, html_line: str) -> None:
         from app.gui.log_format import html_to_spans
@@ -168,6 +239,16 @@ class MainView:
         # makes the rapid-tab-switch session-GC scenario worse. Re-attach
         # happens transparently on the next log line after the user returns
         # to MainView.
+        # If the last known scroll position was at/near the bottom, treat
+        # new lines as wanting to follow — appending shifts max_scroll_extent
+        # so the user can be at the visual bottom while extent_after silently
+        # grows, leaving the pill stuck even though they're already there.
+        if (not self._auto_scroll_enabled
+                and self._last_scroll_pixels is not None
+                and self._last_max_scroll_extent is not None
+                and self._last_max_scroll_extent - self._last_scroll_pixels <= 30):
+            self._auto_scroll_enabled = True
+            self._pill_overlay.visible = False
         if self._auto_scroll_enabled and getattr(self._log_list, "page", None) is not None:
             self._schedule_scroll_to_bottom()
 
@@ -201,6 +282,7 @@ class MainView:
             return
         prev = self._last_scroll_pixels
         self._last_scroll_pixels = e.pixels
+        self._last_max_scroll_extent = e.max_scroll_extent
         if self._auto_scroll_enabled:
             # User scrolled up if pixels decreased by >10px AND we're now
             # more than 30px from the bottom.  The pixel-delta filter rules
@@ -209,8 +291,15 @@ class MainView:
             if prev is not None and e.pixels < prev - 10 and e.extent_after > 30:
                 self._auto_scroll_enabled = False
                 self._pill_overlay.visible = True
-        elif e.extent_after <= 20:
-            self._enable_auto_scroll()
+        else:
+            # Re-enable when the user is near the bottom. The previous
+            # ≤20 threshold was tight enough that scroll_interval=200
+            # throttling could leave the final event at extent_after≈25,
+            # stranding the pill visible at the visual bottom. A scroll-down
+            # nudge that lands ≤80px from the edge also counts as intent.
+            scrolling_down = prev is not None and e.pixels > prev
+            if e.extent_after <= 50 or (scrolling_down and e.extent_after <= 80):
+                self._enable_auto_scroll()
 
     def _enable_auto_scroll(self) -> None:
         self._auto_scroll_enabled = True
@@ -322,8 +411,7 @@ class MainView:
         self._btn_pause.disabled = not is_running
         self._btn_stop.disabled = not is_running
         self._btn_run_all.disabled = is_running
-        for b in self._btn_step:
-            b.disabled = is_running
+        self._cards_disabled = is_running
         # Reset pause toggle to "暫停" whenever the worker stops or a fresh
         # run starts, otherwise the button could keep saying "繼續" with no
         # active worker to resume.
@@ -347,6 +435,8 @@ class MainView:
 
     def _on_run_step(self, step: int) -> None:
         if self._run_controller is None:
+            return
+        if self._cards_disabled:
             return
         self._event_q.put(WorkerEvent("loading", (True, f"正在啟動 步驟 {step}...")))
         threading.Thread(
@@ -427,15 +517,17 @@ class MainView:
             self._event_q.put(WorkerEvent("loading", (False, "")))
 
     def build(self) -> ft.Column:
-        step_row = ft.Row(
-            controls=self._step_cards,
-            alignment=ft.MainAxisAlignment.CENTER,
+        top_row = ft.Row(
+            controls=[
+                self._btn_run_all,
+                *self._step_cards,
+                ft.Container(width=40),
+                self._btn_pause,
+                self._btn_stop,
+            ],
             spacing=8,
-        )
-        control_row = ft.Row(
-            controls=[self._btn_run_all, *self._btn_step, self._btn_pause, self._btn_stop],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
             wrap=True,
-            spacing=8,
         )
         progress_row = ft.Row(
             controls=[
@@ -448,20 +540,21 @@ class MainView:
         )
         return ft.Column(
             controls=[
-                step_row,
-                control_row,
+                top_row,
                 progress_row,
                 self._phase_row,
                 ft.Divider(),
                 ft.Text("即時 Log", size=12, weight=ft.FontWeight.BOLD),
                 ft.Stack(
                     controls=[
-                        ft.Container(
-                            content=self._log_list,
-                            expand=True,
-                            border=ft.border.all(1, ft.Colors.OUTLINE_VARIANT),
-                            border_radius=4,
-                            padding=4,
+                        ft.SelectionArea(
+                            content=ft.Container(
+                                content=self._log_list,
+                                expand=True,
+                                border=ft.border.all(1, ft.Colors.OUTLINE_VARIANT),
+                                border_radius=4,
+                                padding=4,
+                            ),
                         ),
                         self._pill_overlay,
                     ],

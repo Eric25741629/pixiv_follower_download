@@ -3,10 +3,13 @@ import re
 import flet as ft
 
 COLOR_MAP: dict[str, str] = {
-    "red":   ft.Colors.RED_600,
-    "green": ft.Colors.GREEN_600,
-    "gray":  ft.Colors.GREY_600,
-    "black": ft.Colors.ON_SURFACE,
+    "red":    ft.Colors.RED_600,
+    "green":  ft.Colors.GREEN_600,
+    "gray":   ft.Colors.GREY_600,
+    "black":  ft.Colors.ON_SURFACE,
+    "orange": ft.Colors.ORANGE_600,
+    "blue":   ft.Colors.BLUE_600,
+    "teal":   ft.Colors.TEAL_600,
 }
 
 _FONT_RE = re.compile(

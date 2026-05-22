@@ -68,6 +68,9 @@ DEFAULTS = {
         "proxy_pool": [],
         "cookie_proxy_map": {},
     },
+    "ui": {
+        "theme_mode": "SYSTEM",  # "LIGHT" | "DARK" | "SYSTEM"
+    },
 }
 
 LEGACY_FILES = [

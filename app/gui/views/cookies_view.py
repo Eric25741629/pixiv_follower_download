@@ -70,23 +70,26 @@ class CookiesView:
             "測試全部", icon=ft.Icons.PLAYLIST_PLAY,
             on_click=self._on_test_all,
         )
+        self._btn_enable_selected = ft.OutlinedButton(
+            "啟用選取", icon=ft.Icons.TOGGLE_ON,
+            on_click=lambda e: self._set_enabled_for_selected(True),
+        )
+        self._btn_disable_selected = ft.OutlinedButton(
+            "禁用選取", icon=ft.Icons.TOGGLE_OFF,
+            on_click=lambda e: self._set_enabled_for_selected(False),
+        )
         self._btn_auto_pair = ft.OutlinedButton(
             "自動配對", icon=ft.Icons.AUTO_FIX_HIGH,
             on_click=self._on_auto_pair,
         )
-        self._table = ft.DataTable(
-            columns=[
-                ft.DataColumn(ft.Text("選取")),
-                ft.DataColumn(ft.Text("啟用")),
-                ft.DataColumn(ft.Text("別名")),
-                ft.DataColumn(ft.Text("狀態")),
-                ft.DataColumn(ft.Text("上次檢查")),
-                ft.DataColumn(ft.Text("Cookie 預覽")),
-                ft.DataColumn(ft.Text("Proxy 綁定")),
-                ft.DataColumn(ft.Text("操作")),
-            ],
-            rows=[],
-        )
+        # Replaced DataTable with a ListView of compact custom rows.
+        # DataTable in Flet 0.84 has a fixed natural width per column and
+        # never shrinks to viewport — so columns past ~1000 px (the Proxy
+        # dropdown + Cookie 預覽 combo) used to fall outside the visible
+        # area on a 1100-wide window. ListView lets each row reflow with
+        # the page width and keeps every control reachable without a
+        # horizontal scroll.
+        self._table = ft.ListView(spacing=4, padding=0, expand=True)
         self._refresh_table()
 
     def _load_entries(self) -> None:
@@ -123,52 +126,108 @@ class CookiesView:
         """Build the per-row proxy dropdown control."""
         current_proxy = self._cookie_proxy_map.get(cookie) or ""
         options = [ft.dropdown.Option(key="", text="（本機 IP）")] + [
-            ft.dropdown.Option(key=p, text=p[:50]) for p in self._proxy_pool
+            ft.dropdown.Option(key=p, text=p[:40]) for p in self._proxy_pool
         ]
         return ft.Dropdown(
             options=options,
             value=current_proxy if (current_proxy == "" or current_proxy in self._proxy_pool) else "",
-            width=220,
+            width=180,
+            text_size=11,
+            content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
             on_select=lambda e, c=cookie: self._on_proxy_change(c, e.control.value),
         )
 
-    def _build_action_cell(self, idx):
-        """Build the per-row edit/delete IconButton row."""
-        return ft.Row([
-            ft.IconButton(icon=ft.Icons.EDIT, tooltip="編輯",
-                          on_click=lambda e, i=idx: self._open_edit_dialog(i)),
-            ft.IconButton(icon=ft.Icons.DELETE, tooltip="刪除",
-                          icon_color=ft.Colors.RED_400,
-                          on_click=lambda e, i=idx: self._remove_entry(i)),
-        ])
+    def _build_status_badge(self, status, status_color):
+        """Compact pill showing the cookie validity state."""
+        return ft.Container(
+            content=ft.Text(status, color=ft.Colors.WHITE, size=10, weight=ft.FontWeight.BOLD),
+            bgcolor=status_color,
+            padding=ft.padding.symmetric(horizontal=8, vertical=2),
+            border_radius=10,
+        )
 
     def _build_cookie_row(self, idx, entry):
-        """Build one DataRow for the cookies table."""
+        """Build one compact card row that reflows with the page width."""
         alias = entry.get("alias", "") or f"Cookie {idx+1}"
         cookie = entry.get("cookie", "")
         status = entry.get("status", "未知")
-        preview = cookie[:30] + "..." if len(cookie) > 30 else cookie
+        preview_short = (cookie[:24] + "...") if len(cookie) > 24 else cookie
         status_color = _STATUS_COLORS.get(status, ft.Colors.GREY_600)
         tested_text = _format_tested_at(entry.get("last_tested_at"))
         enabled = entry.get("enabled") is not False
         alias_color = None if enabled else ft.Colors.GREY_500
-        return ft.DataRow(cells=[
-            ft.DataCell(ft.Checkbox(
-                value=cookie in self._selected,
-                on_change=lambda e, c=cookie: self._on_toggle_row(c, e.control.value),
-            )),
-            ft.DataCell(ft.Switch(
-                value=enabled,
-                tooltip="關閉後本次任務不使用此 Cookie",
-                on_change=lambda e, c=cookie: self._on_toggle_enabled(c, e.control.value),
-            )),
-            ft.DataCell(ft.Text(alias, color=alias_color)),
-            ft.DataCell(ft.Text(status, color=status_color, weight=ft.FontWeight.BOLD)),
-            ft.DataCell(ft.Text(tested_text, size=11, color=ft.Colors.GREY_700)),
-            ft.DataCell(ft.Text(preview, size=11, font_family="monospace")),
-            ft.DataCell(self._build_proxy_dropdown(cookie)),
-            ft.DataCell(self._build_action_cell(idx)),
-        ])
+
+        # Left cluster: checkbox + per-row enable switch (always visible).
+        controls_left = ft.Row(
+            controls=[
+                ft.Checkbox(
+                    value=cookie in self._selected,
+                    on_change=lambda e, c=cookie: self._on_toggle_row(c, e.control.value),
+                ),
+                ft.Switch(
+                    value=enabled,
+                    tooltip="關閉後本次任務不使用此 Cookie",
+                    on_change=lambda e, c=cookie: self._on_toggle_enabled(c, e.control.value),
+                ),
+            ],
+            spacing=0,
+            tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+        # Middle cluster: alias + status badge + last-tested + cookie preview.
+        # Inner Row is wrap=True so badges drop to a second line on narrow widths.
+        info_header = ft.Row(
+            controls=[
+                ft.Text(alias, color=alias_color, weight=ft.FontWeight.BOLD, size=13),
+                self._build_status_badge(status, status_color),
+                ft.Text(f"檢查：{tested_text}", size=11, color=ft.Colors.GREY_600),
+            ],
+            spacing=8,
+            wrap=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        info_preview = ft.Text(
+            preview_short, size=10, color=ft.Colors.GREY_500,
+            font_family="monospace", tooltip=cookie,
+            overflow=ft.TextOverflow.ELLIPSIS, no_wrap=True,
+        )
+        controls_middle = ft.Column(
+            controls=[info_header, info_preview],
+            spacing=2,
+            expand=True,
+        )
+
+        # Right cluster: proxy binding + edit/delete actions.
+        controls_right = ft.Row(
+            controls=[
+                self._build_proxy_dropdown(cookie),
+                ft.IconButton(
+                    icon=ft.Icons.EDIT, tooltip="編輯",
+                    on_click=lambda e, i=idx: self._open_edit_dialog(i),
+                ),
+                ft.IconButton(
+                    icon=ft.Icons.DELETE, tooltip="刪除",
+                    icon_color=ft.Colors.RED_400,
+                    on_click=lambda e, i=idx: self._remove_entry(i),
+                ),
+            ],
+            spacing=2,
+            tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+        return ft.Container(
+            content=ft.Row(
+                controls=[controls_left, controls_middle, controls_right],
+                spacing=10,
+                wrap=True,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            padding=ft.padding.symmetric(horizontal=10, vertical=6),
+            border=ft.border.all(1, ft.Colors.OUTLINE_VARIANT),
+            border_radius=6,
+        )
 
     def _refresh_table_header_state(self):
         """Update the count label, select-all checkbox, and button-disabled flags."""
@@ -179,10 +238,12 @@ class CookiesView:
         )
         self._btn_test_selected.disabled = self._testing or not self._selected
         self._btn_test_all.disabled = self._testing or not self._entries
+        self._btn_enable_selected.disabled = not self._selected
+        self._btn_disable_selected.disabled = not self._selected
         self._btn_auto_pair.disabled = not self._entries
 
     def _refresh_table(self) -> None:
-        self._table.rows = [
+        self._table.controls = [
             self._build_cookie_row(i, entry) for i, entry in enumerate(self._entries)
         ]
         self._refresh_table_header_state()
@@ -200,17 +261,44 @@ class CookiesView:
             bool(all_cookies) and self._selected.issuperset(all_cookies)
         )
         self._btn_test_selected.disabled = self._testing or not self._selected
+        self._btn_enable_selected.disabled = not self._selected
+        self._btn_disable_selected.disabled = not self._selected
+        try:
+            self._page.update()
+        except Exception:
+            pass
+
+    def _set_enabled_for_selected(self, enable: bool) -> None:
+        """Bulk flip the ``enabled`` flag for every selected cookie."""
+        if not self._selected:
+            return
+        targets = set(self._selected)
+        changed = False
+        for entry in self._entries:
+            if entry.get("cookie", "") not in targets:
+                continue
+            if enable:
+                if entry.get("enabled") is False:
+                    entry.pop("enabled", None)
+                    changed = True
+            else:
+                if entry.get("enabled") is not False:
+                    entry["enabled"] = False
+                    changed = True
+        if changed:
+            self._save_entries()
+        self._refresh_table()
         try:
             self._page.update()
         except Exception:
             pass
 
     def _on_toggle_enabled(self, cookie: str, value: bool) -> None:
-        """Persist the per-cookie enable flag and refresh the row's alias color.
+        """Persist the per-cookie enable flag, then rebuild only that row.
 
-        Skip a full _refresh_table() so the user's switch click is not
-        visually replaced (same pattern as _on_toggle_row), and the Switch
-        keeps the new state without flicker.
+        Targeted rebuild keeps the Switch click responsive — a full
+        ``_refresh_table()`` would visually replace the user's toggle
+        mid-animation.
         """
         for i, entry in enumerate(self._entries):
             if entry.get("cookie", "") != cookie:
@@ -221,10 +309,8 @@ class CookiesView:
                 entry["enabled"] = False
             self._save_entries()
             try:
-                row = self._table.rows[i]
-                alias_text = row.cells[2].content
-                if isinstance(alias_text, ft.Text):
-                    alias_text.color = None if value else ft.Colors.GREY_500
+                self._table.controls[i] = self._build_cookie_row(i, entry)
+                self._table.update()
             except Exception:
                 pass
             break
@@ -411,16 +497,19 @@ class CookiesView:
             self._select_all_cb,
             self._btn_test_selected,
             self._btn_test_all,
+            self._btn_enable_selected,
+            self._btn_disable_selected,
             self._btn_auto_pair,
         ], alignment=ft.MainAxisAlignment.START, spacing=12, wrap=True)
 
+        # self._table is a ListView (vertical scroll built-in). Each row is
+        # a Container with an inner wrap=True Row, so the proxy dropdown +
+        # edit/delete cluster reflows below the alias/status info instead
+        # of disappearing off-screen on narrow windows.
         return ft.Column(
             controls=[
                 header,
-                ft.Container(
-                    content=ft.Column([self._table], scroll=ft.ScrollMode.AUTO),
-                    expand=True,
-                ),
+                ft.Container(content=self._table, expand=True),
             ],
             expand=True,
             spacing=12,

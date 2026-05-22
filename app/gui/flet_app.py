@@ -17,8 +17,34 @@ from app.gui.views.settings_view import SettingsView
 from app.gui.views.cookies_view import CookiesView
 from app.gui.views.stats_view import StatsView
 from app.core.stats_collector import StatsCollector
+from app.core.settings_store import SettingsStore
 
 _log = get_logger("pixiv.gui")
+
+
+def _settings_store() -> SettingsStore:
+    path = os.getenv("APPDATA") + r"/pixiv_download/"
+    os.makedirs(path, exist_ok=True)
+    return SettingsStore(path)
+
+
+def _load_theme_mode() -> ft.ThemeMode:
+    try:
+        name = _settings_store().get_section("ui").get("theme_mode", "SYSTEM")
+    except Exception:
+        return ft.ThemeMode.SYSTEM
+    if name == "DARK":
+        return ft.ThemeMode.DARK
+    if name == "LIGHT":
+        return ft.ThemeMode.LIGHT
+    return ft.ThemeMode.SYSTEM
+
+
+def _save_theme_mode(mode: ft.ThemeMode) -> None:
+    try:
+        _settings_store().update_fields("ui", {"theme_mode": mode.name})
+    except Exception:
+        _log.exception("failed to persist theme_mode")
 
 # ── cross-session persistence ──────────────────────────────────────────────
 # Flet 0.84 desktop GCs the server-side session if the flutter client
@@ -178,7 +204,7 @@ def main(page: ft.Page) -> None:
         getattr(page, "platform", "?"),
     )
     page.title = "Pixiv 下載器"
-    page.theme_mode = ft.ThemeMode.SYSTEM
+    page.theme_mode = _load_theme_mode()
     page.theme = ft.Theme(color_scheme_seed="#0096FA")
     page.window.width = 1100
     page.window.height = 750
@@ -469,6 +495,12 @@ def main(page: ft.Page) -> None:
             if page.theme_mode == ft.ThemeMode.LIGHT
             else ft.ThemeMode.LIGHT
         )
+        _save_theme_mode(page.theme_mode)
+        for view in (main_view, stats_view):
+            try:
+                view.refresh_theme()
+            except Exception:
+                pass
         page.update()
 
     page.appbar = ft.AppBar(
@@ -490,6 +522,15 @@ def main(page: ft.Page) -> None:
             expand=True,
         )
     )
+
+    # platform_brightness becomes reliable only after page.add(), so re-apply
+    # step-card / stats colors once the page is mounted — covers the SYSTEM
+    # theme start-on-dark-OS case where __init__ guessed the light palette.
+    for view in (main_view, stats_view):
+        try:
+            view.refresh_theme()
+        except Exception:
+            _log.exception("initial refresh_theme failed")
 
     # Restore the modal loading dialog AFTER page.add — set_loading() relies
     # on page.show_dialog() which needs the page's session to be live and

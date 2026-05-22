@@ -8,14 +8,22 @@ import flet as ft
 
 from app.core.stats_collector import StatsCollector
 
-_CARD_COLORS = [
+_CARD_COLORS_LIGHT = [
     ft.Colors.BLUE_100,
     ft.Colors.GREEN_100,
     ft.Colors.ORANGE_100,
     ft.Colors.PURPLE_100,
 ]
+_CARD_COLORS_DARK = [
+    ft.Colors.BLUE_GREY_800,
+    ft.Colors.GREEN_900,
+    ft.Colors.DEEP_ORANGE_900,
+    ft.Colors.PURPLE_900,
+]
 
-_BAR_COLORS = [
+# Bar chart colors stay 400-level (mid-saturation reads fine on both bgs),
+# but we swap to 300-level in dark mode to soften the contrast.
+_BAR_COLORS_LIGHT = [
     ft.Colors.BLUE_400,
     ft.Colors.GREEN_400,
     ft.Colors.ORANGE_400,
@@ -25,8 +33,50 @@ _BAR_COLORS = [
     ft.Colors.PINK_400,
     ft.Colors.AMBER_400,
 ]
+_BAR_COLORS_DARK = [
+    ft.Colors.BLUE_300,
+    ft.Colors.GREEN_300,
+    ft.Colors.ORANGE_300,
+    ft.Colors.PURPLE_300,
+    ft.Colors.RED_300,
+    ft.Colors.TEAL_300,
+    ft.Colors.PINK_300,
+    ft.Colors.AMBER_300,
+]
 
 _MAX_BAR_PX = 300
+
+
+def _is_dark_mode(page: ft.Page) -> bool:
+    mode = getattr(page, "theme_mode", None)
+    if mode == ft.ThemeMode.DARK:
+        return True
+    if mode == ft.ThemeMode.LIGHT:
+        return False
+    try:
+        return page.platform_brightness == ft.Brightness.DARK
+    except Exception:
+        return False
+
+
+def _card_palette(page: ft.Page) -> list[str]:
+    return _CARD_COLORS_DARK if _is_dark_mode(page) else _CARD_COLORS_LIGHT
+
+
+def _bar_palette(page: ft.Page) -> list[str]:
+    return _BAR_COLORS_DARK if _is_dark_mode(page) else _BAR_COLORS_LIGHT
+
+
+def _card_label_color(page: ft.Page) -> str:
+    return ft.Colors.GREY_300 if _is_dark_mode(page) else ft.Colors.GREY_700
+
+
+def _empty_text_color(page: ft.Page) -> str:
+    return ft.Colors.GREY_500
+
+
+def _free_cookie_color(page: ft.Page) -> str:
+    return ft.Colors.TEAL_300 if _is_dark_mode(page) else ft.Colors.TEAL_700
 
 
 class StatsView:
@@ -112,26 +162,30 @@ class StatsView:
 
     def _build_cards(self) -> ft.Row:
         labels = ["總下載流量", "JXL 節省空間", "HTTP 請求數", "執行時間"]
+        card_palette = _card_palette(self._page)
+        label_color = _card_label_color(self._page)
+        self._card_containers: list[ft.Container] = []
+        self._card_labels: list[ft.Text] = []
         cards: list[ft.Card] = []
         for i, label in enumerate(labels):
-            card = ft.Card(
-                content=ft.Container(
-                    content=ft.Column(
-                        controls=[
-                            ft.Text(label, size=12, color=ft.Colors.GREY_700, text_align=ft.TextAlign.CENTER),
-                            self._card_values[i],
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        spacing=4,
-                    ),
-                    padding=16,
-                    bgcolor=_CARD_COLORS[i],
-                    border_radius=8,
-                    width=160,
-                    alignment=ft.Alignment(x=0, y=0),
-                ),
+            label_text = ft.Text(
+                label, size=12, color=label_color, text_align=ft.TextAlign.CENTER,
             )
-            cards.append(card)
+            container = ft.Container(
+                content=ft.Column(
+                    controls=[label_text, self._card_values[i]],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=4,
+                ),
+                padding=16,
+                bgcolor=card_palette[i],
+                border_radius=8,
+                width=160,
+                alignment=ft.Alignment(x=0, y=0),
+            )
+            self._card_containers.append(container)
+            self._card_labels.append(label_text)
+            cards.append(ft.Card(content=container))
         return ft.Row(controls=cards, wrap=True, spacing=12)
 
     def start_auto_refresh(self) -> None:
@@ -202,16 +256,16 @@ class StatsView:
         with contextlib.suppress(Exception):
             self._chart_container.update()
 
-    @staticmethod
-    def _build_cookie_bar_rows(cookie_requests: dict[str, int]) -> list[ft.Control]:
+    def _build_cookie_bar_rows(self, cookie_requests: dict[str, int]) -> list[ft.Control]:
         if not cookie_requests:
             return []
         sorted_items = sorted(cookie_requests.items(), key=lambda kv: kv[1], reverse=True)
         max_count = max(1, sorted_items[0][1])
+        palette = _bar_palette(self._page)
         rows: list[ft.Control] = []
         for idx, (label, count) in enumerate(sorted_items):
             bar_w = max(2, int(count / max_count * _MAX_BAR_PX))
-            color = _BAR_COLORS[idx % len(_BAR_COLORS)]
+            color = palette[idx % len(palette)]
             rows.append(
                 ft.Row(
                     controls=[
@@ -227,7 +281,9 @@ class StatsView:
 
     def _update_chart(self, requests: dict[str, int]) -> None:
         if not requests:
-            self._chart_container.controls = [ft.Text("尚無資料", size=12, color=ft.Colors.GREY_500)]
+            self._chart_container.controls = [
+                ft.Text("尚無資料", size=12, color=_empty_text_color(self._page))
+            ]
             self._safe_chart_update()
             return
 
@@ -235,9 +291,31 @@ class StatsView:
         cookie_requests = {k: v for k, v in requests.items() if k != "免Cookie"}
         rows = self._build_cookie_bar_rows(cookie_requests)
         if free_count > 0:
-            rows.append(ft.Text(f"免 Cookie：{free_count} 次", size=12, color=ft.Colors.TEAL_700))
+            rows.append(ft.Text(
+                f"免 Cookie：{free_count} 次", size=12, color=_free_cookie_color(self._page),
+            ))
         if not rows:
-            rows = [ft.Text("尚無資料", size=12, color=ft.Colors.GREY_500)]
+            rows = [ft.Text("尚無資料", size=12, color=_empty_text_color(self._page))]
 
         self._chart_container.controls = rows
         self._safe_chart_update()
+
+    def refresh_theme(self) -> None:
+        """Re-apply theme-dependent colors after a light/dark toggle."""
+        card_palette = _card_palette(self._page)
+        label_color = _card_label_color(self._page)
+        for i, container in enumerate(getattr(self, "_card_containers", []) or []):
+            container.bgcolor = card_palette[i]
+            try:
+                container.update()
+            except Exception:
+                pass
+        for label in getattr(self, "_card_labels", []) or []:
+            label.color = label_color
+            try:
+                label.update()
+            except Exception:
+                pass
+        # Re-render the chart so bar colors and any inline text picks up
+        # the new palette without waiting for the next 1 s tick.
+        self._refresh_now()
