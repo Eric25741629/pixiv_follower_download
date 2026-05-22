@@ -157,7 +157,10 @@ def test_run_actions_backup_db_called_on_run_step(tmp_path):
     rc._stats_collector = None
     rc._run_all_mode = False
 
+    # Patch throttle helpers: no prior snapshot date → backup runs; write is a no-op.
     with patch("app.gui.run_actions._data_path", return_value=str(tmp_path) + os.sep), \
+         patch("app.gui.run_actions._read_event_log_cfg", return_value={}), \
+         patch("app.gui.run_actions._write_event_log_cfg"), \
          patch.object(MetadataDB, "backup_db", return_value=True) as mock_backup, \
          patch.object(rc, "_start_step"):
         rc.run_step(4)
@@ -176,7 +179,10 @@ def test_run_actions_backup_db_called_on_run_all(tmp_path):
     rc._stats_collector = None
     rc._run_all_mode = False
 
+    # Patch throttle helpers: no prior snapshot date → backup runs; write is a no-op.
     with patch("app.gui.run_actions._data_path", return_value=str(tmp_path) + os.sep), \
+         patch("app.gui.run_actions._read_event_log_cfg", return_value={}), \
+         patch("app.gui.run_actions._write_event_log_cfg"), \
          patch.object(MetadataDB, "backup_db", return_value=True) as mock_backup, \
          patch.object(rc, "_start_step"):
         rc.run_all()

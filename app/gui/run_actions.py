@@ -44,6 +44,23 @@ def _store() -> SettingsStore:
     return s
 
 
+def _read_event_log_cfg() -> dict:
+    """Return the event_log sub-section from settings, or {} on any error."""
+    try:
+        section = _store().get_section("event_log")
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_event_log_cfg(new_cfg: dict) -> None:
+    """Persist new_cfg as the event_log section. Silently ignored on error."""
+    try:
+        _store().update_fields("event_log", new_cfg)
+    except Exception:
+        pass
+
+
 def _agent(auth: dict) -> str:
     return str(auth.get("agent") or "").strip() or DEFAULT_AGENT
 
@@ -75,13 +92,37 @@ class RunController:
         self._event_log = event_log
 
     def _backup_db(self) -> None:
+        """Run at most once per local-time day. Persists last-success date via
+        event_log.last_snapshot_date in settings. Skipped entirely when
+        event_log.auto_snapshot_on_run is False."""
         try:
+            import datetime
+            cfg = _read_event_log_cfg()
+
+            if not cfg.get("auto_snapshot_on_run", True):
+                return
+
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            if cfg.get("last_snapshot_date") == today:
+                return
+
             db_path = os.path.join(_data_path(), DB_FILENAME)
             if not os.path.isfile(db_path):
                 return
+
+            retention_days = int(cfg.get("retention_days", 60))
+            max_history = max(3, retention_days // 14)
+
             from app.core.metadata_db import MetadataDB
-            MetadataDB(_data_path(), event_log=self._event_log).backup_db(max_history=3)
+            ok = MetadataDB(_data_path(), event_log=self._event_log).backup_db(
+                max_history=max_history
+            )
+            if not ok:
+                return
+
+            _write_event_log_cfg({**cfg, "last_snapshot_date": today})
         except Exception:
+            # Best-effort; never break Run All if snapshot fails.
             pass
 
     def run_step(self, n: int) -> None:
