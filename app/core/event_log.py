@@ -339,3 +339,51 @@ def replay(
     finally:
         db.close()
     return result
+
+
+def recover_tail(db, log_dir: str) -> int:
+    """Apply orphan events from the most recent unclean session into a live DB.
+
+    'Orphan events' = events after the last clean anchor (session.shutdown OR
+    snapshot, whichever is later). Returns count of events applied. Idempotent.
+
+    During recovery the DB's event_log is temporarily set to None to prevent
+    re-applied events from being duplicated back into the log.
+    """
+    # Find the cutoff: timestamp of latest session.shutdown or snapshot.
+    cutoff_ts: str | None = None
+    for ev in _iter_events(log_dir):
+        if ev.get("k") in ("session.shutdown", "snapshot"):
+            cutoff_ts = ev.get("t", cutoff_ts)
+
+    # Structural/meta event kinds that carry no DB mutation — skip counting them.
+    _META_KINDS = frozenset({"session.start", "session.shutdown", "snapshot"})
+
+    dispatch = _dispatch_table()
+    saved = getattr(db, "_event_log", None)
+    if hasattr(db, "_event_log"):
+        db._event_log = None
+    applied = 0
+    try:
+        for ev in _iter_events(log_dir):
+            t = ev.get("t", "")
+            if cutoff_ts and t <= cutoff_ts:
+                continue
+            kind = ev.get("k", "")
+            if kind in _META_KINDS:
+                continue
+            handler = dispatch.get(kind)
+            if handler is None:
+                continue
+            try:
+                handler(db, ev)
+                applied += 1
+            except Exception:
+                import logging
+                logging.getLogger("pixiv.event_log").exception(
+                    "recover_tail dispatch error for %s", kind,
+                )
+    finally:
+        if hasattr(db, "_event_log"):
+            db._event_log = saved
+    return applied
