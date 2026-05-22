@@ -100,3 +100,37 @@ def test_retention_gc_removes_old_files(tmp_path):
             assert p.name in remaining, f"day-{d} file should be kept"
         else:
             assert p.name not in remaining, f"day-{d} file should be GC'd"
+
+
+def test_clean_shutdown_detected_as_clean(tmp_path):
+    log = EventLog(str(tmp_path))
+    log.emit("page.downloaded", pid="1", page_index=0)
+    log.close()
+
+    log2 = EventLog(str(tmp_path))
+    try:
+        assert log2.last_session_was_unclean is False
+    finally:
+        log2.close()
+
+
+def test_missing_shutdown_detected_as_unclean(tmp_path):
+    log = EventLog(str(tmp_path))
+    log.emit("page.downloaded", pid="1", page_index=0)
+    # simulate crash: drop reference without close()
+    log._fh.close()
+    log._fh = None
+
+    log2 = EventLog(str(tmp_path))
+    try:
+        assert log2.last_session_was_unclean is True
+    finally:
+        log2.close()
+
+
+def test_empty_events_dir_is_clean(tmp_path):
+    log = EventLog(str(tmp_path))
+    try:
+        assert log.last_session_was_unclean is False
+    finally:
+        log.close()

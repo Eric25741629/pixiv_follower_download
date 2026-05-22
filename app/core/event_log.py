@@ -38,6 +38,9 @@ class EventLog:
         self._lock = threading.Lock()
         self._fh: IO | None = None
         self._current_date: str | None = None
+        # Must run before opening today's file so this session's own
+        # session.start is not yet written when we scan for prior sessions.
+        self.last_session_was_unclean = self._detect_unclean()
         with self._lock:
             self._open_today_locked()
             self._gc_old_files_locked()  # explicit startup scan
@@ -66,6 +69,42 @@ class EventLog:
                     pass
                 self._fh = None
                 self._current_date = None
+
+    def _detect_unclean(self) -> bool:
+        """Scan existing event files for a trailing session.shutdown.
+
+        Returns:
+            True  if the last session.* event found is session.start
+                  (no matching shutdown after it — indicates a crash).
+            False if the last session.* event is session.shutdown, or
+                  if no events exist at all (first run).
+        """
+        try:
+            files = sorted(
+                [n for n in os.listdir(self._dir)
+                 if n.startswith("events-") and n.endswith(".jsonl")],
+                reverse=True,
+            )
+        except OSError:
+            return False
+        for name in files:
+            path = os.path.join(self._dir, name)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+            for ln in reversed(lines):
+                try:
+                    ev = json.loads(ln)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                kind = ev.get("k", "")
+                if kind == "session.shutdown":
+                    return False
+                if kind == "session.start":
+                    return True
+        return False  # no session.* events found → first run
 
     def _open_today_locked(self) -> None:
         today = _today_key()
