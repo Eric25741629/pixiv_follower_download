@@ -64,6 +64,7 @@ def _save_theme_mode(mode: ft.ThemeMode) -> None:
 _PERSISTENT_EVENT_Q: queue.Queue = queue.Queue()
 _PERSISTENT_STATS: StatsCollector | None = None
 _PERSISTENT_EVENT_LOG = None  # EventLog singleton; survives session GC
+_PERSISTENT_EVENT_LOG_LOCK = threading.Lock()  # guards one-time init of _PERSISTENT_EVENT_LOG
 _PERSISTENT_RECOVERY_COUNT: int = 0  # orphan events recovered at startup
 _PERSISTENT_ACTIVE_THREAD = None  # populated when a worker starts; cleared on finished/next=-1
 _PERSISTENT_LOG_BUFFER: deque = deque(maxlen=300)  # replayed into new main_view on reattach
@@ -232,34 +233,37 @@ def main(page: ft.Page) -> None:
     # Constructed only on the first main() call; subsequent calls (Flet
     # session GC reattach) reuse the existing instance so we don't open a
     # second writer to the same JSONL file.
-    if _PERSISTENT_EVENT_LOG is None:
-        _base_path = os.path.join(os.getenv("APPDATA", ""), "pixiv_download")
-        os.makedirs(_base_path, exist_ok=True)
-        try:
-            from app.core.event_log import EventLog, recover_tail
-            from app.core.metadata_db import MetadataDB as _MetadataDB
-            _el = EventLog(_base_path)
-            atexit.register(_el.close)
-            _PERSISTENT_EVENT_LOG = _el
-            # Auto recover_tail if the previous session was unclean.
-            # Recovery must run BEFORE any worker thread starts so it
-            # doesn't race with live DB writes.
-            if _el.last_session_was_unclean:
-                try:
-                    _rdb = _MetadataDB(_base_path)
+    # The lock prevents two concurrent main() calls (can happen during rapid
+    # session GC) from each seeing None and creating separate EventLog instances.
+    with _PERSISTENT_EVENT_LOG_LOCK:
+        if _PERSISTENT_EVENT_LOG is None:
+            _base_path = os.path.join(os.getenv("APPDATA", ""), "pixiv_download")
+            os.makedirs(_base_path, exist_ok=True)
+            try:
+                from app.core.event_log import EventLog, recover_tail
+                from app.core.metadata_db import MetadataDB as _MetadataDB
+                _el = EventLog(_base_path)
+                atexit.register(_el.close)
+                _PERSISTENT_EVENT_LOG = _el
+                # Auto recover_tail if the previous session was unclean.
+                # Recovery must run BEFORE any worker thread starts so it
+                # doesn't race with live DB writes.
+                if _el.last_session_was_unclean:
                     try:
-                        _n = recover_tail(_rdb, _el.log_dir)
-                    finally:
-                        _rdb.close()
-                    if _n > 0:
-                        _log.info(
-                            "event_log: recovered %d orphan events from previous session", _n
-                        )
-                        _PERSISTENT_RECOVERY_COUNT = _n
-                except Exception:
-                    _log.exception("event_log: recover_tail failed")
-        except Exception:
-            _log.exception("event_log: failed to initialise EventLog")
+                        _rdb = _MetadataDB(_base_path)
+                        try:
+                            _n = recover_tail(_rdb, _el.log_dir)
+                        finally:
+                            _rdb.close()
+                        if _n > 0:
+                            _log.info(
+                                "event_log: recovered %d orphan events from previous session", _n
+                            )
+                            _PERSISTENT_RECOVERY_COUNT = _n
+                    except Exception:
+                        _log.exception("event_log: recover_tail failed")
+            except Exception:
+                _log.exception("event_log: failed to initialise EventLog")
 
     event_log = _PERSISTENT_EVENT_LOG
 

@@ -68,6 +68,7 @@ class get_img_url_thread(PauseableThread):
         special_like_rules=None,
         scheduler=None,
         stats_collector=None,
+        *,
         event_log=None,
     ):
         super().__init__(q, scheduler=scheduler)

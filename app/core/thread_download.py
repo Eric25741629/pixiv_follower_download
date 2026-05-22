@@ -81,8 +81,8 @@ class download_thread(PauseableThread):
         jxl_effort=7,
         scheduler=None,
         stats_collector=None,
-        event_log=None,
         *legacy_args,
+        event_log=None,
         **legacy_kwargs,
     ):
         super().__init__(q, scheduler=scheduler)

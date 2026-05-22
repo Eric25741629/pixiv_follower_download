@@ -38,6 +38,7 @@ class EventLog:
         self._lock = threading.Lock()
         self._fh: IO | None = None
         self._current_date: str | None = None
+        self._closed: bool = False
         # Must run before opening today's file so this session's own
         # session.start is not yet written when we scan for prior sessions.
         self.last_session_was_unclean = self._detect_unclean()
@@ -54,11 +55,16 @@ class EventLog:
     def emit(self, kind: str, **fields) -> None:
         """Append one event. Synchronous flush + fsync. Thread-safe."""
         with self._lock:
+            if self._closed:
+                return
             self._write_locked(kind, **fields)
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             if self._fh is None:
+                self._closed = True
                 return
             try:
                 self._write_locked("session.shutdown", clean=True)
@@ -69,6 +75,7 @@ class EventLog:
                     pass
                 self._fh = None
                 self._current_date = None
+                self._closed = True
 
     def _detect_unclean(self) -> bool:
         """Scan existing event files for a trailing session.shutdown.
@@ -228,6 +235,9 @@ def _dispatch_table():
     def _artwork_revoked(db, e):
         db.mark_artwork_revoked(pid=e["pid"], revoked_at=e.get("revoked_at"))
 
+    def _artwork_imported_set(db, e):
+        db.import_downloaded_set(set(e.get("pids", [])))
+
     def _noop(db, e):
         return
 
@@ -240,6 +250,7 @@ def _dispatch_table():
         "artwork.upsert": _artwork_upsert,
         "artwork.discovered": _artwork_discovered,
         "artwork.revoked": _artwork_revoked,
+        "artwork.imported_set": _artwork_imported_set,
         "session.start": _noop,
         "session.shutdown": _noop,
         "snapshot": _noop,

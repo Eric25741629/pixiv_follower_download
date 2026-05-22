@@ -174,7 +174,10 @@ class MetadataDB:
         try:
             self._event_log.emit(kind, **fields)
         except Exception:
-            pass
+            import logging
+            logging.getLogger("pixiv.metadata_db").debug(
+                "event log emit failed for kind=%s", kind, exc_info=True,
+            )
 
     # ── connection management ─────────────────────────────────────────────
 
@@ -533,19 +536,19 @@ class MetadataDB:
                 artwork_rows.append((pid_key, "0001-01-01 00:00:00", "0001-01-01 00:00:00"))
         if not rows:
             return 0
-        # Emit before the writes — recovery replays the sentinel-meta
-        # insert via artwork.upsert (one per pid, since the bulk
-        # artwork.discovered handler only sets discovered_at and would
-        # miss the meta_updated_at sentinel that v_closed_artworks needs).
+        # Emit one bulk event instead of one-per-PID.  The dispatch handler
+        # in event_log._dispatch_table() maps "artwork.imported_set" back to
+        # import_downloaded_set(), which runs with event_log=None during
+        # replay / recover_tail so there is no recursive emit.
         # The legacy `downloaded` table is shadow-only and unused by
         # readers, so it doesn't need its own event kind.
-        for pid_key, _disc, _meta_ts in artwork_rows:
-            self._emit(
-                "artwork.upsert",
-                pid=pid_key,
-                discovered_at="0001-01-01 00:00:00",
-                meta_updated_at="0001-01-01 00:00:00",
-            )
+        pids_to_emit = [r[0] for r in artwork_rows]
+        self._emit(
+            "artwork.imported_set",
+            pids=pids_to_emit,
+            discovered_at="0001-01-01 00:00:00",
+            meta_updated_at="0001-01-01 00:00:00",
+        )
         self._bulk_write(
             "INSERT OR REPLACE INTO downloaded (pid, downloaded_at) VALUES (?, ?)",
             rows,
