@@ -177,8 +177,6 @@ def _dispatch_table():
 
     Defined lazily so tests can import event_log without MetadataDB.
     """
-    from app.core.metadata_db import MetadataDB  # noqa: F401
-
     def _page_upsert(db, e):
         db.upsert_page(
             pid=e["pid"], page_index=e["page_index"], status=e["status"],
@@ -287,7 +285,11 @@ def replay(
     the start of the log.
     """
     import sqlite3
-    from app.core.metadata_db import MetadataDB
+    from app.core.metadata_db import DB_FILENAME, MetadataDB
+
+    assert os.path.basename(db_path) == DB_FILENAME, (
+        f"replay db_path must end in {DB_FILENAME}; got {db_path!r}"
+    )
 
     snapshot_ts: str | None = None
     if snapshot_path and os.path.isfile(snapshot_path):
