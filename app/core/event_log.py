@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 import sys
 import threading
@@ -37,9 +38,10 @@ class EventLog:
         self._lock = threading.Lock()
         self._fh: IO | None = None
         self._current_date: str | None = None
-        self._open_today_locked()
-        self._write_locked("session.start", pid=os.getpid(),
-                           python_version=sys.version.split()[0])
+        with self._lock:
+            self._open_today_locked()
+            self._write_locked("session.start", pid=os.getpid(),
+                               python_version=sys.version.split()[0])
 
     @property
     def log_dir(self) -> str:
@@ -88,12 +90,8 @@ class EventLog:
         try:
             self._fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
             self._fh.flush()
-            try:
-                os.fsync(self._fh.fileno())
-            except OSError:
-                pass
+            os.fsync(self._fh.fileno())
         except OSError as e:
-            import logging
             logging.getLogger("pixiv.event_log").warning(
                 "event log write failed: %s (kind=%s)", e, kind,
             )

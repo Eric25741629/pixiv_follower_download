@@ -49,7 +49,6 @@ def test_emit_is_thread_safe(tmp_path):
 
     files = sorted(os.listdir(tmp_path / "events"))
     lines = (tmp_path / "events" / files[0]).read_text(encoding="utf-8").splitlines()
-    ticks = [json.loads(ln) for ln in lines if json.loads(ln)["k"] == "test.tick"]
+    payloads = [json.loads(ln) for ln in lines]
+    ticks = [p for p in payloads if p["k"] == "test.tick"]
     assert len(ticks) == n_threads * n_per_thread
-    for ln in lines:
-        json.loads(ln)
