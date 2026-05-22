@@ -108,6 +108,25 @@ Phase B (planned): switch `run_actions._build_step2/_build_step3` to `MetadataDB
 
 Migration utility: `python tools/db_migration.py [--dry-run]` (idempotent — re-running picks up nothing on a fresh DB). `python tools/dump_state.py` snapshots all sources as JSON for diff. `python tools/verify_consistency.py` cross-checks legacy vs new tables.
 
+### Event log + replay
+
+Every mutation to canonical `artworks` / `pages` tables is also appended as one JSON line to `%APPDATA%/pixiv_download/events/events-YYYYMMDD.jsonl` **before** the DB write. Files rotate daily; retention is 60 days (`othersettings.event_log.retention_days`).
+
+Emitted by `MetadataDB._emit(...)` in `app/core/metadata_db.py`. Event kinds:
+- `page.upsert` — every `upsert_page` (covers `mark_page_downloaded` / `_failed` / `_pending` via convenience wrappers that call `upsert_page` underneath; no separate event for those)
+- `pages.upsert_bulk` — `upsert_pages_bulk`
+- `artwork.upsert` — `upsert_artwork` (also emitted per-PID by `import_downloaded_set` so PHASE-A shadow-write inserts can be replayed)
+- `artwork.discovered` — `upsert_artworks` (bulk PID discovery)
+- `artwork.revoked` — `mark_artwork_revoked`
+- `session.start` / `session.shutdown` — anchor events emitted by `EventLog.__init__` / `close`
+- `snapshot` — emitted after a successful `MetadataDB.backup_db()` (called daily by `RunController._backup_db`, throttled via `othersettings.event_log.last_snapshot_date`; `max_history` = `max(3, retention_days // 14)`)
+
+Two recovery paths:
+- **Automatic** — `app/gui/flet_app.py` startup constructs the EventLog and, if `last_session_was_unclean`, calls `recover_tail(db, log_dir)` which re-applies events newer than the last `session.shutdown` / `snapshot` into the live DB. All DB mutation methods are idempotent (`INSERT OR IGNORE` / `ON CONFLICT DO UPDATE`), so re-application is safe. During recovery the DB's `_event_log` is temporarily set to None to prevent emit-loops.
+- **Manual** — `python tools/replay_events.py [--target PATH] [--from-snapshot PATH] [--dry-run]` rebuilds a fresh DB from the latest `history/metadata.sqlite3.YYYYMMDD` snapshot plus events newer than it. Use when the live DB is unrecoverable.
+
+To disable the event log entirely, set `othersettings.event_log.enabled = false` (`MetadataDB(path, event_log=None)` reverts to SQLite-WAL-only durability).
+
 ### JXL post-processing
 
 `thread_download` optionally converts downloaded images to JPEG XL using an external `cjxl.exe`. `_find_default_cjxl_path()` in `app/core/thread_download.py` searches known Windows paths (`~/Downloads/jxl*/bin/cjxl.exe`) as fallback; the settings view field `jxl_cjxl_path` overrides it; persisted `othersettings.json.jxl_*` keys are the final fallback. Keep behavior optional — absence of `cjxl.exe` must not break downloads (`tests/test_jxl_fallback.py`).
