@@ -176,15 +176,29 @@ class CookiesView:
         )
 
         # Middle cluster: alias + status badge + last-tested + cookie preview.
-        # Inner Row is wrap=True so badges drop to a second line on narrow widths.
+        # Each sub-cell is a fixed-width Container so badges/timestamps line
+        # up vertically across rows regardless of how long an alias is.
+        # Long aliases are ellipsised by the Text widget.
+        alias_cell = ft.Container(
+            content=ft.Text(
+                alias, color=alias_color, weight=ft.FontWeight.BOLD, size=13,
+                overflow=ft.TextOverflow.ELLIPSIS, max_lines=1, no_wrap=True,
+                tooltip=alias if len(alias) > 14 else None,
+            ),
+            width=140,
+        )
+        badge_cell = ft.Container(
+            content=self._build_status_badge(status, status_color),
+            width=44,
+        )
+        tested_cell = ft.Container(
+            content=ft.Text(f"檢查：{tested_text}", size=11, color=ft.Colors.GREY_600,
+                            overflow=ft.TextOverflow.ELLIPSIS, max_lines=1, no_wrap=True),
+            width=130,
+        )
         info_header = ft.Row(
-            controls=[
-                ft.Text(alias, color=alias_color, weight=ft.FontWeight.BOLD, size=13),
-                self._build_status_badge(status, status_color),
-                ft.Text(f"檢查：{tested_text}", size=11, color=ft.Colors.GREY_600),
-            ],
+            controls=[alias_cell, badge_cell, tested_cell],
             spacing=8,
-            wrap=True,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         info_preview = ft.Text(
