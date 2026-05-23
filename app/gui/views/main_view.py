@@ -150,7 +150,7 @@ class MainView:
                     content=ft.Text("↓ 跳到最新", size=11, color=ft.Colors.WHITE),
                     bgcolor=ft.Colors.with_opacity(0.75, ft.Colors.BLUE_GREY_700),
                     border_radius=20,
-                    padding=ft.padding.symmetric(horizontal=16, vertical=7),
+                    padding=ft.Padding.symmetric(horizontal=16, vertical=7),
                     on_click=self._on_scroll_to_bottom,
                     ink=True,
                 ),
@@ -551,7 +551,7 @@ class MainView:
                             content=ft.Container(
                                 content=self._log_list,
                                 expand=True,
-                                border=ft.border.all(1, ft.Colors.OUTLINE_VARIANT),
+                                border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
                                 border_radius=4,
                                 padding=4,
                             ),

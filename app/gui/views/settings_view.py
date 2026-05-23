@@ -438,7 +438,7 @@ class SettingsView:
                 title=ft.Text(title),
                 controls=[ft.Container(
                     content=ft.Column(controls, spacing=8),
-                    padding=ft.padding.only(left=16, top=10, bottom=12),
+                    padding=ft.Padding.only(left=16, top=10, bottom=12),
                 )],
             )
 
@@ -521,7 +521,7 @@ class SettingsView:
                     ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
                     self._label_ua_status,
                 ]),
-                ft.Container(content=save_btn, padding=ft.padding.only(top=8)),
+                ft.Container(content=save_btn, padding=ft.Padding.only(top=8)),
             ],
             scroll=ft.ScrollMode.AUTO,
             spacing=0,

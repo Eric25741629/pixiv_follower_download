@@ -133,7 +133,7 @@ class CookiesView:
             value=current_proxy if (current_proxy == "" or current_proxy in self._proxy_pool) else "",
             width=180,
             text_size=11,
-            content_padding=ft.padding.symmetric(horizontal=8, vertical=4),
+            content_padding=ft.Padding.symmetric(horizontal=8, vertical=4),
             on_select=lambda e, c=cookie: self._on_proxy_change(c, e.control.value),
         )
 
@@ -142,7 +142,7 @@ class CookiesView:
         return ft.Container(
             content=ft.Text(status, color=ft.Colors.WHITE, size=10, weight=ft.FontWeight.BOLD),
             bgcolor=status_color,
-            padding=ft.padding.symmetric(horizontal=8, vertical=2),
+            padding=ft.Padding.symmetric(horizontal=8, vertical=2),
             border_radius=10,
         )
 
@@ -192,10 +192,15 @@ class CookiesView:
             font_family="monospace", tooltip=cookie,
             overflow=ft.TextOverflow.ELLIPSIS, no_wrap=True,
         )
-        controls_middle = ft.Column(
-            controls=[info_header, info_preview],
-            spacing=2,
-            expand=True,
+        # Bounded width so wrap=True on the outer Row can decide whether the
+        # right cluster (proxy + edit/delete) fits beside us or flows below.
+        # expand=True is intentionally NOT used: under Flet 0.85's Row(wrap=True)
+        # — which becomes a Wrap widget — `expand` is undefined and the column
+        # consumes the entire ListView vertical space (silently hiding all
+        # subsequent rows).
+        controls_middle = ft.Container(
+            content=ft.Column([info_header, info_preview], spacing=2),
+            width=420,
         )
 
         # Right cluster: proxy binding + edit/delete actions.
@@ -224,8 +229,8 @@ class CookiesView:
                 wrap=True,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
-            padding=ft.padding.symmetric(horizontal=10, vertical=6),
-            border=ft.border.all(1, ft.Colors.OUTLINE_VARIANT),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=6),
+            border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
             border_radius=6,
         )
 
