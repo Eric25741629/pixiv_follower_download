@@ -4,6 +4,8 @@
 >
 > *Pixiv batch downloader rebuilt with Flet (Material 3), desktop & web.*
 
+![主畫面](docs/screenshots/main-light.png)
+
 ---
 
 ## 功能概覽 Features
@@ -148,6 +150,29 @@ ruff check app/
 radon cc app/ -n C -s
 lizard -C 15 -L 100 app/
 ```
+
+---
+
+## 截圖 Screenshots
+
+### 主畫面 — 4 步驟管線 + 一鍵執行
+![主畫面](docs/screenshots/main-light.png)
+
+### Cookie 管理 — 多帳號輪替 + Proxy 綁定
+![Cookie 管理](docs/screenshots/cookies-light.png)
+
+> 圖中 alias 與 cookie 內容已遮蓋；實際使用會顯示你自訂的別名與最後檢查時間。
+
+### 設定 — ExpansionTile 分組
+![設定面板](docs/screenshots/settings-light.png)
+
+### 統計面板 — 流量、JXL 節省空間、HTTP 請求、Cookie 分配
+![統計面板](docs/screenshots/stats-light.png)
+
+### 深色模式
+![深色模式](docs/screenshots/main-dark.png)
+
+> 右上角單鍵切換 LIGHT / DARK / SYSTEM，選擇透過 `SettingsStore` 持久化；所有 view 即時重新著色不需重啟。
 
 ---
 
