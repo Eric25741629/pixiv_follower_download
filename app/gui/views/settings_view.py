@@ -12,6 +12,18 @@ def _store() -> SettingsStore:
     return SettingsStore(path)
 
 
+def _safe_int(value, default: int) -> int:
+    """Tolerant int parse for TextField values that may be empty / non-numeric.
+
+    Falls back to *default* on TypeError/ValueError so a stray "abc" does not
+    raise during save.
+    """
+    try:
+        return int(str(value).strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
 class SettingsView:
     """Settings page grouped into ExpansionTile sections."""
 
@@ -44,6 +56,13 @@ class SettingsView:
         self._sw_notime = ft.Switch(label="無時間不下載", value=bool(flt.get("notime", False)))
         self._tf_like_num = ft.TextField(label="最低讚數（一般）", value=str(dl.get("like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
         self._tf_r18_like_num = ft.TextField(label="最低讚數（R18）", value=str(dl.get("r18_like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
+        self._tf_rescrape_within_days = ft.TextField(
+            label="重抓上限（天數，0=關閉）",
+            value=str(dl.get("rescrape_within_days", 365)),
+            width=200,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            tooltip="作品距上傳時間小於此天數時，Step 3 會重新抓取 meta 以更新讚數，避免新作品因初始讚數不足被永久過濾。0 表示停用。已下載的作品永遠不會重抓。",
+        )
         self._tf_filename_template = ft.TextField(
             label="檔名範本（留空＝使用預設）",
             value=str(dl.get("filename_template", "") or ""),
@@ -349,8 +368,9 @@ class SettingsView:
         store.update_section("download", {
             **store.get_section("download"),
             "path": self._tf_path.value,
-            "like_num": int(self._tf_like_num.value or 0),
-            "r18_like_num": int(self._tf_r18_like_num.value or 0),
+            "like_num": _safe_int(self._tf_like_num.value, 0),
+            "r18_like_num": _safe_int(self._tf_r18_like_num.value, 0),
+            "rescrape_within_days": _safe_int(self._tf_rescrape_within_days.value, 0),
             "ban_tag": self._ban_tags,
             "must_tag": self._must_tags,
             "filename_template": (self._tf_filename_template.value or "").strip(),
@@ -458,7 +478,7 @@ class SettingsView:
                 ]),
                 _tile("過濾規則", [
                     ft.Row([self._sw_hidefollow, self._sw_nogif, self._sw_notag, self._sw_notime], wrap=True),
-                    ft.Row([self._tf_like_num, self._tf_r18_like_num], spacing=16),
+                    ft.Row([self._tf_like_num, self._tf_r18_like_num, self._tf_rescrape_within_days], spacing=16, wrap=True),
                 ]),
                 _tile("檔名範本", [
                     ft.Text(

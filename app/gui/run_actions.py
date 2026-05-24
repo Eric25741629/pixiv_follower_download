@@ -32,6 +32,18 @@ DEFAULT_AGENT = (
 _RETEST_INTERVAL_SEC = 30 * 86400  # 30 days
 
 
+def _coerce_int(value, default: int) -> int:
+    """Tolerant int parse for settings.json values that may be hand-edited.
+
+    Falls back to *default* on TypeError/ValueError. Keeps thread construction
+    from crashing when a user pastes a non-numeric value into a settings field.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _data_path() -> str:
     p = os.getenv("APPDATA") + r"/pixiv_download/"
     os.makedirs(p, exist_ok=True)
@@ -556,6 +568,7 @@ class RunController:
             special_like_rules=[],
             stats_collector=self._stats_collector,
             event_log=self._event_log,
+            rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t

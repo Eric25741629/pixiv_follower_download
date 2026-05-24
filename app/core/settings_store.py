@@ -24,6 +24,10 @@ DEFAULTS = {
         "rule_tag_2": "",
         "rule_like_2": 0,
         "filename_template": "",
+        # When Step 3 finds a cached artwork that was uploaded within this many
+        # days, re-fetch its meta over the network instead of trusting the
+        # cached like_count. 0 disables the feature.
+        "rescrape_within_days": 365,
     },
     "filter": {
         "pass_tag": False,

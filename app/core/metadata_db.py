@@ -335,27 +335,31 @@ class MetadataDB:
 
     def get_meta(self, pid: str) -> dict | None:
         """Look up artwork meta in the new schema, returning the legacy
-        ``{tag, like, pagecount, img_url, requires_cookie, updated_at}``
-        dict shape that existing callers expect.
+        ``{tag, like, pagecount, img_url, requires_cookie, updated_at,
+        upload_date}`` dict shape that existing callers expect.
 
         Returns ``None`` only when no ``artworks`` row exists for the PID
         AND no meta has ever been recorded — a row that exists but lacks
         meta (``meta_updated_at IS NULL``) still returns ``None`` so the
         caller's "needs network fetch" branch fires.
+
+        ``upload_date`` is the Pixiv-reported ISO-8601 upload timestamp;
+        consumers use it for the rescrape-window staleness check (see
+        ``thread_url_fetch.get_img_url_thread._is_within_rescrape_window``).
         """
         pid_key = self._coerce_pid(pid)
         if not pid_key:
             return None
         cur = self._conn().execute(
             "SELECT tags, like_count, page_count, img_url_template, "
-            "requires_cookie, meta_updated_at "
+            "requires_cookie, meta_updated_at, upload_date "
             "FROM artworks WHERE pid = ? AND meta_updated_at IS NOT NULL",
             (pid_key,),
         )
         row = cur.fetchone()
         if row is None:
             return None
-        tags_blob, like, pages, img, rc, updated = row
+        tags_blob, like, pages, img, rc, updated, upload = row
         try:
             tags = json.loads(tags_blob) if tags_blob else []
         except Exception:
@@ -367,6 +371,7 @@ class MetadataDB:
             "img_url": img,
             "requires_cookie": None if rc is None else bool(rc),
             "updated_at": updated,
+            "upload_date": upload,
         }
 
     def has_meta(self, pid: str) -> bool:

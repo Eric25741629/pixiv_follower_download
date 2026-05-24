@@ -70,10 +70,12 @@ class get_img_url_thread(PauseableThread):
         stats_collector=None,
         *,
         event_log=None,
+        rescrape_within_days=0,
     ):
         super().__init__(q, scheduler=scheduler)
         self._stats_collector = stats_collector
         self._event_log = event_log
+        self._rescrape_within_days = self._coerce_rescrape_days(rescrape_within_days)
         self._init_basic_options(
             Author_list, Agent, cookies, exist_pid, ban_tag, must_tag,
             like_num, no_to_check, base_path, single_thread_mode, special_like_rules,
@@ -1825,6 +1827,91 @@ class get_img_url_thread(PauseableThread):
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _coerce_rescrape_days(raw):
+        """Coerce settings.json's ``rescrape_within_days`` into a non-negative int.
+
+        Negative / non-numeric / None all collapse to 0 (feature disabled).
+        """
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        return n if n > 0 else 0
+
+    @staticmethod
+    def _parse_pixiv_upload_date(value):
+        """Parse Pixiv's ISO-8601 uploadDate string into a tz-aware datetime.
+
+        Returns None for non-string / empty / unparseable input. Pixiv emits
+        e.g. ``'2024-01-15T12:30:00+09:00'``. ``fromisoformat`` accepts that
+        on Python >= 3.7, but rejects some valid ISO-8601 variants on Python
+        3.10 (e.g. ``Z`` suffix, ``+0900`` without colon). The strptime
+        fallback covers those cases without depending on a 3.11+ runtime.
+        Naive inputs are treated as UTC defensively.
+        """
+        if not isinstance(value, str) or not value.strip():
+            return None
+        s = value.strip()
+        try:
+            dt = datetime.datetime.fromisoformat(s)
+        except ValueError:
+            dt = None
+        if dt is None:
+            # Normalize trailing 'Z' (Zulu / UTC) and tolerate offsets without
+            # the colon, then retry via strptime.
+            normalized = s
+            if normalized.endswith('Z'):
+                normalized = normalized[:-1] + '+0000'
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f%z",
+                "%Y-%m-%dT%H:%M:%S",
+            ):
+                try:
+                    dt = datetime.datetime.strptime(normalized, fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is None:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+
+    def _is_within_rescrape_window(self, cached):
+        """True iff the cached entry was uploaded within ``self._rescrape_within_days`` days.
+
+        Returns False (no rescrape) when:
+          - the feature is disabled (threshold <= 0)
+          - ``cached`` is not a dict
+          - ``upload_date`` is missing or unparseable
+          - the artwork is older than the threshold
+          - the parsed upload_date is in the future (clock skew safeguard)
+        """
+        threshold = getattr(self, '_rescrape_within_days', 0)
+        if threshold <= 0:
+            return False
+        if not isinstance(cached, dict):
+            return False
+        dt = self._parse_pixiv_upload_date(cached.get('upload_date'))
+        if dt is None:
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc)
+        diff_days = (now - dt).total_seconds() / 86400.0
+        return 0.0 <= diff_days < float(threshold)
+
+    def _step3_cache_is_fresh(self, cached):
+        """Cache short-circuits the network fetch only when both conditions hold:
+           - the entry is well-formed (``_step3_cache_is_usable``); and
+           - the artwork is NOT within the rescrape window.
+        """
+        if not self._step3_cache_is_usable(cached):
+            return False
+        if self._is_within_rescrape_window(cached):
+            return False
+        return True
+
     def _step3_finish_pid(self, ret_value, query_source, need_cookie, should_wait, pid_key):
         """Apply the trailing wait + progress advance, then format the return tuple."""
         if should_wait:
@@ -1837,11 +1924,16 @@ class get_img_url_thread(PauseableThread):
         where meta_tuple is either ``(tag, like, pagecount, img_url, need_cookie)`` or
         ``None`` to signal the network path failed and the caller should bail with [pid_key]."""
         cached = self._get_meta(pid_key) or None
-        if self._step3_cache_is_usable(cached):
+        if self._step3_cache_is_fresh(cached):
             return (
                 self._step3_resolve_meta_from_cache(pid_key, cached),
                 "cache",
                 False,
+            )
+        if self._step3_cache_is_usable(cached) and self._is_within_rescrape_window(cached):
+            self._step3_safe_emit(
+                f"<p><font color='gray'>PID {pid_key} 距上傳 &lt; "
+                f"{self._rescrape_within_days} 天，重新抓取以更新讚數</font></p>"
             )
         resolved = self._step3_resolve_meta_from_network(
             pid_key, url, Agent, session, cookie_override
