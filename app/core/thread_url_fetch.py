@@ -10,7 +10,6 @@ import requests
 from queue import Queue
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
-import tag_edit
 import pixiv_api
 from app.core.metadata_db import MetadataDB, emit_db_stats, open_metadata_db
 from app.core.pixiv_thread_utils import (
@@ -88,7 +87,6 @@ class get_img_url_thread(PauseableThread):
         self.url_meta = self._load_initial_url_meta()
         self._metadata_db = self._init_metadata_db(self.url_meta)
         self._emit_metadata_db_stats(stage="Step3")
-        self._migrate_pending_pids_from_file()
         self._safe_emit_init(
             f"<p><font color='gray'>[Step3初始化] metadata DB 載入，"
             f"開始 schema 遷移檢查...</font></p>"
@@ -759,25 +757,6 @@ class get_img_url_thread(PauseableThread):
         """Open the SQLite metadata cache; first-run import from JSON."""
         return open_metadata_db(self.path, json_meta, event_log=getattr(self, "_event_log", None))
 
-    def _migrate_pending_pids_from_file(self):
-        """First-run migration: import pictures_id.txt into pending_pids when DB is empty."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            if db.pending_pid_count() > 0:
-                return
-            pid_file = os.path.join(self.path, "pictures_id.txt")
-            if not os.path.isfile(pid_file):
-                return
-            n = db.import_pending_pids_from_file(pid_file)
-            if n > 0:
-                self._safe_emit_init(
-                    f"<p><font color='gray'>[Migration] 從 pictures_id.txt 匯入 {n} 筆 PID 至 DB</font></p>"
-                )
-        except Exception:
-            pass
-
     def _emit_metadata_db_stats(self, stage="Step3"):
         """Print a one-liner with current SQLite cache size."""
         emit_db_stats(getattr(self, "_metadata_db", None), self._q, stage=stage)
@@ -870,8 +849,12 @@ class get_img_url_thread(PauseableThread):
             out.append(x)
         return out
 
-    def _write_all_url_snapshot(self, fetched_urls):
-        """Write merged all_url snapshot to disk and sync to DB."""
+    def _write_all_url_snapshot(self, fetched_urls, *, full=False):
+        """Write merged all_url snapshot to disk and sync the DELTA to the DB.
+
+        ``full=True`` (terminal flushes) pushes the entire merged set once as a
+        backstop; periodic flushes push only URLs not yet mirrored this run.
+        """
         try:
             old_urls = self._filter_undownloaded_urls(self._read_existing_all_url_lines())
             new_urls = self._filter_undownloaded_urls(fetched_urls, only_https=True)
@@ -891,11 +874,25 @@ class get_img_url_thread(PauseableThread):
             db = getattr(self, "_metadata_db", None)
             if db is not None:
                 try:
-                    entries = [
-                        (url, self._extract_pid_from_url(url) or "")
-                        for url in merged
-                    ]
-                    db.upsert_pending_urls(entries)
+                    # QW1: only mirror URLs not already pushed THIS run. The full
+                    # all_url.txt snapshot above is unchanged; upsert_pending_urls
+                    # is INSERT OR IGNORE (idempotent), so re-deriving the full set
+                    # from all_url.txt on the next run loses nothing. This turns
+                    # the per-batch DB write + pages.upsert_bulk event from
+                    # O(cumulative) into O(new) and collapses the quadratic
+                    # event-log growth at the source.
+                    flushed = getattr(self, "_flushed_urls", None)
+                    if flushed is None:
+                        flushed = set()
+                        self._flushed_urls = flushed
+                    to_push = merged if full else [u for u in merged if u not in flushed]
+                    if to_push:
+                        entries = [
+                            (url, self._extract_pid_from_url(url) or "")
+                            for url in to_push
+                        ]
+                        db.upsert_pending_urls(entries)
+                        flushed.update(to_push)
                 except Exception:
                     pass
             return old_urls, new_urls, merged
@@ -1394,9 +1391,11 @@ class get_img_url_thread(PauseableThread):
                     color = "black"
                     extra = ""
                 tag_text = f"標籤 {tag_count} 個" + (f"（{tag_preview}）" if tag_preview else "")
+                user_name = meta.get("user_name")
+                by_label = f" [by {user_name}]" if user_name else ""
                 self._q.put(WorkerEvent("output",
                     f"<p><font color='{color}'>處理 PID {processed_count + 1}/{self.pid_max}："
-                    f"{pid_key}（來源={source_label}、愛心={like}、頁數={pagecount}、"
+                    f"{pid_key}{by_label}（來源={source_label}、愛心={like}、頁數={pagecount}、"
                     f"{tag_text}、cookie={req_label}）{extra}</font></p>"))
             else:
                 self._q.put(WorkerEvent("output",
@@ -1493,7 +1492,7 @@ class get_img_url_thread(PauseableThread):
     def _finalize_on_stop(self, results):
         try:
             flat_results = [x for item in results if isinstance(item, list) for x in item]
-            old_urls, new_urls, merged = self._write_all_url_snapshot(flat_results)
+            old_urls, new_urls, merged = self._write_all_url_snapshot(flat_results, full=True)
             self._flush_url_meta_snapshot()
             self._persist_pending_pid_file()  # Phase 36: ensure pending list is saved on stop
             self._flush_revoked_pid_file()
@@ -1584,7 +1583,7 @@ class get_img_url_thread(PauseableThread):
     def _finalize_on_complete(self, results):
         self._step3_emit("<p><font color='gray'>[Step3完成] 整理結果並寫入 all_url.txt...</font></p>")
         url_results, error_pid = self._split_results_and_errors(results)
-        old_urls, new_urls, merged = self._write_all_url_snapshot(url_results)
+        old_urls, new_urls, merged = self._write_all_url_snapshot(url_results, full=True)
 
         self._step3_emit("<p><font color='gray'>[Step3完成] 持久化剩餘 pending PID...</font></p>")
         self._persist_pending_pid_file()  # Phase 36: flush remaining pending PIDs
@@ -1655,14 +1654,24 @@ class get_img_url_thread(PauseableThread):
             self._q.put(WorkerEvent("progress", (1, self.pid_max)))
 
     def _step3_extract_meta_from_cache(self, cached):
-        """Unpack a cached url_meta entry into the (tag, like, pagecount, img_url, need_cookie)
-        tuple expected by `get_download_url`. Pure dict reads; no side effects."""
+        """Unpack a cached url_meta entry into the 9-element meta tuple expected
+        by ``get_download_url``: ``(tag, like, pagecount, img_url, need_cookie,
+        upload_date, create_date, user_id, user_name)``. The 4 trailing fields
+        default to ``None`` for entries that predate the schema extension —
+        Step 3 will re-fetch via network when the cache is missing img_url, so
+        those NULLs only affect filter-passing artwork that already has cached
+        urls (acceptable: existing rows in DB stay NULL until next re-fetch)."""
         tag = cached.get('tag', [])
         like = cached.get('like', 0)
         pagecount = int(cached.get('pagecount', 1) or 1)
         img_url = cached.get('img_url')
         need_cookie = cached.get('requires_cookie', None)
-        return tag, like, pagecount, img_url, need_cookie
+        upload_date = cached.get('upload_date')
+        create_date = cached.get('create_date')
+        user_id = cached.get('user_id')
+        user_name = cached.get('user_name')
+        return (tag, like, pagecount, img_url, need_cookie,
+                upload_date, create_date, user_id, user_name)
 
     def _step3_safe_emit(self, html):
         """Emit `html` on `_output`, swallowing any signal-emit exception.
@@ -1727,9 +1736,17 @@ class get_img_url_thread(PauseableThread):
             return None
 
     def _step3_build_url_meta_entry(self, pid_key, tag, like, pagecount, img_url,
-                                     need_cookie, artwork_url, query_source):
+                                     need_cookie, artwork_url, query_source,
+                                     upload_date=None, create_date=None,
+                                     user_id=None, user_name=None):
         """Write the url_meta entry for a successfully resolved PID. Wrapped in try/except
-        to preserve the original best-effort semantics (failures must not abort the workflow)."""
+        to preserve the original best-effort semantics (failures must not abort the workflow).
+
+        ``upload_date`` / ``create_date`` are Pixiv's ISO-8601 timestamps;
+        ``user_id`` / ``user_name`` identify the artist. ``user_id`` may already
+        be set in the DB by Step 2 — we still write it here for the JSON cache
+        so :meth:`mirror_meta_dict_to_db` propagates it on shutdown.
+        """
         try:
             self.url_meta[pid_key] = {
                 "tag": tag if isinstance(tag, list) else [],
@@ -1738,6 +1755,10 @@ class get_img_url_thread(PauseableThread):
                 "img_url": img_url,
                 "requires_cookie": need_cookie,
                 "artwork_url": artwork_url,
+                "upload_date": upload_date,
+                "create_date": create_date,
+                "user_id": user_id,
+                "user_name": user_name,
                 "pixiv_info": {
                     "tag": tag if isinstance(tag, list) else [],
                     "like": int(like) if str(like).isdigit() else like,
@@ -1746,6 +1767,10 @@ class get_img_url_thread(PauseableThread):
                     "requires_cookie": need_cookie,
                     "queried_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "source": query_source,
+                    "upload_date": upload_date,
+                    "create_date": create_date,
+                    "user_id": user_id,
+                    "user_name": user_name,
                 },
             }
         except Exception:
@@ -1773,21 +1798,27 @@ class get_img_url_thread(PauseableThread):
             raise
 
     def _step3_resolve_meta_from_cache(self, pid_key, cached):
-        """Pull (tag, like, pagecount, img_url, need_cookie) out of the cache entry."""
+        """Pull the 9-element meta tuple out of the cache entry."""
         self._pid_cache_hit[pid_key] = True
-        tag, like, pagecount, img_url, need_cookie = self._step3_extract_meta_from_cache(cached)
+        (tag, like, pagecount, img_url, need_cookie,
+         upload_date, create_date, user_id, user_name) = (
+            self._step3_extract_meta_from_cache(cached)
+        )
         need_cookie = self._refresh_cookie_requirement(pid_key, fallback=need_cookie)
         if self.single_mode_flag and bool(getattr(self, "_log_step3_cache_detail", False)):
             self._step3_safe_emit(
                 f"<p><font color='gray'>[URL階段] PID {pid_key} 使用本地快取，跳過等待</font></p>"
             )
-        return tag, like, pagecount, img_url, need_cookie
+        return (tag, like, pagecount, img_url, need_cookie,
+                upload_date, create_date, user_id, user_name)
 
     def _step3_resolve_meta_from_network(
         self, pid_key, url, Agent, session, cookie_override
     ):
-        """Network fetch + parse for one PID. Returns (tag, like, pagecount, img_url, need_cookie)
-        on success, or ``None`` when the call failed / 404'd / returned a malformed payload."""
+        """Network fetch + parse for one PID. Returns the 9-element meta tuple
+        ``(tag, like, pagecount, img_url, need_cookie, upload_date, create_date,
+        user_id, user_name)`` on success, or ``None`` when the call failed /
+        404'd / returned a malformed payload."""
         self._pid_cache_hit[pid_key] = False
         if cookie_override is not None:
             pid_cookie = cookie_override
@@ -1808,12 +1839,14 @@ class get_img_url_thread(PauseableThread):
             self._mark_revoked_pid(pid_key, reason="404")
             return None
         try:
-            tag, like, pagecount, img_url = info
+            (tag, like, pagecount, img_url,
+             upload_date, create_date, user_id, user_name) = info
         except Exception:
             return None
         fallback_req = self._step3_safe_cookie_requirement(pid_key)
         need_cookie = self._refresh_cookie_requirement(pid_key, fallback=fallback_req)
-        return tag, like, pagecount, img_url, need_cookie
+        return (tag, like, pagecount, img_url, need_cookie,
+                upload_date, create_date, user_id, user_name)
 
     @staticmethod
     def _step3_cache_is_usable(cached):
@@ -1964,10 +1997,13 @@ class get_img_url_thread(PauseableThread):
             return self._step3_finish_pid(
                 [str(pid_key)], query_source, None, should_wait, pid_key,
             )
-        tag, like, pagecount, img_url, need_cookie = meta_tuple
+        (tag, like, pagecount, img_url, need_cookie,
+         upload_date, create_date, user_id, user_name) = meta_tuple
 
         self._step3_build_url_meta_entry(
             pid_key, tag, like, pagecount, img_url, need_cookie, url, query_source,
+            upload_date=upload_date, create_date=create_date,
+            user_id=user_id, user_name=user_name,
         )
 
         passed, reason = self._passes_artwork_filters(pid_key, tag, like)

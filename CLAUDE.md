@@ -63,7 +63,7 @@ The canonical code lives under `app/` in three layers:
   - `pixiv_api.py` wraps Pixiv HTTP endpoints, cookie handling, and response parsing.
   - `pixiv_thread_utils.py` is a helpers module: `atomic_write_json/text`, `normalize_pid`, `fetch_with_cookie_retry`, diagnostic event logging, PID cache sync.
   - `safe_io.py` provides atomic write + history-based backup (keeps latest 10 copies in a sibling `history/` directory).
-  - `tag_edit.py`, `update_selenium.py` — tag filtering and Selenium cookie refresh.
+  - `update_selenium.py` — Selenium-based cookie refresh.
 
 ### Top-level shim files
 
@@ -71,10 +71,9 @@ A few files at the repository root are thin re-exports that keep legacy absolute
 
 - `main.py` → `app.entry.main`
 - `user_info.py` → `app.gui.user_info`
-- `tag_edit.py` → `app.core.tag_edit`
 - `update_selenium.py` → `app.core.update_selenium`
 
-Note: the root `pixiv_api.py`, `pixiv_thread.py`, and `download_img.py` are still standalone copies (not shims) — the `app/core/*.py` versions are the ones loaded through `main.py → app.entry.main`. When in doubt, trace from `app/entry/main.py`; modules inside `app.core` import `from pixiv_api import *` and `import tag_edit` as bare names (not `app.core.*`), so `sys.path` must include the repo root (tests do this explicitly; `main.py` inherits it from being run at the repo root).
+Note: the root `pixiv_api.py`, `pixiv_thread.py`, and `download_img.py` are still standalone copies (not shims) — the `app/core/*.py` versions are the ones loaded through `main.py → app.entry.main`. When in doubt, trace from `app/entry/main.py`; modules inside `app.core` use `from pixiv_api import *` as a bare name (not `app.core.pixiv_api`), so `sys.path` must include the repo root (tests do this explicitly; `main.py` inherits it from being run at the repo root).
 
 ### Runtime data locations
 
@@ -96,7 +95,7 @@ Three views provide the decisions Step 3 / Step 4 consult:
 
 Helpers in `app/core/metadata_db.py`: `upsert_artwork`, `upsert_artworks` (bulk), `mark_artwork_revoked`, `upsert_page`, `mark_page_downloaded`, `mark_page_failed`, `mark_page_pending`, `upsert_pages_bulk`, `get_pending_pages`, `get_pending_urls_filtered`, `closed_artwork_set`, `is_pid_closed`, `is_pid_complete`, `page_status_counts`.
 
-**Legacy tables (`pids`, `downloaded`, `pending_urls`, `pending_pids`) are still written by shadow-write helpers** for one more transition phase. They no longer drive read decisions and will be dropped in a future revision. JSON / text files `exist_pid.json`, `all_url.txt`, `pictures_id.txt`, `err_url.txt` likewise persist for compatibility but the canonical state lives in SQLite.
+**Legacy tables (`pids`, `downloaded`, `pending_urls`, `pending_pids`) were dropped in Phase 8.** `_SCHEMA` runs `DROP TABLE IF EXISTS` on every open (`app/core/metadata_db.py:38-41`) and nothing writes to them — the `MetadataDB` methods named after them (`upsert_pending_urls`, `upsert_pending_pids`, `mark_url_done`/`mark_urls_done`) write the canonical `pages` / `artworks` tables instead, so legacy-table write-amplification is zero. (This is separate from the still-active PHASE-A `exist_pid` shadow-write into `artworks` sentinel rows described below.) JSON / text files `exist_pid.json`, `all_url.txt`, `pictures_id.txt`, `err_url.txt` likewise persist for compatibility but the canonical state lives in SQLite.
 
 #### `exist_pid` DB-only migration (in progress — search `PHASE-A`)
 
@@ -110,19 +109,25 @@ Migration utility: `python tools/db_migration.py [--dry-run]` (idempotent — re
 
 ### Event log + replay
 
-Every mutation to canonical `artworks` / `pages` tables is also appended as one JSON line to `%APPDATA%/pixiv_download/events/events-YYYYMMDD.jsonl` **before** the DB write. Files rotate daily; retention is 60 days (`othersettings.event_log.retention_days`).
+Every mutation to canonical `artworks` / `pages` tables is also appended as one JSON line to `%APPDATA%/pixiv_download/events/events-YYYYMMDD.jsonl` **before** the DB write. Files rotate by date AND by size (`event_log.rotate_size_bytes`, default 128 MB → `events-YYYYMMDD.NNN.jsonl`, zero-padded sequence; the bare name is sequence 0). Retention is time-based (`event_log.retention_days`, 60) AND byte-capped (`event_log.max_total_bytes`, default 4 GB — oldest files evicted first, never past the most recent snapshot/shutdown/checkpoint anchor).
+
+**Durability cadence:** every line is `flush()`ed (survives a process kill), but `os.fsync` is batched — forced every `event_log.fsync_every_n` events (default 200) OR `event_log.fsync_interval_sec` (default 1.0s), whichever first, plus unconditionally on anchor kinds and `close()`. Set `fsync_every_n=1` for the legacy per-event fsync (max power-loss durability). The batched default removes the per-DB-mutation disk barrier that dominated write cost; the SQLite WAL (`synchronous=NORMAL`) is the authoritative durable store, the log is a recovery aid.
 
 Emitted by `MetadataDB._emit(...)` in `app/core/metadata_db.py`. Event kinds:
 - `page.upsert` — every `upsert_page` (covers `mark_page_downloaded` / `_failed` / `_pending` via convenience wrappers that call `upsert_page` underneath; no separate event for those)
 - `pages.upsert_bulk` — `upsert_pages_bulk`
+- `pages.downloaded_bulk` — `mark_pages_downloaded_bulk` (Step-4 success path via `mark_urls_done`). Replays through an `ON CONFLICT DO UPDATE SET status='downloaded'`, so recovery correctly flips pre-seeded `pending` rows to `downloaded` (a plain `pages.upsert_bulk` uses `INSERT OR IGNORE` and would leave them stuck pending)
 - `artwork.upsert` — `upsert_artwork` (also emitted per-PID by `import_downloaded_set` so PHASE-A shadow-write inserts can be replayed)
 - `artwork.discovered` — `upsert_artworks` (bulk PID discovery)
 - `artwork.revoked` — `mark_artwork_revoked`
 - `session.start` / `session.shutdown` — anchor events emitted by `EventLog.__init__` / `close`
-- `snapshot` — emitted after a successful `MetadataDB.backup_db()` (called daily by `RunController._backup_db`, throttled via `othersettings.event_log.last_snapshot_date`; `max_history` = `max(3, retention_days // 14)`)
+- `snapshot` — emitted after a successful `MetadataDB.backup_db()` (called daily by `RunController._backup_db`, throttled via `othersettings.event_log.last_snapshot_date`; `max_history` = `max(3, retention_days // 14)`). After a verified snapshot, `RunController._backup_db` calls `EventLog.compact_before_date` to prune event files fully older than it (2-day margin), bounding the log to a small tail by construction
+- `checkpoint` — a lightweight anchor (no DB copy) emitted at startup by `app/gui/flet_app.py` **after** `recover_tail`, so the next crash recovery is bounded to one session even when the user never presses Run and force-kills
+
+Cutoff anchors (what `recover_tail` stops at) are `session.shutdown` / `snapshot` / `checkpoint`.
 
 Two recovery paths:
-- **Automatic** — `app/gui/flet_app.py` startup constructs the EventLog and, if `last_session_was_unclean`, calls `recover_tail(db, log_dir)` which re-applies events newer than the last `session.shutdown` / `snapshot` into the live DB. All DB mutation methods are idempotent (`INSERT OR IGNORE` / `ON CONFLICT DO UPDATE`), so re-application is safe. During recovery the DB's `_event_log` is temporarily set to None to prevent emit-loops.
+- **Automatic** — `app/gui/flet_app.py` startup constructs the EventLog and, if `last_session_was_unclean`, calls `recover_tail(db, log_dir)`. It **reverse-seeks** (block-streamed, never `readlines` a multi-GB file) from the newest file to the most recent cutoff anchor and applies only the orphan tail — O(tail), not O(total log), so a large backlog can never blank-screen startup. The tail scan is bounded by `RECOVER_TAIL_MAX_BYTES` (256 MB); beyond it the most-recent budget-worth is applied best-effort and a warning logged. All DB mutation methods are idempotent (`INSERT OR IGNORE` / `ON CONFLICT DO UPDATE`), so re-application is safe. During recovery the DB's `_event_log` is temporarily set to None to prevent emit-loops.
 - **Manual** — `python tools/replay_events.py [--target PATH] [--from-snapshot PATH] [--dry-run]` rebuilds a fresh DB from the latest `history/metadata.sqlite3.YYYYMMDD` snapshot plus events newer than it. Use when the live DB is unrecoverable.
 
 To disable the event log entirely, set `othersettings.event_log.enabled = false` (`MetadataDB(path, event_log=None)` reverts to SQLite-WAL-only durability).

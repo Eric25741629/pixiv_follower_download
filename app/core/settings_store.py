@@ -24,6 +24,10 @@ DEFAULTS = {
         "rule_tag_2": "",
         "rule_like_2": 0,
         "filename_template": "",
+        # tag cleanup options applied to the {hashtag} placeholder in filenames.
+        # Default false to preserve historical behavior.
+        "tag_strip_brackets": False,
+        "tag_strip_special_chars": False,
         # When Step 3 finds a cached artwork that was uploaded within this many
         # days, re-fetch its meta over the network instead of trusting the
         # cached like_count. 0 disables the feature.
@@ -74,6 +78,23 @@ DEFAULTS = {
     },
     "ui": {
         "theme_mode": "SYSTEM",  # "LIGHT" | "DARK" | "SYSTEM"
+    },
+    "event_log": {
+        "enabled": True,
+        "retention_days": 60,
+        "auto_snapshot_on_run": True,
+        # Durability cadence: fsync every N events OR every interval seconds,
+        # whichever comes first; anchor kinds (session.*/snapshot/checkpoint) and
+        # close() always force an fsync. Batched defaults remove the per-DB-write
+        # disk barrier that dominated write cost (set fsync_every_n=1 to restore
+        # the legacy per-event fsync for maximum power-loss durability).
+        "fsync_every_n": 200,
+        "fsync_interval_sec": 1.0,
+        # Hard ceiling on the events/ directory; oldest files are evicted first,
+        # never past the most recent snapshot/shutdown/checkpoint anchor.
+        "max_total_bytes": 4294967296,    # 4 GB
+        # Roll the day's file to the next sequence once it exceeds this size.
+        "rotate_size_bytes": 134217728,   # 128 MB
     },
 }
 

@@ -1,8 +1,6 @@
 """SQLite-backed metadata cache.
 
-Two generations of schema coexist during the ongoing refactor:
-
-**New (canonical) tables — single source of truth:**
+Canonical tables:
 
     artworks (pid, discovered_at, page_count, like_count, tags,
               img_url_template, requires_cookie, meta_updated_at,
@@ -14,16 +12,10 @@ Two generations of schema coexist during the ongoing refactor:
             — one row per (PID, page) tuple, status ∈ {pending,
             downloaded, failed, revoked}.
 
-**Legacy tables (kept for the migration window):**
-
-    pids            — superseded by ``artworks``
-    downloaded      — superseded by ``pages WHERE status='downloaded'``
-    pending_urls    — superseded by ``pages WHERE status='pending'``
-    pending_pids    — superseded by ``artworks WHERE meta_updated_at IS NULL``
-
-Helpers prefixed ``mark_page_*``, ``upsert_artwork`` etc. operate on the
-new schema; the older ``mark_downloaded``, ``upsert_pending_urls`` etc.
-remain so that shadow-write (Phase 2) keeps both stores in sync.
+Legacy tables (``pids``, ``downloaded``, ``pending_urls``,
+``pending_pids``) were dropped in Phase 8. The schema migration runs
+``DROP TABLE IF EXISTS`` on first open so any existing DB is cleaned up
+automatically.
 
 Concurrency: SQLite is opened in WAL mode, which lets the four worker
 threads (Steps 2/3/4) share a connection-per-thread without contention.
@@ -42,36 +34,13 @@ DB_FILENAME = "metadata.sqlite3"
 
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS pids (
-    pid TEXT PRIMARY KEY,
-    tags TEXT,
-    like_count INTEGER,
-    page_count INTEGER,
-    img_url TEXT,
-    requires_cookie INTEGER,
-    updated_at TEXT
-);
-CREATE TABLE IF NOT EXISTS downloaded (
-    pid TEXT PRIMARY KEY,
-    downloaded_at TEXT
-);
-CREATE TABLE IF NOT EXISTS pending_urls (
-    url     TEXT PRIMARY KEY,
-    pid     TEXT,
-    status  TEXT NOT NULL DEFAULT 'pending',
-    added_at TEXT
-);
-CREATE TABLE IF NOT EXISTS pending_pids (
-    pid     TEXT PRIMARY KEY,
-    status  TEXT NOT NULL DEFAULT 'pending',
-    added_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_pids_requires_cookie
-    ON pids(requires_cookie);
-CREATE INDEX IF NOT EXISTS idx_pending_urls_status ON pending_urls(status);
-CREATE INDEX IF NOT EXISTS idx_pending_pids_status ON pending_pids(status);
+-- Phase 8: drop legacy tables on first open (idempotent after that).
+DROP TABLE IF EXISTS pids;
+DROP TABLE IF EXISTS downloaded;
+DROP TABLE IF EXISTS pending_urls;
+DROP TABLE IF EXISTS pending_pids;
 
--- New schema: artworks + pages (canonical, replaces all four tables above).
+-- Canonical schema: artworks + pages.
 CREATE TABLE IF NOT EXISTS artworks (
     pid              TEXT PRIMARY KEY,
     discovered_at    TEXT NOT NULL,
@@ -81,7 +50,11 @@ CREATE TABLE IF NOT EXISTS artworks (
     img_url_template TEXT,
     requires_cookie  INTEGER,
     meta_updated_at  TEXT,
-    revoked_at       TEXT
+    revoked_at       TEXT,
+    upload_date      TEXT,
+    create_date      TEXT,
+    user_id          TEXT,
+    user_name        TEXT
 );
 CREATE TABLE IF NOT EXISTS pages (
     pid               TEXT NOT NULL,
@@ -196,9 +169,39 @@ class MetadataDB:
         with self._lock:
             if not self._initialized:
                 conn.executescript(_SCHEMA)
+                self._apply_artwork_column_migrations(conn)
                 self._initialized = True
         self._local.conn = conn  # cached only after successful init
         return conn
+
+    @staticmethod
+    def _apply_artwork_column_migrations(conn: sqlite3.Connection) -> None:
+        """Idempotent ``ALTER TABLE artworks ADD COLUMN`` migrations.
+
+        Each column added after the original schema lives here. SQLite raises
+        ``OperationalError`` with message ``duplicate column name: <col>`` when
+        the column already exists, which is the only OperationalError this
+        migration is expected to encounter — every other error (DB locked,
+        wrong column type, file-perm issue) means something is genuinely
+        broken and **must** propagate so startup fails loudly rather than
+        silently running on a half-migrated DB.
+
+        New deployments hit ``CREATE TABLE IF NOT EXISTS`` in ``_SCHEMA``
+        which already includes these columns; the ALTERs then fail with
+        "duplicate column" on the first call and are no-ops thereafter.
+        """
+        columns = (
+            "upload_date TEXT",
+            "create_date TEXT",
+            "user_id     TEXT",
+            "user_name   TEXT",
+        )
+        for col_def in columns:
+            try:
+                conn.execute(f"ALTER TABLE artworks ADD COLUMN {col_def}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
     def close(self) -> None:
         conn = getattr(self._local, "conn", None)
@@ -232,14 +235,32 @@ class MetadataDB:
                 dst_path = f"{dst_path}.{idx}"
             src = sqlite3.connect(self._path, timeout=10.0, isolation_level=None)
             try:
-                src.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                # TRUNCATE (vs PASSIVE) also physically shrinks the -wal file back
+                # to zero. Safe here: dedicated short-lived connection invoked at
+                # an idle point (run start, before workers); if a writer holds the
+                # lock it silently no-ops rather than erroring.
+                src.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 dst = sqlite3.connect(dst_path, timeout=10.0, isolation_level=None)
                 try:
                     src.backup(dst)
+                    # Durably flush the snapshot before any caller prunes the
+                    # pre-snapshot event log against it (STR3 compaction).
+                    try:
+                        dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception:
+                        pass
                 finally:
                     dst.close()
             finally:
                 src.close()
+            try:
+                _fd = os.open(dst_path, os.O_RDONLY)
+                try:
+                    os.fsync(_fd)
+                finally:
+                    os.close(_fd)
+            except OSError:
+                pass
             # Prune old backups — keep the most recent max_history copies
             files = sorted(
                 [f for f in os.listdir(hist_dir) if f.startswith(base + ".")],
@@ -302,27 +323,6 @@ class MetadataDB:
         pid_key = self._coerce_pid(pid)
         if not pid_key:
             return
-        rc_int = None if requires_cookie is None else (1 if requires_cookie else 0)
-        tags_blob = None if tags is None else json.dumps(list(tags), ensure_ascii=False)
-        sql = (
-            "INSERT INTO pids (pid, tags, like_count, page_count, img_url, "
-            "requires_cookie, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(pid) DO UPDATE SET "
-            "tags = COALESCE(excluded.tags, pids.tags), "
-            "like_count = COALESCE(excluded.like_count, pids.like_count), "
-            "page_count = COALESCE(excluded.page_count, pids.page_count), "
-            "img_url = COALESCE(excluded.img_url, pids.img_url), "
-            "requires_cookie = COALESCE(excluded.requires_cookie, pids.requires_cookie), "
-            "updated_at = COALESCE(excluded.updated_at, pids.updated_at)"
-        )
-        with self._lock:
-            self._conn().execute(
-                sql,
-                (pid_key, tags_blob, like_count, page_count, img_url, rc_int, updated_at),
-            )
-        # Shadow write to new schema. ``meta_updated_at`` is stamped to
-        # ``updated_at`` if the caller passed one, else *now* — this is what
-        # tells Step 3's queue (v_pending_artworks) that meta is fresh.
         import datetime
         stamp = updated_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.upsert_artwork(
@@ -394,108 +394,82 @@ class MetadataDB:
     # ── downloaded-pid set ────────────────────────────────────────────────
 
     def mark_downloaded(self, pid: str, *, downloaded_at: str | None = None) -> None:
+        """Mark a PID as closed via a sentinel artwork row.
+
+        Redirected to :meth:`import_downloaded_set` in Phase 8 — the
+        legacy ``downloaded`` table has been dropped.
+        """
         pid_key = self._coerce_pid(pid)
         if not pid_key:
             return
-        with self._lock:
-            self._conn().execute(
-                "INSERT OR REPLACE INTO downloaded (pid, downloaded_at) VALUES (?, ?)",
-                (pid_key, downloaded_at),
-            )
+        self.import_downloaded_set([pid_key])
 
     def is_downloaded(self, pid: str) -> bool:
-        """Legacy PID-level check — kept reading from the legacy table.
+        """PID-level closed check — reads from ``v_closed_artworks``.
 
-        For the new per-page semantics use :meth:`is_pid_complete`. The
-        legacy table is still maintained by shadow writes so this returns
-        the same answer the pre-refactor code did. Phase 8 will redirect
-        this to ``v_complete_artworks`` and update the tests in lockstep.
+        Returns True for any PID that is fully downloaded, revoked, or
+        imported as a legacy sentinel (via :meth:`import_downloaded_set`).
+        For strict per-page completion use :meth:`is_pid_complete`.
+        Phase 8 may rename or remove this wrapper.
         """
         pid_key = self._coerce_pid(pid)
         if not pid_key:
             return False
         cur = self._conn().execute(
-            "SELECT 1 FROM downloaded WHERE pid = ? LIMIT 1", (pid_key,)
+            "SELECT 1 FROM v_closed_artworks WHERE pid = ? LIMIT 1", (pid_key,)
         )
         return cur.fetchone() is not None
 
     def downloaded_set(self) -> set[str]:
-        cur = self._conn().execute("SELECT pid FROM downloaded")
-        return {str(r[0]) for r in cur.fetchall()}
+        """Return the set of all closed PIDs (``v_closed_artworks``)."""
+        return self.closed_artwork_set()
 
     def downloaded_count(self) -> int:
-        cur = self._conn().execute("SELECT COUNT(*) FROM downloaded")
+        """Count all closed PIDs (``v_closed_artworks``)."""
+        cur = self._conn().execute("SELECT COUNT(*) FROM v_closed_artworks")
         return int(cur.fetchone()[0])
 
     # ── bulk migration helpers ────────────────────────────────────────────
 
-    @staticmethod
-    def _build_meta_row(pid_key, entry):
-        """Translate one (pid, entry) into a row tuple for the pids table."""
-        tags = entry.get("tag")
-        if tags is None:
-            tags = entry.get("tags", [])
-        tags_blob = json.dumps(
-            list(tags) if isinstance(tags, list) else [],
-            ensure_ascii=False,
-        )
-        rc = entry.get("requires_cookie")
-        rc_int = None if rc is None else (1 if rc else 0)
-        return (
-            pid_key,
-            tags_blob,
-            entry.get("like"),
-            entry.get("pagecount") or entry.get("page_count"),
-            entry.get("img_url"),
-            rc_int,
-            entry.get("updated_at") or entry.get("checked_at"),
-        )
-
     def import_meta_dict(self, meta: dict) -> int:
-        """Bulk-insert from the legacy all_url_meta.json shape.
+        """Bulk-insert from the legacy all_url_meta.json shape into ``artworks``.
 
-        Writes to BOTH ``pids`` (legacy table — kept until Phase 8) and
-        ``artworks`` (new canonical table) so the read switch picks the
-        data up regardless of which table the caller eventually queries.
+        ``meta_updated_at`` falls back to ``datetime('now')`` when the
+        caller's entry didn't carry a timestamp — calling import_meta_dict
+        always means "we have meta", so a NULL would wrongly hide the row
+        from get_meta() (which filters meta_updated_at IS NOT NULL).
         Returns the number of rows attempted.
         """
         if not isinstance(meta, dict) or not meta:
             return 0
-        rows = []
         artworks_rows = []
         for pid, entry in meta.items():
             pid_key = self._coerce_pid(pid)
             if not pid_key or not isinstance(entry, dict):
                 continue
-            rows.append(self._build_meta_row(pid_key, entry))
             artworks_rows.append(self._build_artwork_row(pid_key, entry))
-        if not rows:
+        if not artworks_rows:
             return 0
         self._bulk_write(
-            "INSERT OR REPLACE INTO pids "
-            "(pid, tags, like_count, page_count, img_url, requires_cookie, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        # ``meta_updated_at`` falls back to ``datetime('now')`` when the
-        # caller's entry didn't carry a timestamp — calling import_meta_dict
-        # always means "we have meta", so a NULL would wrongly hide the row
-        # from get_meta() (which filters meta_updated_at IS NOT NULL).
-        self._bulk_write(
             "INSERT INTO artworks (pid, discovered_at, page_count, like_count, "
-            "tags, img_url_template, requires_cookie, meta_updated_at) "
+            "tags, img_url_template, requires_cookie, meta_updated_at, "
+            "upload_date, create_date, user_id, user_name) "
             "VALUES (?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, "
-            "COALESCE(?, datetime('now'))) "
+            "COALESCE(?, datetime('now')), ?, ?, ?, ?) "
             "ON CONFLICT(pid) DO UPDATE SET "
             "page_count       = COALESCE(excluded.page_count, artworks.page_count), "
             "like_count       = COALESCE(excluded.like_count, artworks.like_count), "
             "tags             = COALESCE(excluded.tags, artworks.tags), "
             "img_url_template = COALESCE(excluded.img_url_template, artworks.img_url_template), "
             "requires_cookie  = COALESCE(excluded.requires_cookie, artworks.requires_cookie), "
-            "meta_updated_at  = COALESCE(excluded.meta_updated_at, artworks.meta_updated_at)",
+            "meta_updated_at  = COALESCE(excluded.meta_updated_at, artworks.meta_updated_at), "
+            "upload_date      = COALESCE(excluded.upload_date, artworks.upload_date), "
+            "create_date      = COALESCE(excluded.create_date, artworks.create_date), "
+            "user_id          = COALESCE(excluded.user_id, artworks.user_id), "
+            "user_name        = COALESCE(excluded.user_name, artworks.user_name)",
             artworks_rows,
         )
-        return len(rows)
+        return len(artworks_rows)
 
     @staticmethod
     def _build_artwork_row(pid_key, entry):
@@ -513,6 +487,10 @@ class MetadataDB:
         rc = entry.get("requires_cookie")
         rc_int = None if rc is None else (1 if rc else 0)
         updated = entry.get("updated_at") or entry.get("checked_at")
+        upload = entry.get("upload_date")
+        create = entry.get("create_date")
+        uid = entry.get("user_id")
+        uname = entry.get("user_name")
         return (
             pid_key,
             updated,                                          # discovered_at fallback
@@ -522,31 +500,27 @@ class MetadataDB:
             entry.get("img_url"),
             rc_int,
             updated,                                          # meta_updated_at
+            None if upload in (None, "") else str(upload),
+            None if create in (None, "") else str(create),
+            None if uid in (None, "") else str(uid),
+            None if uname in (None, "") else str(uname),
         )
 
     def import_downloaded_set(self, pids: Iterable) -> int:
-        """Bulk-import a PID set as 'closed' artworks.
+        """Bulk-import a PID set as 'closed' artworks (sentinel rows).
 
-        Legacy callers only had a PID-level flag; under the new schema
-        that's a sentinel-meta artwork with no pages — exactly what the
-        ``v_closed_artworks`` view picks up. Writes to both stores during
-        the migration window.
+        Each PID becomes an ``artworks`` row with
+        ``meta_updated_at = '0001-01-01 00:00:00'``, which ``v_closed_artworks``
+        treats as a legacy-closed sentinel. Safe to call multiple times —
+        ``INSERT OR IGNORE`` is idempotent.
         """
-        rows = []
         artwork_rows = []
         for v in pids or ():
             pid_key = self._coerce_pid(v)
             if pid_key:
-                rows.append((pid_key, None))
                 artwork_rows.append((pid_key, "0001-01-01 00:00:00", "0001-01-01 00:00:00"))
-        if not rows:
+        if not artwork_rows:
             return 0
-        # Emit one bulk event instead of one-per-PID.  The dispatch handler
-        # in event_log._dispatch_table() maps "artwork.imported_set" back to
-        # import_downloaded_set(), which runs with event_log=None during
-        # replay / recover_tail so there is no recursive emit.
-        # The legacy `downloaded` table is shadow-only and unused by
-        # readers, so it doesn't need its own event kind.
         pids_to_emit = [r[0] for r in artwork_rows]
         self._emit(
             "artwork.imported_set",
@@ -555,21 +529,23 @@ class MetadataDB:
             meta_updated_at="0001-01-01 00:00:00",
         )
         self._bulk_write(
-            "INSERT OR REPLACE INTO downloaded (pid, downloaded_at) VALUES (?, ?)",
-            rows,
-        )
-        self._bulk_write(
             "INSERT OR IGNORE INTO artworks (pid, discovered_at, meta_updated_at) "
             "VALUES (?, ?, ?)",
             artwork_rows,
         )
-        return len(rows)
+        return len(artwork_rows)
 
     def export_meta_dict(self) -> dict:
-        """Return the canonical dict shape, suitable for writing all_url_meta.json."""
+        """Return the canonical dict shape, suitable for writing all_url_meta.json.
+
+        Reads from ``artworks`` (only rows where meta has been fetched,
+        i.e. ``meta_updated_at IS NOT NULL`` and not the sentinel value).
+        """
         cur = self._conn().execute(
-            "SELECT pid, tags, like_count, page_count, img_url, requires_cookie, "
-            "updated_at FROM pids"
+            "SELECT pid, tags, like_count, page_count, img_url_template, "
+            "requires_cookie, meta_updated_at FROM artworks "
+            "WHERE meta_updated_at IS NOT NULL "
+            "AND meta_updated_at != '0001-01-01 00:00:00'"
         )
         out: dict = {}
         for pid, tags_blob, like, pages, img, rc, updated in cur.fetchall():
@@ -590,21 +566,16 @@ class MetadataDB:
     # ── pending_urls ──────────────────────────────────────────────────────
 
     def upsert_pending_urls(self, entries: list) -> None:
-        """Bulk INSERT OR IGNORE (url, pid) pairs; never overwrites existing status."""
+        """Bulk-insert (url, pid) pairs into ``pages`` as status='pending'.
+
+        URLs that cannot be parsed into a (pid, page_index) pair are
+        silently dropped — they were malformed even under the old schema.
+        """
         if not entries:
             return
         rows = [(str(u), str(p)) for u, p in entries if u]
         if not rows:
             return
-        self._bulk_write(
-            "INSERT OR IGNORE INTO pending_urls (url, pid, added_at)"
-            " VALUES (?, ?, datetime('now'))",
-            rows,
-        )
-        # Shadow write to new schema: pages(status='pending') keyed on
-        # (pid, page_index) parsed from the URL. URLs that don't yield a
-        # page index are dropped — those were buggy entries even under the
-        # old schema.
         from app.core.pid_filesystem import parse_pid_and_page_from_url
         page_rows: list = []
         for url, pid in rows:
@@ -621,63 +592,90 @@ class MetadataDB:
             )
 
     def get_pending_urls(self) -> list:
-        """Legacy: ``[(url, pid)]`` from the ``pending_urls`` table.
+        """``[(url, pid)]`` from the canonical ``v_pending_pages`` view.
 
-        Kept reading the legacy table because tests pin the exact
-        deletion semantics (rows disappear on ``mark_url_done``). New code
-        should call :meth:`get_pending_pages` which uses the per-page
-        ``pages.status='pending'`` selection.
+        The ``url`` column may be ``None`` for rows seeded by PID-only
+        workflows; callers that need a non-None URL should use
+        :meth:`get_pending_urls_filtered` instead.
         """
         cur = self._conn().execute(
-            "SELECT url, pid FROM pending_urls WHERE status = 'pending'"
+            "SELECT url, pid FROM v_pending_pages"
         )
         return cur.fetchall()
 
     def mark_url_done(self, url: str) -> None:
-        """Delete a URL row — pending_urls only stores truly pending entries."""
-        with self._lock:
-            self._conn().execute(
-                "DELETE FROM pending_urls WHERE url=?", (str(url),)
-            )
-        # Shadow write: mark the corresponding page as downloaded.
+        """Mark the page for this URL as downloaded in ``pages``."""
         from app.core.pid_filesystem import parse_pid_and_page_from_url
         pid, pidx = parse_pid_and_page_from_url(str(url))
         if pid is not None and pidx is not None:
             self.mark_page_downloaded(pid, pidx, url=str(url))
 
-    def mark_urls_done(self, urls) -> None:
-        """Bulk-delete downloaded URL rows to prevent table bloat."""
-        rows = [(str(u),) for u in urls if u]
-        if not rows:
+    def mark_pages_downloaded_bulk(self, rows) -> None:
+        """Bulk-mark pages as downloaded in ONE statement.
+
+        Each row is ``(pid, page_index, url)`` (url may be ``None``, or the row
+        may be a 2-tuple). Inserts the page as ``downloaded`` if absent,
+        otherwise flips an existing pending/failed row to ``downloaded`` while
+        preserving the original ``downloaded_at`` of already-downloaded rows.
+
+        Emitted as a single ``pages.downloaded_bulk`` event whose replay handler
+        calls back here, so crash recovery correctly turns completed pages
+        ``downloaded``. (A plain ``pages.upsert_bulk`` event replays through
+        INSERT OR IGNORE and would leave a pre-seeded 'pending' row stuck
+        pending, silently re-queuing already-downloaded pages.)
+        """
+        clean: list = []
+        for row in rows or ():
+            try:
+                pid_raw, pidx_raw, url = row
+            except (TypeError, ValueError):
+                try:
+                    pid_raw, pidx_raw = row
+                    url = None
+                except (TypeError, ValueError):
+                    continue
+            pid_key = self._coerce_pid(pid_raw)
+            if not pid_key:
+                continue
+            try:
+                pidx = int(pidx_raw)
+            except (TypeError, ValueError):
+                continue
+            clean.append((pid_key, pidx, url))
+        if not clean:
             return
-        self._bulk_write("DELETE FROM pending_urls WHERE url=?", rows)
-        # Shadow write: pages(status='downloaded') for each URL we can parse.
+        self._emit("pages.downloaded_bulk", rows=[list(r) for r in clean])
+        self._bulk_write(
+            "INSERT INTO pages "
+            "(pid, page_index, status, url, downloaded_at, last_attempted_at, attempt_count) "
+            "VALUES (?, ?, 'downloaded', ?, datetime('now'), datetime('now'), 0) "
+            "ON CONFLICT(pid, page_index) DO UPDATE SET "
+            "status='downloaded', "
+            "url=COALESCE(excluded.url, pages.url), "
+            "downloaded_at=datetime('now'), "
+            "last_attempted_at=datetime('now') "
+            "WHERE pages.status != 'downloaded'",
+            clean,
+        )
+
+    def mark_urls_done(self, urls) -> None:
+        """Bulk-mark pages as downloaded for the given URL list (one statement,
+        one ``pages.downloaded_bulk`` event)."""
         from app.core.pid_filesystem import parse_pid_and_page_from_url
-        page_rows: list = []
-        for (url,) in rows:
-            pid, pidx = parse_pid_and_page_from_url(url)
+        rows: list = []
+        for url in urls:
+            if not url:
+                continue
+            pid, pidx = parse_pid_and_page_from_url(str(url))
             if pid is not None and pidx is not None:
-                page_rows.append((pid, pidx, PAGE_STATUS_DOWNLOADED, url, None))
-        if page_rows:
-            # ``upsert_pages_bulk`` is INSERT OR IGNORE, so existing rows
-            # keep their state. Run a follow-up UPDATE to flip rows that
-            # were 'pending' over to 'downloaded'.  ``datetime('now')`` is
-            # evaluated per-row by SQLite, which is fine for shadow write.
-            self.upsert_pages_bulk(page_rows)
-            self._bulk_write(
-                "UPDATE pages SET status='downloaded', "
-                "downloaded_at=datetime('now'), last_attempted_at=datetime('now') "
-                "WHERE pid=? AND page_index=? AND status!='downloaded'",
-                [(r[0], r[1]) for r in page_rows],
-            )
+                rows.append((pid, pidx, str(url)))
+        if rows:
+            self.mark_pages_downloaded_bulk(rows)
 
     def pending_url_count(self) -> int:
-        """Legacy: number of rows in ``pending_urls`` with status='pending'.
-
-        The new equivalent is ``page_status_counts()['pending']``.
-        """
+        """Number of ``pages`` rows with ``status='pending'``."""
         cur = self._conn().execute(
-            "SELECT COUNT(*) FROM pending_urls WHERE status='pending'"
+            "SELECT COUNT(*) FROM pages WHERE status='pending'"
         )
         return int(cur.fetchone()[0])
 
@@ -718,84 +716,77 @@ class MetadataDB:
         return cur.fetchall()
 
     def url_row_count(self) -> int:
-        """Legacy: total rows in ``pending_urls`` regardless of status.
+        """Total page rows in ``pages`` regardless of status.
 
-        The new ``pages`` table preserves rows across the full lifecycle
-        (pending → downloaded), so this count is not directly comparable
-        to it. New code should use ``page_status_counts()`` for per-status
-        totals.
+        Replaces the old ``pending_urls`` row count. Use
+        ``page_status_counts()`` for per-status breakdowns.
         """
-        cur = self._conn().execute("SELECT COUNT(*) FROM pending_urls")
+        cur = self._conn().execute("SELECT COUNT(*) FROM pages")
         return int(cur.fetchone()[0])
-
-    def import_pending_urls_from_file(self, path: str) -> int:
-        """First-run migration: read all_url.txt and INSERT OR IGNORE into pending_urls."""
-        try:
-            with open(path, encoding="utf-8", errors="ignore") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-        except OSError:
-            return 0
-        entries = []
-        for url in lines:
-            try:
-                filename = url.rsplit("/", 1)[-1]
-                pid = filename.split("_", 1)[0]
-                if not pid.isdigit():
-                    pid = ""
-            except Exception:
-                pid = ""
-            entries.append((url, pid))
-        self.upsert_pending_urls(entries)
-        return len(entries)
 
     # ── pending_pids ──────────────────────────────────────────────────────
 
-    def upsert_pending_pids(self, pids) -> None:
-        """Bulk INSERT OR IGNORE; never overwrites existing status."""
-        rows = [(self._coerce_pid(p),) for p in pids if self._coerce_pid(p)]
-        if not rows:
+    def upsert_pending_pids(self, pids, *, user_id: str | None = None) -> None:
+        """Discover PIDs that Step 3 still needs to fetch meta for.
+
+        Each PID becomes an ``artworks`` row with ``meta_updated_at=NULL``
+        so :attr:`v_pending_artworks` picks it up. ``INSERT OR IGNORE``
+        ensures an already-processed PID (``meta_updated_at`` set) is not
+        reverted to pending.
+
+        ``pids`` accepts either a flat iterable of PID strings or an iterable
+        of ``(pid, user_id)`` tuples.
+        """
+        coerced_rows = []  # list of (pid_key, uid_for_this_pid)
+        for entry in pids or ():
+            if isinstance(entry, tuple):
+                raw_pid = entry[0]
+                row_uid = entry[1] if len(entry) > 1 else None
+            else:
+                raw_pid = entry
+                row_uid = None
+            pid_key = self._coerce_pid(raw_pid)
+            if not pid_key:
+                continue
+            uid = row_uid if row_uid is not None else user_id
+            coerced_rows.append((pid_key, None if uid is None else str(uid)))
+        if not coerced_rows:
             return
-        self._bulk_write(
-            "INSERT OR IGNORE INTO pending_pids (pid, added_at)"
-            " VALUES (?, datetime('now'))",
-            rows,
-        )
-        # Shadow write to new schema: each PID becomes an artwork row with
-        # ``meta_updated_at=NULL`` so Step 3 picks it up. Existing rows
-        # (already in artworks) are preserved by INSERT OR IGNORE.
-        self.upsert_artworks([r[0] for r in rows])
+        from collections import defaultdict
+        by_uid = defaultdict(list)
+        for pid_key, uid in coerced_rows:
+            by_uid[uid].append(pid_key)
+        for uid, pid_list in by_uid.items():
+            self.upsert_artworks(pid_list, user_id=uid)
 
     def get_pending_pids(self) -> list:
-        """Return list of pid strings with status='pending'."""
-        cur = self._conn().execute(
-            "SELECT pid FROM pending_pids WHERE status='pending'"
-        )
+        """Return PIDs that Step 3 still needs to fetch meta for (``v_pending_artworks``)."""
+        cur = self._conn().execute("SELECT pid FROM v_pending_artworks")
         return [r[0] for r in cur.fetchall()]
 
     def mark_pid_done(self, pid: str) -> None:
+        """Mark a PID as meta-fetched by setting ``meta_updated_at`` on ``artworks``.
+
+        In normal Step 3 flow this is already done by :meth:`upsert_meta` /
+        :meth:`upsert_artwork`. This method is a fallback for cases where the
+        PID is considered processed but no real meta is available.
+        """
+        import datetime
         pid_key = self._coerce_pid(pid)
         if not pid_key:
             return
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._lock:
             self._conn().execute(
-                "UPDATE pending_pids SET status='done' WHERE pid=?", (pid_key,)
+                "UPDATE artworks SET meta_updated_at = ? "
+                "WHERE pid = ? AND meta_updated_at IS NULL",
+                (stamp, pid_key),
             )
 
     def pending_pid_count(self) -> int:
-        cur = self._conn().execute(
-            "SELECT COUNT(*) FROM pending_pids WHERE status='pending'"
-        )
+        """Count PIDs in ``v_pending_artworks`` (meta not yet fetched)."""
+        cur = self._conn().execute("SELECT COUNT(*) FROM v_pending_artworks")
         return int(cur.fetchone()[0])
-
-    def import_pending_pids_from_file(self, path: str) -> int:
-        """First-run migration: read pictures_id.txt and INSERT OR IGNORE."""
-        try:
-            with open(path, encoding="utf-8", errors="ignore") as f:
-                pids = [ln.strip() for ln in f if ln.strip()]
-        except OSError:
-            return 0
-        self.upsert_pending_pids(pids)
-        return len(pids)
 
     # ── artworks (new canonical schema) ───────────────────────────────────
 
@@ -811,12 +802,23 @@ class MetadataDB:
         requires_cookie: bool | None = None,
         meta_updated_at: str | None = None,
         revoked_at: str | None = None,
+        upload_date: str | None = None,
+        create_date: str | None = None,
+        user_id: str | None = None,
+        user_name: str | None = None,
     ) -> None:
         """Insert or merge an artwork row. ``COALESCE`` keeps existing
         columns whenever the caller passes ``None``, so this method is safe
         to call with partial information (e.g. when first discovering a PID
         before meta is fetched). ``discovered_at`` defaults to *now* on
         first insert; subsequent calls keep the original value.
+
+        ``upload_date`` and ``create_date`` are Pixiv's ISO-8601 timestamps
+        (with timezone) for the artwork upload / creation. ``user_id`` /
+        ``user_name`` identify the artist; Step 2 knows ``user_id`` from the
+        profile-scan iteration, Step 3 supplements ``user_name`` from
+        ``/ajax/illust/{id}``. ``meta_updated_at`` doubles as the fetched-at
+        timestamp.
         """
         pid_key = self._coerce_pid(pid)
         if not pid_key:
@@ -828,11 +830,14 @@ class MetadataDB:
                    tags=list(tags) if tags is not None else None,
                    img_url_template=img_url_template,
                    requires_cookie=requires_cookie,
-                   meta_updated_at=meta_updated_at, revoked_at=revoked_at)
+                   meta_updated_at=meta_updated_at, revoked_at=revoked_at,
+                   upload_date=upload_date, create_date=create_date,
+                   user_id=user_id, user_name=user_name)
         sql = (
             "INSERT INTO artworks (pid, discovered_at, page_count, like_count, "
-            "tags, img_url_template, requires_cookie, meta_updated_at, revoked_at) "
-            "VALUES (?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?, ?) "
+            "tags, img_url_template, requires_cookie, meta_updated_at, revoked_at, "
+            "upload_date, create_date, user_id, user_name) "
+            "VALUES (?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(pid) DO UPDATE SET "
             "page_count       = COALESCE(excluded.page_count, artworks.page_count), "
             "like_count       = COALESCE(excluded.like_count, artworks.like_count), "
@@ -840,41 +845,79 @@ class MetadataDB:
             "img_url_template = COALESCE(excluded.img_url_template, artworks.img_url_template), "
             "requires_cookie  = COALESCE(excluded.requires_cookie, artworks.requires_cookie), "
             "meta_updated_at  = COALESCE(excluded.meta_updated_at, artworks.meta_updated_at), "
-            "revoked_at       = COALESCE(excluded.revoked_at, artworks.revoked_at)"
+            "revoked_at       = COALESCE(excluded.revoked_at, artworks.revoked_at), "
+            "upload_date      = COALESCE(excluded.upload_date, artworks.upload_date), "
+            "create_date      = COALESCE(excluded.create_date, artworks.create_date), "
+            "user_id          = COALESCE(excluded.user_id, artworks.user_id), "
+            "user_name        = COALESCE(excluded.user_name, artworks.user_name)"
         )
         with self._lock:
             self._conn().execute(sql, (
                 pid_key, discovered_at, page_count, like_count, tags_blob,
                 img_url_template, rc_int, meta_updated_at, revoked_at,
+                upload_date, create_date, user_id, user_name,
             ))
 
-    def upsert_artworks(self, pids: Iterable, *, discovered_at: str | None = None) -> int:
+    def upsert_artworks(
+        self,
+        pids: Iterable,
+        *,
+        discovered_at: str | None = None,
+        user_id: str | None = None,
+    ) -> int:
         """Bulk-discover PIDs (no meta yet). Existing rows are untouched.
 
         Used by migration + Step 2 ingestion. ``discovered_at`` defaults to
         the current wall-clock time when not supplied. Returns the row count
         attempted (``INSERT OR IGNORE`` may skip duplicates).
+
+        ``user_id`` is recorded alongside ``discovered_at`` when supplied —
+        Step 2 already knows which artist a PID came from, so writing it at
+        discovery time fills in the author field for PIDs that never reach
+        Step 3 (e.g. interrupted runs).
         """
         import datetime
         ts = discovered_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        rows = [(self._coerce_pid(p), ts) for p in (pids or ()) if self._coerce_pid(p)]
+        uid = None if user_id is None else str(user_id)
+        rows = [(self._coerce_pid(p), ts, uid) for p in (pids or ()) if self._coerce_pid(p)]
         if not rows:
             return 0
-        self._emit("artwork.discovered", pids=[r[0] for r in rows], discovered_at=ts)
+        self._emit("artwork.discovered",
+                   pids=[r[0] for r in rows],
+                   discovered_at=ts,
+                   user_id=uid)
         self._bulk_write(
-            "INSERT OR IGNORE INTO artworks (pid, discovered_at) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO artworks (pid, discovered_at, user_id) "
+            "VALUES (?, ?, ?)",
             rows,
         )
+        # Backfill user_id for PIDs that existed before this discovery pass
+        # but had no author recorded. INSERT OR IGNORE leaves those rows
+        # untouched, so we patch them explicitly. Only NULL→value updates run
+        # (never overwrite an existing user_id, even if the caller-passed
+        # uid disagrees — keep first writer wins).
+        if uid is not None:
+            self._bulk_write(
+                "UPDATE artworks SET user_id = ? "
+                "WHERE pid = ? AND user_id IS NULL",
+                [(uid, r[0]) for r in rows],
+            )
         return len(rows)
 
     def get_artwork(self, pid: str) -> dict | None:
-        """Read one artwork row as a dict, decoding the JSON tag blob."""
+        """Read one artwork row as a dict, decoding the JSON tag blob.
+
+        ``meta_updated_at`` is also exposed under the ``fetched_at`` alias so
+        callers can use the more user-facing wording without coupling to the
+        column name.
+        """
         pid_key = self._coerce_pid(pid)
         if not pid_key:
             return None
         cur = self._conn().execute(
             "SELECT pid, discovered_at, page_count, like_count, tags, "
-            "img_url_template, requires_cookie, meta_updated_at, revoked_at "
+            "img_url_template, requires_cookie, meta_updated_at, revoked_at, "
+            "upload_date, create_date, user_id, user_name "
             "FROM artworks WHERE pid=?",
             (pid_key,),
         )
@@ -894,7 +937,12 @@ class MetadataDB:
             "img_url_template": row[5],
             "requires_cookie": None if row[6] is None else bool(row[6]),
             "meta_updated_at": row[7],
+            "fetched_at": row[7],
             "revoked_at": row[8],
+            "upload_date": row[9],
+            "create_date": row[10],
+            "user_id": row[11],
+            "user_name": row[12],
         }
 
     def mark_artwork_revoked(self, pid: str, *, revoked_at: str | None = None) -> None:

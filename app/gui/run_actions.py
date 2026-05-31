@@ -15,10 +15,10 @@ from app.core.worker_event import WorkerEvent
 from app.core.account_scheduler import AccountState, AccountScheduler
 from app.core.proxy_utils import parse_proxy_url
 from app.core.pixiv_thread_utils import (
-    safe_read_json, load_exist_pid_set, normalize_cookie_entries, backup_file,
+    safe_read_json, normalize_cookie_entries, backup_file,
     sync_exist_pid_with_download_folder,
 )
-from app.core.metadata_db import DB_FILENAME
+from app.core.metadata_db import DB_FILENAME, MetadataDB
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
 
 DEFAULT_AGENT = (
@@ -133,6 +133,21 @@ class RunController:
                 return
 
             _write_event_log_cfg({**cfg, "last_snapshot_date": today})
+
+            # STR3: the snapshot is a verified, fsync'd full DB image, so event
+            # files fully older than it are redundant. Prune them (keeping a
+            # 2-day margin for tools/replay_events.py), bounding the log to a
+            # small tail by construction. compact_before_date never crosses the
+            # latest anchor or the current file.
+            try:
+                if self._event_log is not None:
+                    import datetime as _dt
+                    cutoff = (
+                        _dt.datetime.now() - _dt.timedelta(days=2)
+                    ).strftime("%Y%m%d")
+                    self._event_log.compact_before_date(cutoff)
+            except Exception:
+                pass
         except Exception:
             # Best-effort; never break Run All if snapshot fails.
             pass
@@ -480,7 +495,7 @@ class RunController:
             agent,
             path,
             self._attach_aliases(valid_cookies, auth),
-            load_exist_pid_set(path),  # PHASE-A: Phase B → MetadataDB(path).closed_artwork_set()
+            MetadataDB(path).closed_artwork_set(),
             bool(perf.get("single_thread_mode", False)),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
@@ -556,7 +571,7 @@ class RunController:
             Author_list=authors,
             Agent=agent,
             cookies=self._attach_aliases(valid_cookies, auth),
-            exist_pid=load_exist_pid_set(path),  # PHASE-A: Phase B → MetadataDB(path).closed_artwork_set()
+            exist_pid=MetadataDB(path).closed_artwork_set(),
             ban_tag=list(dl.get("ban_tag", [])),
             must_tag=list(dl.get("must_tag", [])),
             like_num=int(dl.get("like_num", 0)),
@@ -619,6 +634,8 @@ class RunController:
             special_like_rules=[],
             ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
             filename_template=str(dl.get("filename_template", "") or ""),
+            tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
+            tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
         )
