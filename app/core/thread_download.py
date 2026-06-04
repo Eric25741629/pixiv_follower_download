@@ -199,6 +199,7 @@ class download_thread(PauseableThread):
         # Backward compatibility: accept older positional/keyword constructor calls.
         overrides = self._apply_legacy_constructor_args(legacy_args, legacy_kwargs)
         self.ai_gen_dir = overrides.get("ai_gen_dir", self.ai_gen_dir)
+        self.author_order = bool(overrides.get("author_order", False))
         self._init_jxl_config(
             overrides.get("jxl_enable", jxl_enable),
             overrides.get("jxl_cjxl_path", jxl_cjxl_path),
@@ -964,6 +965,7 @@ class download_thread(PauseableThread):
         ("filename_template", lambda v: str(v or "").strip() or None),
         ("tag_strip_brackets", bool),
         ("tag_strip_special_chars", bool),
+        ("author_order", bool),
     ]
 
     @staticmethod

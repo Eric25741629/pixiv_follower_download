@@ -69,6 +69,21 @@ class SettingsView:
             hint_text="例：{timetag}_PID{pid}{page}{hashtag}.{ext}",
             expand=True,
         )
+        self._sw_tag_strip_brackets = ft.Switch(
+            label="Tag 過濾括號內容",
+            value=bool(dl.get("tag_strip_brackets", False)),
+            tooltip="開啟後，tag 中成對括號（含 () （） [] 【】 《》 〈〉 「」 『』 〔〕 〘〙）與內容會從檔名移除",
+        )
+        self._sw_tag_strip_special_chars = ft.Switch(
+            label="Tag 過濾裝飾符號與 emoji",
+            value=bool(dl.get("tag_strip_special_chars", False)),
+            tooltip="開啟後，箭頭、★☆♀♂♪♫、◯●◎、各式 emoji 等裝飾性符號會從 tag 中移除",
+        )
+        self._sw_author_order = ft.Switch(
+            label="依作者順序下載（同作者連續）",
+            value=bool(dl.get("author_order", False)),
+            tooltip="開啟後，步驟 4 會把同一作者的作品連續下載完（PID 由大到小）再換下一位；作者不明的作品排到最後",
+        )
 
         self._ban_tags: list[str] = list(dl.get("ban_tag", []))
         self._must_tags: list[str] = list(dl.get("must_tag", []))
@@ -374,6 +389,9 @@ class SettingsView:
             "ban_tag": self._ban_tags,
             "must_tag": self._must_tags,
             "filename_template": (self._tf_filename_template.value or "").strip(),
+            "tag_strip_brackets": bool(self._sw_tag_strip_brackets.value),
+            "tag_strip_special_chars": bool(self._sw_tag_strip_special_chars.value),
+            "author_order": bool(self._sw_author_order.value),
         })
         store.update_multiple({
             "filter": {
@@ -487,6 +505,13 @@ class SettingsView:
                         size=11, color=ft.Colors.GREY_700,
                     ),
                     self._tf_filename_template,
+                    ft.Text("Tag 整理（套用於 {hashtag} 佔位符）", size=12),
+                    ft.Row(
+                        [self._sw_tag_strip_brackets, self._sw_tag_strip_special_chars],
+                        wrap=True,
+                    ),
+                    ft.Text("下載順序", size=12),
+                    self._sw_author_order,
                 ]),
                 _tile("資料夾分類", [
                     ft.Text(

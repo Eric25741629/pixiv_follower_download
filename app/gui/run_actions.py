@@ -636,6 +636,7 @@ class RunController:
             filename_template=str(dl.get("filename_template", "") or ""),
             tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
             tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
+            author_order=bool(dl.get("author_order", False)),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
         )

@@ -28,6 +28,9 @@ DEFAULTS = {
         # Default false to preserve historical behavior.
         "tag_strip_brackets": False,
         "tag_strip_special_chars": False,
+        # When true, Step 4 downloads one author's works fully (PID desc)
+        # before moving to the next author; unknown-author works go last.
+        "author_order": False,
         # When Step 3 finds a cached artwork that was uploaded within this many
         # days, re-fetch its meta over the network instead of trusting the
         # cached like_count. 0 disables the feature.
