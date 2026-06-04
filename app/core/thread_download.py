@@ -2091,33 +2091,43 @@ class download_thread(PauseableThread):
                 self._sleep_between_downloads(pid)
         return failed_nested
 
-    def _execute_downloads_pool(self, pid_order, pid_groups):
-        """Multi-thread per-PID-group download via ThreadPoolExecutor (4 workers)."""
+    def _execute_downloads_pool(self, author_batches, pid_groups):
+        """Multi-thread per-PID-group download via ThreadPoolExecutor.
+
+        Processes ``author_batches`` one batch (= one author) at a time:
+        submit all of a batch's PIDs, drain them (as_completed), then move to
+        the next batch. With a single batch this is identical to the previous
+        submit-all behavior. Author-order strictness is the per-batch barrier.
+        """
         self._q.put(WorkerEvent("output",
             "<p><font color='gray'>下載模式：多執行緒（以 PID 為單位分派；每個 PID 仍共用單一 Session）</font></p>"))
         failed_nested = []
+        total = getattr(self, "_step4_pid_total",
+                        sum(len(b) for b in author_batches))
+        done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as self.executor:
-            futures = [
-                self.executor.submit(self._download_pid_group, pid, pid_groups.get(pid, []))
-                for pid in pid_order
-            ]
-            total = getattr(self, "_step4_pid_total", len(pid_order))
-            done = 0
-            for fu in concurrent.futures.as_completed(futures):
-                try:
-                    failed_nested.append(fu.result())
-                except Exception:
-                    failed_nested.append([])
-                done += 1
-                self._step4_pid_done = done
-                self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
-                self._maybe_flush_url_meta_periodically(done)
+            for batch in author_batches:
+                if self._stop_event.is_set():
+                    break
+                futures = [
+                    self.executor.submit(self._download_pid_group, pid, pid_groups.get(pid, []))
+                    for pid in batch
+                ]
+                for fu in concurrent.futures.as_completed(futures):
+                    try:
+                        failed_nested.append(fu.result())
+                    except Exception:
+                        failed_nested.append([])
+                    done += 1
+                    self._step4_pid_done = done
+                    self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
+                    self._maybe_flush_url_meta_periodically(done)
         return failed_nested
 
-    def _execute_downloads(self, pid_order, pid_groups):
+    def _execute_downloads(self, pid_order, pid_groups, author_batches):
         if self.single_mode_flag:
             return self._execute_downloads_single(pid_order, pid_groups)
-        return self._execute_downloads_pool(pid_order, pid_groups)
+        return self._execute_downloads_pool(author_batches, pid_groups)
 
     @staticmethod
     def _classify_one_fail_item(item):
@@ -2427,13 +2437,16 @@ class download_thread(PauseableThread):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4] 開始 PID 分組...</font></p>"))
             pid_order, pid_groups = self._group_urls_by_pid(self.allurl)
+            if getattr(self, "author_order", False):
+                self._emit_phase("步驟 4：依作者排序中...")
+            pid_order, author_batches = self._resolve_execution_order(pid_order)
             self._diag("step4_grouped", pid_count=len(pid_order), url_count=len(self.allurl))
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4] PID 分組完成：{len(pid_order)} 個 PID、{len(self.allurl)} 個 URL</font></p>"))
             self._emit_phase(f"步驟 4：下載中（0 / {len(pid_order)} PID 完成）")
             self._step4_pid_total = len(pid_order)
             self._step4_pid_done = 0
-            failed_nested = self._execute_downloads(pid_order, pid_groups)
+            failed_nested = self._execute_downloads(pid_order, pid_groups, author_batches)
             self._emit_phase("步驟 4：整理失敗項目...")
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4] 下載迴圈結束，整理失敗項目中...</font></p>"))
