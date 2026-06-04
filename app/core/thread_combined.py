@@ -106,3 +106,30 @@ class combined_thread(PauseableThread):
         """Propagate the scheduler set by run_actions after construction."""
         self.fetcher._scheduler = self._scheduler
         self.downloader._scheduler = self._scheduler
+
+    def _build_work_lists(self):
+        """Return ``(query_pids, download_only_pids)``.
+
+        query_pids: from pictures_id.txt, minus exist/revoked/dupes — need
+            query then download. (Reuses the fetcher's pure filter helpers,
+            NOT _load_and_filter_pid_list, to avoid its next/progress emits.)
+        download_only_pids: PIDs with pending pages in the DB that are not in
+            query_pids — a partial Step 3 already resolved their meta but never
+            downloaded them. Download-only, no re-query.
+        """
+        raw = self.fetcher.check_exist()
+        if not isinstance(raw, list):
+            raw = []
+        query_pids, *_ = self.fetcher._prepare_pending_pid_tasks(raw)
+        query_set = set(query_pids)
+        db = self.fetcher._metadata_db
+        try:
+            pending = db.pids_with_pending_pages() if db is not None else []
+        except Exception:
+            pending = []
+        download_only = [
+            normalize_pid(p) or str(p)
+            for p in pending
+            if (normalize_pid(p) or str(p)) not in query_set
+        ]
+        return query_pids, download_only
