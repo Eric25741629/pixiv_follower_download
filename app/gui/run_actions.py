@@ -586,6 +586,51 @@ class RunController:
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
 
+    def _build_combined(self, auth, agent, dl, flt, perf, directory, jxl, path):
+        authors = _load_author_list()
+        valid_cookies = self._validate_cookies_for_step(auth, agent, 3)
+        if not valid_cookies:
+            return None
+        dl_path = str(dl.get("path", "")).strip()
+        if not dl_path:
+            self._log("<p><font color='red'>請先在「設定」指定下載路徑</font></p>")
+            return None
+        self._sync_exist_pid_from_download_folder(dl_path, path, step_num=3)
+        from app.core import thread_combined
+        t = thread_combined.combined_thread(
+            q=self._event_q, Author_list=authors, Agent=agent,
+            cookies=self._attach_aliases(valid_cookies, auth),
+            exist_pid=MetadataDB(path).closed_artwork_set(),
+            ban_tag=list(dl.get("ban_tag", [])),
+            must_tag=list(dl.get("must_tag", [])),
+            like_num=int(dl.get("like_num", 0)), no_to_check=[], base_path=path,
+            single_thread_mode=bool(perf.get("single_thread_mode", False)),
+            download_path=dl_path,
+            download_time=self._parse_download_time(dl.get("download_time")),
+            nogif=bool(flt.get("nogif", False)), notag=bool(flt.get("notag", False)),
+            notime=bool(flt.get("notime", False)),
+            create_dir=bool(directory.get("create_dir", False)),
+            no_R18G_dir=bool(directory.get("no_R18G_dir", False)),
+            no_R18_dir=bool(directory.get("no_R18_dir", False)),
+            intra_pid_wait_min=int(perf.get("intra_pid_wait_min", 5)),
+            intra_pid_wait_max=int(perf.get("intra_pid_wait_max", 15)),
+            pid_wait_nocookie_min=int(perf.get("pid_wait_nocookie_min", 1)),
+            pid_wait_nocookie_max=int(perf.get("pid_wait_nocookie_max", 6)),
+            jxl_enable=bool(jxl.get("enable", False)),
+            jxl_cjxl_path=str(jxl.get("cjxl_path", "")),
+            jxl_delete_original=bool(jxl.get("delete_original", False)),
+            jxl_effort=int(jxl.get("effort", 7)),
+            ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
+            filename_template=str(dl.get("filename_template", "") or ""),
+            tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
+            tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
+            author_order=bool(dl.get("author_order", False)),
+            rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
+            stats_collector=self._stats_collector, event_log=self._event_log,
+        )
+        t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
+        return t
+
     @staticmethod
     def _parse_download_time(dt_str):
         """Parse download_time setting; falls back to epoch on any error."""
@@ -657,6 +702,8 @@ class RunController:
         if n == 2:
             return self._build_step2(auth, agent, perf, path)
         if n == 3:
+            if bool(dl.get("combined_mode", False)):
+                return self._build_combined(auth, agent, dl, flt, perf, directory, jxl, path)
             return self._build_step3(auth, agent, dl, perf, path)
         if n == 4:
             return self._build_step4(auth, agent, dl, flt, perf, directory, jxl)
