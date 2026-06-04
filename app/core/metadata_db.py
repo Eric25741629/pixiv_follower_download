@@ -28,7 +28,8 @@ import json
 import os
 import sqlite3
 import threading
-from typing import Iterable
+from collections.abc import Iterable
+import contextlib
 
 DB_FILENAME = "metadata.sqlite3"
 
@@ -245,10 +246,8 @@ class MetadataDB:
                     src.backup(dst)
                     # Durably flush the snapshot before any caller prunes the
                     # pre-snapshot event log against it (STR3 compaction).
-                    try:
+                    with contextlib.suppress(Exception):
                         dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    except Exception:
-                        pass
                 finally:
                     dst.close()
             finally:
@@ -268,10 +267,8 @@ class MetadataDB:
                 reverse=True,
             )
             for old in files[max_history:]:
-                try:
+                with contextlib.suppress(Exception):
                     os.remove(os.path.join(hist_dir, old))
-                except Exception:
-                    pass
             try:
                 size = os.path.getsize(dst_path)
             except OSError:
@@ -1323,7 +1320,5 @@ def mirror_exist_pid_set(db, exist_pid):
     exceptions (best-effort sync)."""
     if db is None or not exist_pid:
         return
-    try:
+    with contextlib.suppress(Exception):
         db.import_downloaded_set(exist_pid)
-    except Exception:
-        pass

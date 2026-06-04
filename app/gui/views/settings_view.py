@@ -4,6 +4,7 @@ import os
 import threading
 import flet as ft
 from app.core.settings_store import SettingsStore
+import contextlib
 
 
 def _store() -> SettingsStore:
@@ -259,10 +260,8 @@ class SettingsView:
         avg = self._safe_int_cooldown()
         self._label_cooldown_hint.value = self._cooldown_hint(avg)
         self._label_cooldown_hint.color = ft.Colors.RED_600 if avg < 30 else ft.Colors.GREY_600
-        try:
+        with contextlib.suppress(Exception):
             self._label_cooldown_hint.update()
-        except Exception:
-            pass
 
     def _on_cooldown_slider_change(self, e: ft.ControlEvent) -> None:
         try:
@@ -324,10 +323,8 @@ class SettingsView:
         from app.core.proxy_utils import parse_proxy_list, test_proxy
         lines = parse_proxy_list(self._tf_proxy_pool.value or "")
         self._proxy_test_results.controls = [ft.Text("測試中...", size=11)]
-        try:
+        with contextlib.suppress(Exception):
             self._page.update()
-        except Exception:
-            pass
 
         def _run():
             results = []
@@ -340,10 +337,8 @@ class SettingsView:
                     color = ft.Colors.GREEN_600 if ok else ft.Colors.RED_600
                     results.append(ft.Text(f"{icon} {url} — {msg}", size=11, color=color))
             self._proxy_test_results.controls = results
-            try:
+            with contextlib.suppress(Exception):
                 self._page.update()
-            except Exception:
-                pass
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -429,21 +424,15 @@ class SettingsView:
         avg_val = self._safe_int_cooldown()
         if avg_val < 30:
             def _confirm(ev):
-                try:
+                with contextlib.suppress(Exception):
                     self._page.pop_dialog()
-                except Exception:
-                    pass
                 self.save()
-                try:
+                with contextlib.suppress(Exception):
                     self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
-                except Exception:
-                    pass
 
             def _cancel(ev):
-                try:
+                with contextlib.suppress(Exception):
                     self._page.pop_dialog()
-                except Exception:
-                    pass
 
             try:
                 self._page.show_dialog(ft.AlertDialog(
@@ -461,10 +450,8 @@ class SettingsView:
                 self.save()
             return
         self.save()
-        try:
+        with contextlib.suppress(Exception):
             self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
-        except Exception:
-            pass
 
     # ------------------------------------------------------------------
     # Layout

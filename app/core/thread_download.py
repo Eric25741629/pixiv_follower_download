@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 from queue import Queue, Empty
 from PIL import Image
-from pixiv_api import *
+from pixiv_api import *  # noqa: F403  (intentional: re-exports Pixiv_info/gif_download/etc.)
 from app.core.worker_event import WorkerEvent
 import pixiv_api
 from app.core.pixiv_thread_utils import (
@@ -26,24 +26,20 @@ from app.core.pixiv_thread_utils import (
     count_text_lines,
     fetch_with_cookie_retry,
     init_cookie_fields,
-    load_exist_pid_set,
     mirror_meta_dict_to_db,
     normalize_filter_tags,
     normalize_pid,
     output_err,
-    safe_read_json,
     to_int_lenient,
-    trash_file,
     write_all_url_file,
 )
-from app.core.metadata_db import MetadataDB, emit_db_stats, mirror_exist_pid_set, open_metadata_db
+from app.core.metadata_db import emit_db_stats, mirror_exist_pid_set, open_metadata_db
 from app.core.pixiv_thread_base import (
     PauseableThread,
     _normalize_special_like_rules,
     _resolve_like_threshold,
     _is_ai_artwork_tagged,
     _cookie_usage_label,
-    _format_cookie_usage_summary,
 )
 
 def _safe_meta_count(db) -> int:
@@ -392,14 +388,12 @@ class download_thread(PauseableThread):
             return
         if int(self.like_num or 0) <= 0 and not self.special_like_rules:
             return
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 "<p><font color='red'>[警告] all_url_meta.json 為空，"
                 "且設定了愛心過濾門檻；步驟 4 將嘗試即時補抓 meta，"
                 "若仍失敗會被全部標為「無meta」跳過。建議先重跑步驟 3。</font></p>"
             ))
-        except Exception:
-            pass
 
     def _sql_like_min(self) -> int:
         """Compute the conservative SQL-level like threshold.
@@ -515,10 +509,8 @@ class download_thread(PauseableThread):
         )
 
     def _diag(self, event, **fields):
-        try:
+        with contextlib.suppress(Exception):
             append_diagnostic_event(self.path, event, stage="step4", **fields)
-        except Exception:
-            pass
 
     def _count_text_lines(self, file_path):
         return count_text_lines(file_path)
@@ -563,18 +555,12 @@ class download_thread(PauseableThread):
         key = str(target_tag).strip().lower()
         if not key:
             return False
-        for tag in artwork_tags:
-            if key in tag:
-                return True
-        return False
+        return any(key in tag for tag in artwork_tags)
 
     def _is_r18g_artwork(self, tag):
         """Gore-adjacent adult content: r-18g / 糞 / 子宮脫."""
         artwork_tags = self._normalize_artwork_tags(tag)
-        for marker in ("r-18g", "糞", "子宮脫"):
-            if self._tag_hit(marker, artwork_tags):
-                return True
-        return False
+        return any(self._tag_hit(marker, artwork_tags) for marker in ("r-18g", "糞", "子宮脫"))
 
     def _is_r18_artwork(self, tag):
         """General adult content (r-18) excluding r-18g markers."""
@@ -642,10 +628,8 @@ class download_thread(PauseableThread):
 
     def _record_step4_filter_skip(self, reason, pid_key=None):
         key = self._bump_step4_skip_count(reason)
-        try:
+        with contextlib.suppress(Exception):
             self._diag("step4_filter_skip", reason=key, pid=str(pid_key or ""))
-        except Exception:
-            pass
         self._maybe_emit_step4_skip_notice()
         self._maybe_emit_step4_skip_summary(self._step4_skip_total())
 
@@ -656,7 +640,7 @@ class download_thread(PauseableThread):
             total = 0
         if total <= 0:
             return
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 "<p><font color='gray'>[Step4過濾完成] 共略過 {} 筆（標籤={}、低愛心={}、無meta={}）</font></p>".format(
                     total,
@@ -666,8 +650,6 @@ class download_thread(PauseableThread):
                 )
             ))
 
-        except Exception:
-            pass
 
     def _refresh_cookie_requirement(self, pid, fallback=None):
         pid_key = normalize_pid(pid)
@@ -746,10 +728,8 @@ class download_thread(PauseableThread):
         if info == [404]:
             db = getattr(self, "_metadata_db", None)
             if db is not None:
-                try:
+                with contextlib.suppress(Exception):
                     db.mark_artwork_revoked(pid)
-                except Exception:
-                    pass
         return self._normalize_pixiv_info(info)
 
     def _build_artwork_headers(self, pid, pid_cookie, need_cookie, *, honour_pid_used=False):
@@ -781,10 +761,8 @@ class download_thread(PauseableThread):
             f"final_status={htmlfile.status_code}"
         )
         if first_try_resp is not None:
-            try:
+            with contextlib.suppress(Exception):
                 print(f"[pixiv_thread] response preview (first): {first_try_resp.text[:500]}")
-            except Exception:
-                pass
         try:
             stage = "retry" if meta_trace.get("retry_used") else "first"
             print(f"[pixiv_thread] response preview ({stage}): {htmlfile.text[:500]}")
@@ -870,19 +848,15 @@ class download_thread(PauseableThread):
         if info == [404]:
             db = getattr(self, "_metadata_db", None)
             if db is not None:
-                try:
+                with contextlib.suppress(Exception):
                     db.mark_artwork_revoked(pid_key)
-                except Exception:
-                    pass
         normalized = self._normalize_pixiv_info(info)
         if not normalized:
             return None
         tag, like, pagecount, img_url = normalized
         meta = self._build_filter_meta_entry(url, tag, like, pagecount, img_url, need_cookie)
-        try:
+        with contextlib.suppress(Exception):
             self.url_meta[pid_key] = meta
-        except Exception:
-            pass
         return meta
 
     def _filter_no_meta_decision(self):
@@ -1012,12 +986,10 @@ class download_thread(PauseableThread):
         """Run special_like_rules through the normalizer when present."""
         if "special_like_rules" not in kwargs:
             return
-        try:
+        with contextlib.suppress(Exception):
             overrides["special_like_rules"] = _normalize_special_like_rules(
                 kwargs.get("special_like_rules", [])
             )
-        except Exception:
-            pass
 
     @staticmethod
     def _apply_legacy_constructor_args(legacy_args, legacy_kwargs):
@@ -1069,12 +1041,10 @@ class download_thread(PauseableThread):
         try:
             completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
         except subprocess.TimeoutExpired:
-            try:
+            with contextlib.suppress(Exception):
                 self._q.put(WorkerEvent("output",
                     f"<p><font color='orange'>JXL 轉檔逾時（120s），跳過：{os.path.basename(str(src_path))}</font></p>"
                 ))
-            except Exception:
-                pass
             return False, "cjxl timeout (120s)"
         if completed.returncode == 0 and os.path.isfile(dst_path):
             return True, ""
@@ -1104,10 +1074,8 @@ class download_thread(PauseableThread):
         except Exception as err:
             return False, str(err)
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 shutil.rmtree(workdir, ignore_errors=True)
-            except Exception:
-                pass
 
     _JXL_SUPPORTED_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 
@@ -1116,12 +1084,10 @@ class download_thread(PauseableThread):
         if self._jxl_path_warned:
             return
         self._jxl_path_warned = True
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='orange'>JXL 已啟用，但找不到 cjxl：{self.jxl_cjxl_path}</font></p>"
             ))
-        except Exception:
-            pass
 
     def _handle_existing_jxl_destination(self, src_path):
         """Bump ok counter and optionally delete the original when .jxl already exists."""
@@ -1171,10 +1137,7 @@ class download_thread(PauseableThread):
         if (not ok) and ext != ".gif":
             # Retry with short ASCII temp path to avoid unicode/long-path decode failures.
             ok, reason2 = self._run_cjxl_with_temp_ascii_path(src_path, dst_path)
-            if ok:
-                reason = ""
-            else:
-                reason = reason2 or reason
+            reason = "" if ok else reason2 or reason
         # GIF intentionally does not fall back to first-frame static conversion
         # so animation correctness is preserved.
         return ok, reason
@@ -1223,10 +1186,8 @@ class download_thread(PauseableThread):
         """Delete the source file when jxl_delete_original is True (best-effort)."""
         if not self.jxl_delete_original:
             return
-        try:
+        with contextlib.suppress(Exception):
             os.remove(src_path)
-        except Exception:
-            pass
 
     def _jxl_emit_failure_log(self, src_path, reason):
         """Print the per-file failure log line; trims very long reasons."""
@@ -1234,13 +1195,11 @@ class download_thread(PauseableThread):
         msg = reason if len(reason) <= 120 else reason[:117] + "..."
         if not msg:
             msg = "cjxl conversion failed"
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='orange'>JXL 轉檔失敗：{os.path.basename(src_path)} "
                 f"({msg})</font></p>"
             ))
-        except Exception:
-            pass
 
     def _jxl_record_outcome(self, src_path, dst_path, ok, reason):
         """Update counters, emit log lines and optionally delete the source."""
@@ -1545,13 +1504,11 @@ class download_thread(PauseableThread):
         """Print the '[下載等待][label] 等待 N 秒' header at the start of a wait."""
         cookie_used = self._is_cookie_used_for_pid(pid)
         ratio_text = '1.0x' if cookie_used else '0.5x'
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='{color}'>[下載等待][{label}] 等待 {delay} 秒 "
                 f"(PID {pid}, 倍率 {ratio_text}, cookie_used={cookie_used})</font></p>"
             ))
-        except Exception:
-            pass
 
     def _countdown_tick(self, remaining, respect_group_stop):
         """Run one 1-second tick. Returns True iff the loop should break."""
@@ -1565,10 +1522,8 @@ class download_thread(PauseableThread):
             self._pause_event.wait(timeout=0.5)
         if self._stop_event.is_set():
             return True
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("countdown", remaining))
-        except Exception:
-            pass
         return self._stop_event.wait(timeout=1.0)
 
     def _run_download_countdown(self, pid, min_sec, max_sec, *, label, color, respect_group_stop):
@@ -1579,10 +1534,8 @@ class download_thread(PauseableThread):
         for remaining in range(int(delay), 0, -1):
             if self._countdown_tick(remaining, respect_group_stop):
                 break
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("countdown", 0))
-        except Exception:
-            pass
 
     def _sleep_between_downloads(self, pid):
         # Inter-PID cooldown is owned by AccountScheduler.release() when active.
@@ -1816,14 +1769,12 @@ class download_thread(PauseableThread):
             from app.core.safe_io import atomic_write_text
             ordered = sorted(merged, key=lambda s: int(s) if s.isdigit() else s)
             atomic_write_text(pending_path, ordered, backup=False)
-            try:
+            with contextlib.suppress(Exception):
                 self._q.put(WorkerEvent("output",
                     f"<p><font color='orange'>[補meta] {added} 個缺 meta 的 PID "
                     f"已加回 pictures_id.txt（共 {len(merged)} 筆待辦），"
                     f"請再跑一次步驟 3 補抓資料</font></p>"
                 ))
-            except Exception:
-                pass
         except Exception:
             pass
     def _group_urls_by_pid(self, urls):
@@ -1896,10 +1847,8 @@ class download_thread(PauseableThread):
                 if self._stop_event.is_set():
                     break
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 sess.close()
-            except Exception:
-                pass
         return failed
 
     @staticmethod
@@ -1970,20 +1919,16 @@ class download_thread(PauseableThread):
         return file_list
     
     def _emit_phase(self, text: str) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("phase", text))
-        except Exception:
-            pass
 
     def _emit_step4_header(self):
         self._q.put(WorkerEvent("output", "<p><font color='red'>下載階段開始...</font></p>"))
         self._q.put(WorkerEvent("output", f"<p><font color='red'>Pending URL: {len(self.allurl)}</font></p>"))
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4過濾設定] like_min={self.like_num}, special_rules={len(self.special_like_rules)}, ban_tag={len(self._ban_tag_norm)}, must_tag={len(self._must_tag_norm)}, ai_dir={bool(self.ai_gen_dir)}</font></p>"
             ))
-        except Exception:
-            pass
         if self.jxl_enable:
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>JXL 轉檔啟用：cjxl='{self.jxl_cjxl_path}' effort={self.jxl_effort} delete_original={self.jxl_delete_original}</font></p>"
@@ -2236,10 +2181,8 @@ class download_thread(PauseableThread):
         db = getattr(self, "_metadata_db", None)
         if db is None or not pid_key:
             return
-        try:
+        with contextlib.suppress(Exception):
             db.upsert_meta(pid_key, **self._meta_to_db_kwargs(meta))
-        except Exception:
-            pass
 
     def _persist_url_meta(self):
         """Sync self.url_meta to SQLite (DB is now the primary store)."""
@@ -2325,10 +2268,8 @@ class download_thread(PauseableThread):
             self.exist_pid.add(pid_key)
             db = getattr(self, "_metadata_db", None)
             if db is not None:
-                try:
+                with contextlib.suppress(Exception):
                     db.import_downloaded_set([pid_key])
-                except Exception:
-                    pass
 
     # 每 N 個 PID 組之後額外 flush url_meta；exist_pid + DB 已逐筆寫，
     # 這裡只是把每組 cookie_used / requires_cookie 等 url_meta 變動推到 DB。
@@ -2344,10 +2285,8 @@ class download_thread(PauseableThread):
             return
         if done_count % every != 0:
             return
-        try:
+        with contextlib.suppress(Exception):
             self._persist_url_meta()
-        except Exception:
-            pass
 
     def _sync_exist_pid_to_db(self):
         """Bulk-sync the current exist_pid set into the canonical DB.
@@ -2358,10 +2297,8 @@ class download_thread(PauseableThread):
         """
         db = getattr(self, "_metadata_db", None)
         if db is not None:
-            try:
+            with contextlib.suppress(Exception):
                 db.import_downloaded_set(self.exist_pid)
-            except Exception:
-                pass
 
     def _emit_step4_summary_and_finalize(self, remaining_urls):
         if self.jxl_enable:
@@ -2437,7 +2374,7 @@ class download_thread(PauseableThread):
                 return
             self._emit_phase("步驟 4：分組 PID 中...")
             self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[Step4] 開始 PID 分組...</font></p>"))
+                "<p><font color='gray'>[Step4] 開始 PID 分組...</font></p>"))
             pid_order, pid_groups = self._group_urls_by_pid(self.allurl)
             if getattr(self, "author_order", False):
                 self._emit_phase("步驟 4：依作者排序中...")
@@ -2451,11 +2388,11 @@ class download_thread(PauseableThread):
             failed_nested = self._execute_downloads(pid_order, pid_groups, author_batches)
             self._emit_phase("步驟 4：整理失敗項目...")
             self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[Step4] 下載迴圈結束，整理失敗項目中...</font></p>"))
+                "<p><font color='gray'>[Step4] 下載迴圈結束，整理失敗項目中...</font></p>"))
             remaining_urls = self._finalize_downloads(failed_nested)
             self._emit_phase("步驟 4：更新已下載紀錄...")
             self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[Step4] 寫入已下載 PID 紀錄...</font></p>"))
+                "<p><font color='gray'>[Step4] 寫入已下載 PID 紀錄...</font></p>"))
             self._sync_exist_pid_to_db()
             self._emit_phase("步驟 4：產生摘要...")
             self._emit_step4_summary_and_finalize(remaining_urls)
@@ -2556,10 +2493,8 @@ class download_thread(PauseableThread):
     def _mark_gif_cookie_usage(self, pid, used, source="unknown"):
         pid_key = normalize_pid(pid) or str(pid)
         used_flag = bool(used)
-        try:
+        with contextlib.suppress(Exception):
             self._pid_cookie_used[pid_key] = used_flag
-        except Exception:
-            pass
         if not used_flag:
             return
 
@@ -2575,12 +2510,10 @@ class download_thread(PauseableThread):
             if lock is not None:
                 lock.release()
 
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='blue'>[GIF][Cookie] PID {pid_key} 使用 cookies（來源：{source}），已更新 all_url_meta 暫存</font></p>"
             ))
-        except Exception:
-            pass
 
     def _stream_ugoira_zip_bytes(self, url, headers, http, pid_cookie):
         """Fetch a ugoira zip URL and return the full bytes blob (or None on error).
@@ -2637,7 +2570,7 @@ class download_thread(PauseableThread):
 
     def _diag_ugoira_meta_fetch(self, pid, meta_trace):
         """Append a step4 diagnostic record describing the ugoira meta fetch result."""
-        try:
+        with contextlib.suppress(Exception):
             self._diag(
                 "ugoira_meta_fetch",
                 pid=str(pid),
@@ -2646,8 +2579,6 @@ class download_thread(PauseableThread):
                 retry_with_cookie_status=meta_trace.get("retry_with_cookie_status"),
                 final_status=meta_trace.get("final_status"),
             )
-        except Exception:
-            pass
 
     def _maybe_mark_meta_retry_cookie(self, pid, meta_trace):
         """If the with-cookie retry succeeded, record cookie usage and return True."""
@@ -2677,7 +2608,7 @@ class download_thread(PauseableThread):
     def _fetch_ugoira_meta(self, pid, pid_cookie, need_cookie, session):
         """Fetch ugoira_meta with cookie-retry. Returns (download_url, delay_info, need_cookie)
         on success, or ``None`` on any failure (404 / parse error / non-200)."""
-        url = 'https://www.pixiv.net/ajax/illust/%s/ugoira_meta?lang=zh_tw' % pid
+        url = f'https://www.pixiv.net/ajax/illust/{pid}/ugoira_meta?lang=zh_tw'
         headers = self._build_artwork_headers(pid, pid_cookie, need_cookie)
         self._mark_gif_cookie_usage(
             pid,
@@ -2715,12 +2646,10 @@ class download_thread(PauseableThread):
             pid, pid_cookie, need_cookie = self._resolve_pid_and_cookie(url, source="step4")
             normalized = self._load_artwork_metadata(pid, pid_cookie)
             if not normalized:
-                try:
+                with contextlib.suppress(Exception):
                     self._q.put(WorkerEvent("output",
                         f"<p><font color='orange'>PID {pid} 取得 ugoira 資訊失敗，"
                         f"已標記為失敗任務</font></p>"))
-                except Exception:
-                    pass
                 return [url, my_time.strftime('%Y%m%d_%H%M%S')]
             tag, like, pagecount, img_url = normalized
             meta = self._fetch_ugoira_meta(pid, pid_cookie, need_cookie, session)
@@ -2818,17 +2747,13 @@ class download_thread(PauseableThread):
         if like == 404 and tag == 404:
             db = getattr(self, "_metadata_db", None)
             if db is not None:
-                try:
+                with contextlib.suppress(Exception):
                     db.mark_artwork_revoked(pid)
-                except Exception:
-                    pass
             return 0  # treat as success — nothing to download
         page, picture_format = self._jpg_extract_page_and_format(url)
         headers = self._jpg_build_headers(pid, pid_cookie, need_cookie)
-        try:
+        with contextlib.suppress(Exception):
             self._pid_cookie_used[str(pid)] = bool(need_cookie is True and pid_cookie)
-        except Exception:
-            pass
         http = session if session is not None else requests
         htmlfile = http.get(url, headers=headers, stream=True, timeout=5)
         htmlfile.raise_for_status()
@@ -2878,16 +2803,12 @@ class download_thread(PauseableThread):
         flush completes even when the process is about to be killed; safe to
         call multiple times (best-effort throughout).
         """
-        try:
+        with contextlib.suppress(Exception):
             self._persist_url_meta()
-        except Exception:
-            pass
         db = getattr(self, "_metadata_db", None)
         if db is not None:
-            try:
+            with contextlib.suppress(Exception):
                 db.close()
-            except Exception:
-                pass
 
     def stop(self):
         if self.single_mode_flag:

@@ -15,11 +15,11 @@ from app.core.worker_event import WorkerEvent
 from app.core.account_scheduler import AccountState, AccountScheduler
 from app.core.proxy_utils import parse_proxy_url
 from app.core.pixiv_thread_utils import (
-    safe_read_json, normalize_cookie_entries, backup_file,
-    sync_exist_pid_with_download_folder,
+    safe_read_json, normalize_cookie_entries, sync_exist_pid_with_download_folder,
 )
 from app.core.metadata_db import DB_FILENAME, MetadataDB
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
+import contextlib
 
 DEFAULT_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -67,10 +67,8 @@ def _read_event_log_cfg() -> dict:
 
 def _write_event_log_cfg(new_cfg: dict) -> None:
     """Persist new_cfg as the event_log section. Silently ignored on error."""
-    try:
+    with contextlib.suppress(Exception):
         _store().update_fields("event_log", new_cfg)
-    except Exception:
-        pass
 
 
 def _agent(auth: dict) -> str:
