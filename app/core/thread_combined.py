@@ -1,3 +1,4 @@
+import contextlib
 import os
 import requests
 from queue import Queue
@@ -133,3 +134,54 @@ class combined_thread(PauseableThread):
             if (normalize_pid(p) or str(p)) not in query_set
         ]
         return query_pids, download_only
+
+    def _download_only_urls(self, pid):
+        """Per-page pending URLs for a download-only PID, from the DB."""
+        db = self.fetcher._metadata_db
+        if db is None:
+            return []
+        pid_key = normalize_pid(pid) or str(pid)
+        try:
+            rows = db.get_pending_pages()  # [(pid, page_index, url)]
+        except Exception:
+            return []
+        urls = [
+            str(u) for (p, _idx, u) in rows
+            if (normalize_pid(p) or str(p)) == pid_key and u
+        ]
+        return urls
+
+    def _process_one_pid(self, pid, needs_query):
+        """Acquire one account; query (if needed) + download this PID's pages;
+        release. Returns the per-PID failed list (possibly empty)."""
+        acc = self._acquire_account()
+        if acc is None:
+            return None  # stop signal / all disabled -> caller breaks
+        sess = pixiv_api.make_session(acc.proxy_url)
+        failed = []
+        ok = True
+        try:
+            if needs_query:
+                ok, one, _ = self._run_with_network_retry(
+                    f"PID {pid}",
+                    lambda: self.fetcher.get_download_url(
+                        self.path, self.Agent, 1, pid,
+                        cookie_override=acc.cookie, session=sess,
+                    ),
+                )
+                urls = self.fetcher._normalize_loop_result(one)
+            else:
+                urls = self._download_only_urls(pid)
+
+            urls = [u for u in urls if isinstance(u, str) and u.startswith("http")]
+            if urls:
+                self.downloader._current_account = acc
+                failed = self.downloader._download_pid_group(pid, urls)
+                if not failed:
+                    self.downloader._maybe_flush_exist_pid(pid)
+                self.downloader._current_account = None
+        finally:
+            self._release_account(acc, ok=ok)
+            with contextlib.suppress(Exception):
+                sess.close()
+        return failed if isinstance(failed, list) else []
