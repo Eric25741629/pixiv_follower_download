@@ -54,6 +54,47 @@ def _safe_meta_count(db) -> int:
         return 0
 
 
+def _within_author_sorted(pids: list[str]) -> list[str]:
+    """Sort one author's pids: numeric PIDs descending, then any
+    non-numeric pids in reverse-lexical order at the end (deterministic)."""
+    digits = sorted((p for p in pids if str(p).isdigit()),
+                    key=lambda p: int(p), reverse=True)
+    nondigits = sorted((p for p in pids if not str(p).isdigit()), reverse=True)
+    return digits + nondigits
+
+
+def compute_author_order(pid_order, pid_to_user_id):
+    """Reorder pids so each author's works are contiguous.
+
+    - Authors are sequenced by first-encounter order in ``pid_order``.
+    - Within an author, pids are PID-descending (see _within_author_sorted).
+    - pids whose user_id is None/empty/missing form one "unknown" bucket
+      appended last.
+
+    Returns ``(flat_order, author_batches)`` where ``author_batches`` is a
+    list of per-author pid lists (one batch per author, unknown bucket last)
+    and ``flat_order`` is those batches concatenated.
+    """
+    author_seq: list[str] = []
+    groups: dict[str, list[str]] = {}
+    unknown: list[str] = []
+    for pid in pid_order:
+        uid = pid_to_user_id.get(pid)
+        key = "" if uid is None else str(uid).strip()
+        if not key:
+            unknown.append(pid)
+            continue
+        if key not in groups:
+            groups[key] = []
+            author_seq.append(key)
+        groups[key].append(pid)
+    author_batches = [_within_author_sorted(groups[k]) for k in author_seq]
+    if unknown:
+        author_batches.append(_within_author_sorted(unknown))
+    flat_order = [pid for batch in author_batches for pid in batch]
+    return flat_order, author_batches
+
+
 class download_thread(PauseableThread):
     pid_max=0
     pid_now=0
@@ -2707,6 +2748,5 @@ class download_thread(PauseableThread):
         self._pause_event.set()
         self._q.put(WorkerEvent("output", "<p><font color='red'>已停止</font></p>"))
         self._stop_event.set()
-
 
 
