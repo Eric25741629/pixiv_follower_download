@@ -18,7 +18,6 @@ from queue import Queue, Empty
 from PIL import Image
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
-import tag_edit
 import pixiv_api
 from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
@@ -52,6 +51,66 @@ def _safe_meta_count(db) -> int:
         return int(db.meta_count())
     except Exception:
         return 0
+
+
+# Tag-cleanup regexes used by _normalize_tag_for_filename. Kept at module level
+# so they compile once on import.
+#
+# _ZERO_WIDTH_RE: zero-width / invisible chars that take up no display width
+# but still consume filename-length budget. Always stripped (no toggle).
+#   U+200B-200D zero-width space / non-joiner / joiner
+#   U+FEFF     byte-order mark / zero-width no-break space
+#   U+00AD     soft hyphen
+_ZERO_WIDTH_RE = re.compile(r"[​-‍﻿­]")
+
+# _BRACKET_CONTENT_RE: matched bracket pairs with their content. Each
+# alternative uses a tight negated char class so we only consume the innermost
+# pair — a second pass over the same string mops up any outer pair that became
+# empty after the inner content vanished. Order: ASCII (), full-width （）,
+# ASCII [], CJK 【】《》〈〉「」『』〔〕〘〙. Unmatched single-side brackets
+# are intentionally left alone so `R-18(警告` stays readable.
+_BRACKET_CONTENT_RE = re.compile(
+    r"(?:"
+    r"\([^()]*\)"
+    r"|（[^（）]*）"
+    r"|\[[^\[\]]*\]"
+    r"|【[^【】]*】"
+    r"|《[^《》]*》"
+    r"|〈[^〈〉]*〉"
+    r"|「[^「」]*」"
+    r"|『[^『』]*』"
+    r"|〔[^〔〕]*〕"
+    r"|〘[^〘〙]*〙"
+    r")"
+)
+
+# _DECORATIVE_CHARS_RE: Unicode-range blocklist for the
+# tag_strip_special_chars toggle. Covers arrows, geometric shapes, misc
+# symbols (★ ♀ ♪ etc.), dingbats, and the full emoji span U+1F000-U+1FAFF.
+# Also strips Variation Selectors U+FE00-U+FE0F — these combine with a base
+# character to switch between text-style and emoji-style rendering (e.g.
+# "♪️"). If we strip the base ♪ but leave the VS16 selector behind,
+# the filename ends up with a stray invisible codepoint, so VS selectors
+# must go alongside the emoji they decorate.
+# Deliberately excludes the CJK Symbols and Punctuation block (U+3000-U+303F)
+# because that overlaps with the bracket characters handled by the brackets
+# toggle; if special_chars is on but brackets is off, we still want brackets
+# preserved. Extend by adding more ranges to this character class.
+_DECORATIVE_CHARS_RE = re.compile(
+    r"["
+    r"←-⇿"   # Arrows
+    r"⌀-⏿"   # Misc Technical
+    r"①-⓿"   # Enclosed Alphanumerics
+    r"─-▟"   # Box Drawing + Block Elements
+    r"■-◿"   # Geometric Shapes (◯ ● ◎ ◇ ◆)
+    r"☀-⛿"   # Misc Symbols (★ ☆ ♀ ♂ ♪ ♫)
+    r"✀-➿"   # Dingbats (✂ ✈ ✏)
+    r"⬀-⯿"   # Misc Symbols and Arrows
+    r"︀-️"  # Variation Selectors (VS1-VS16, esp. ️ U+FE0F)
+    r"\U0001F000-\U0001FAFF"  # All emoji blocks
+    r"※〝〞〽"            # explicit additions outside the range blocks above
+    r"]"
+)
 
 
 def _within_author_sorted(pids: list[str]) -> list[str]:
@@ -152,11 +211,12 @@ class download_thread(PauseableThread):
             overrides.get("must_tag", []),
             overrides.get("special_like_rules", []),
             overrides.get("filename_template", ""),
+            tag_strip_brackets=bool(overrides.get("tag_strip_brackets", False)),
+            tag_strip_special_chars=bool(overrides.get("tag_strip_special_chars", False)),
         )
         self._init_step4_paths_and_state()
 
-        if not os.path.exists(self.download_path):
-            os.mkdir(self.download_path)
+        os.makedirs(self.download_path, exist_ok=True)
         # Order matters: ``_load_initial_exist_pid_set`` now reads from
         # ``v_closed_artworks`` in the SQLite cache, so ``_metadata_db``
         # has to be initialised first.
@@ -254,13 +314,17 @@ class download_thread(PauseableThread):
         self._jxl_worker_thread: threading.Thread | None = None
 
     def _init_filter_state(self, like_num, ban_tag, must_tag, special_like_rules,
-                           filename_template=""):
+                           filename_template="", *,
+                           tag_strip_brackets=False,
+                           tag_strip_special_chars=False):
         """Normalize tag/like filters and seed the per-PID decision cache."""
         self.like_num = like_num if like_num > 0 else 0
         self.ban_tag = ban_tag
         self.must_tag = must_tag
         self.special_like_rules = special_like_rules
         self.filename_template = str(filename_template or "").strip()
+        self.tag_strip_brackets = bool(tag_strip_brackets)
+        self.tag_strip_special_chars = bool(tag_strip_special_chars)
         self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
         self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
         self._pid_filter_decision = {}
@@ -363,7 +427,7 @@ class download_thread(PauseableThread):
         return 0  # conservative: skip SQL likes filter on error
 
     def _read_all_url_file_into_state(self):
-        """Read pending URLs into ``self.allurl``; DB-first with file fallback."""
+        """Read pending URLs into ``self.allurl`` from the canonical DB."""
         db = getattr(self, "_metadata_db", None)
         if db is not None:
             try:
@@ -384,7 +448,7 @@ class download_thread(PauseableThread):
                 return
             except Exception:
                 pass
-        # Fallback: file
+        # Fallback: file (no DB available)
         try:
             print("正在讀取 all_url.txt...", self.path + r"/all_url.txt")
             with open(self.path + r"/all_url.txt") as file:
@@ -898,6 +962,8 @@ class download_thread(PauseableThread):
         ("like_num", lambda v: int(v or 0)),
         ("ai_gen_dir", bool),
         ("filename_template", lambda v: str(v or "").strip() or None),
+        ("tag_strip_brackets", bool),
+        ("tag_strip_special_chars", bool),
     ]
 
     @staticmethod
@@ -998,7 +1064,16 @@ class download_thread(PauseableThread):
 
     def _run_cjxl_once(self, src_path, dst_path):
         cmd = self._build_jxl_command(src_path, dst_path)
-        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        try:
+            completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
+        except subprocess.TimeoutExpired:
+            try:
+                self._q.put(WorkerEvent("output",
+                    f"<p><font color='orange'>JXL 轉檔逾時（120s），跳過：{os.path.basename(str(src_path))}</font></p>"
+                ))
+            except Exception:
+                pass
+            return False, "cjxl timeout (120s)"
         if completed.returncode == 0 and os.path.isfile(dst_path):
             return True, ""
         reason = (completed.stderr or completed.stdout or "").strip()
@@ -1193,9 +1268,15 @@ class download_thread(PauseableThread):
 
     def _jxl_worker_loop(self):
         """Process queued source paths one at a time.  Exits cleanly on the
-        ``None`` sentinel pushed by ``_drain_jxl_queue``."""
-        while True:
-            src_path = self._jxl_queue.get()
+        ``None`` sentinel pushed by ``_drain_jxl_queue``.  Uses a 1-second
+        polling timeout so the thread can exit if the main thread crashes
+        before pushing the sentinel."""
+        import queue as _queue_mod
+        while not self._stop_event.is_set():
+            try:
+                src_path = self._jxl_queue.get(timeout=1.0)
+            except _queue_mod.Empty:
+                continue
             if src_path is None:
                 with contextlib.suppress(Exception):
                     self._jxl_queue.task_done()
@@ -1309,14 +1390,43 @@ class download_thread(PauseableThread):
         )
 
     def _normalize_tag_for_filename(self, raw_tag):
+        """Clean one tag for inclusion in the {hashtag} filename segment.
+
+        Pipeline (in order):
+          1. Strip zero-width / invisible chars (always on — they have no
+             display value but eat filename budget).
+          2. Optionally strip matched-bracket pairs and their content
+             (``tag_strip_brackets`` toggle). Two passes so newly-empty outer
+             pairs after the inner content disappears also get cleaned.
+          3. Optionally strip decorative symbols and the entire emoji range
+             (``tag_strip_special_chars`` toggle).
+          4. Collapse any remaining empty-bracket pairs that survived steps
+             1-3 (cosmetic — Pixiv sometimes ships ``tag（）`` shapes).
+          5. Unify all whitespace variants (full-width, no-break, etc.) into
+             single ASCII space and trim.
+        """
         text = str(raw_tag or "").strip()
         if not text:
             return ""
-        # Remove empty bracket pairs after tag cleanup/transliteration.
+        # 1. Zero-width / invisible chars — drop entirely.
+        text = _ZERO_WIDTH_RE.sub("", text)
+        # 2. Bracket-content stripping (toggle).
+        if getattr(self, "tag_strip_brackets", False):
+            # Two passes: nested brackets like ((a)(b)) → ((a)(b)) loses the
+            # innermost first; the second sub picks up the now-empty outer.
+            text = _BRACKET_CONTENT_RE.sub("", text)
+            text = _BRACKET_CONTENT_RE.sub("", text)
+        # 3. Decorative symbols / emoji (toggle).
+        if getattr(self, "tag_strip_special_chars", False):
+            text = _DECORATIVE_CHARS_RE.sub("", text)
+        # 4. Mop up empty bracket pairs left behind by translation/cleanup.
         text = re.sub(r"\(\s*\)", "", text)
         text = re.sub(r"（\s*）", "", text)
         text = re.sub(r"\[\s*\]", "", text)
         text = re.sub(r"【\s*】", "", text)
+        # 5. Whitespace unification: \s matches 　 (full-width space) and
+        #   (no-break space) in Python 3, so a single \s+ collapse here
+        # handles all width variants the user encounters in Pixiv tags.
         text = re.sub(r"\s+", " ", text).strip()
         text = text.strip(" _-")
         return text
@@ -1727,6 +1837,38 @@ class download_thread(PauseableThread):
             groups[pid].append(u)
         return order, groups
 
+    def _reorder_pid_order_by_author(self, pid_order):
+        """Reorder pid_order so same-author works are contiguous.
+
+        Returns ``(flat_order, author_batches)``. Falls back to a single
+        batch (current behavior) when no metadata DB is available."""
+        db = getattr(self, "_metadata_db", None)
+        if db is None:
+            return list(pid_order), [list(pid_order)]
+        try:
+            uid_map = db.user_id_map_for_pids(pid_order)
+        except Exception:
+            return list(pid_order), [list(pid_order)]
+        flat_order, author_batches = compute_author_order(pid_order, uid_map)
+        unknown_count = sum(
+            1 for p in pid_order if not str(uid_map.get(p) or "").strip()
+        )
+        if unknown_count:
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='orange'>[作者排序] {unknown_count} 筆作品作者不明，"
+                f"已排到最後；重跑步驟 2/3 可補作者資料</font></p>"))
+        return flat_order, author_batches
+
+    def _resolve_execution_order(self, pid_order):
+        """Decide final PID sequence + per-author batches for the executors.
+
+        author_order off -> (pid_order unchanged, single batch) [zero regression]
+        author_order on  -> author-grouped reorder
+        """
+        if getattr(self, "author_order", False):
+            return self._reorder_pid_order_by_author(pid_order)
+        return list(pid_order), [list(pid_order)]
+
     def _download_pid_group(self, pid, urls):
         failed = []
         # Build session with the bound proxy when an account is currently held.
@@ -2121,7 +2263,12 @@ class download_thread(PauseableThread):
             atomic_write_text(self.path + "/err_url.txt", err_lines, backup=False)
             self._shadow_mark_failures(fail_records)
         self._diag("step4_fail_records", fail_record_count=len(fail_records))
-        stop_to_download = [self.q.get() for _ in range(self.q.qsize())]
+        stop_to_download = []
+        while True:
+            try:
+                stop_to_download.append(self.q.get_nowait())
+            except Empty:
+                break
         remaining_urls = self._compute_remaining_urls(stop_to_download, fail_records)
         self._mark_completed_urls_in_db(fail_records)
         self._write_all_url_file(remaining_urls, reason="step4_remaining")
@@ -2155,14 +2302,19 @@ class download_thread(PauseableThread):
             pass
 
     def _maybe_flush_exist_pid(self, pid: str) -> None:
-        """Add pid to exist_pid and mark downloaded in DB immediately."""
+        """Add pid to exist_pid and mark it closed in DB immediately.
+
+        Uses :meth:`~MetadataDB.import_downloaded_set` which writes a
+        sentinel ``artworks`` row — visible to ``v_closed_artworks`` and
+        therefore to :meth:`~MetadataDB.is_downloaded`.
+        """
         pid_key = normalize_pid(pid) or str(pid)
         if pid_key:
             self.exist_pid.add(pid_key)
             db = getattr(self, "_metadata_db", None)
             if db is not None:
                 try:
-                    db.mark_downloaded(pid_key)
+                    db.import_downloaded_set([pid_key])
                 except Exception:
                     pass
 
@@ -2185,23 +2337,19 @@ class download_thread(PauseableThread):
         except Exception:
             pass
 
-    def _refresh_and_write_exist_pid(self):
-        # Merge disk state into memory (full scan catches PIDs from previous runs)
-        disk_pids = load_exist_pid_set(self.path)
-        self.exist_pid.update(disk_pids)
-        download_id = self.splitID(self.get_filelist(self.download_path))
-        self.exist_pid.update(download_id)
-        # SQLite is now the primary store — bulk sync the final set
+    def _sync_exist_pid_to_db(self):
+        """Bulk-sync the current exist_pid set into the canonical DB.
+
+        Replaces the old ``_refresh_and_write_exist_pid`` which additionally
+        scanned the download folder and wrote a JSON file.  Now that the DB
+        is the sole source of truth, we only need the sentinel import.
+        """
         db = getattr(self, "_metadata_db", None)
         if db is not None:
             try:
                 db.import_downloaded_set(self.exist_pid)
             except Exception:
                 pass
-        # Trash any remaining legacy files
-        for old in [self.legacy_exist_json_path, self.exist_txt_path]:
-            if os.path.isfile(old):
-                trash_file(old, self.path)
 
     def _emit_step4_summary_and_finalize(self, remaining_urls):
         if self.jxl_enable:
@@ -2293,7 +2441,7 @@ class download_thread(PauseableThread):
             self._emit_phase("步驟 4：更新已下載紀錄...")
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4] 寫入已下載 PID 紀錄...</font></p>"))
-            self._refresh_and_write_exist_pid()
+            self._sync_exist_pid_to_db()
             self._emit_phase("步驟 4：產生摘要...")
             self._emit_step4_summary_and_finalize(remaining_urls)
             self._emit_phase("")
@@ -2435,9 +2583,6 @@ class download_thread(PauseableThread):
             return None
         if resp.status_code != 200:
             return None
-        with self.timelock:
-            self.download_time = self.download_time + datetime.timedelta(seconds=1)
-            print(datetime.datetime.strftime(self.download_time, '%Y-%m-%d %H:%M:%S'))
         chunks = [data for data in resp.iter_content(chunk_size=65536) if data]
         zip_bytes = b"".join(chunks)
         if self._stats_collector is not None and zip_bytes:
@@ -2549,7 +2694,8 @@ class download_thread(PauseableThread):
         return download_url, delay_info, need_cookie
 
     def gif_download(self, url, session=None):
-        my_time = self.download_time
+        with self.timelock:
+            my_time = self.download_time
         try:
             pid, pid_cookie, need_cookie = self._resolve_pid_and_cookie(url, source="step4")
             normalized = self._load_artwork_metadata(pid, pid_cookie)
@@ -2569,7 +2715,9 @@ class download_thread(PauseableThread):
             url = download_url
             http = session if session is not None else requests
             headers = self._build_artwork_headers(pid, pid_cookie, need_cookie, honour_pid_used=True)
-            my_time = self.download_time
+            with self.timelock:
+                my_time = self.download_time
+                self.download_time = self.download_time + datetime.timedelta(seconds=1)
             zip_bytes = self._stream_ugoira_zip_bytes(url, headers, http, pid_cookie)
             if not zip_bytes:
                 return [url, my_time.strftime('%Y%m%d_%H%M%S')]
@@ -2748,5 +2896,6 @@ class download_thread(PauseableThread):
         self._pause_event.set()
         self._q.put(WorkerEvent("output", "<p><font color='red'>已停止</font></p>"))
         self._stop_event.set()
+
 
 
