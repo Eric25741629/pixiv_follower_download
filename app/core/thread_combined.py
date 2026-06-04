@@ -1,7 +1,5 @@
 import contextlib
 import os
-import requests
-from queue import Queue
 
 from app.core.worker_event import WorkerEvent
 from app.core.pixiv_thread_base import PauseableThread
@@ -185,3 +183,62 @@ class combined_thread(PauseableThread):
             with contextlib.suppress(Exception):
                 sess.close()
         return failed if isinstance(failed, list) else []
+
+    def _emit(self, html):
+        with contextlib.suppress(Exception):
+            self._q.put(WorkerEvent("output", html))
+
+    def run(self):
+        try:
+            self._share_scheduler()
+            self._emit("<p><font color='red'>邊查邊下階段開始</font></p>")
+            self.fetcher._reset_run_counters()
+            query_pids, download_only = self._build_work_lists()
+            total = len(query_pids) + len(download_only)
+            self._q.put(WorkerEvent("progress", (0, total)))
+            self._emit(
+                f"<p><font color='red'>待處理：查詢+下載 {len(query_pids)} 筆、"
+                f"純下載(吸收上次未完成) {len(download_only)} 筆</font></p>"
+            )
+
+            failed_nested = []
+            for pid, needs_query in (
+                [(p, True) for p in query_pids] + [(p, False) for p in download_only]
+            ):
+                if self._stop_event.is_set():
+                    break
+                failed = self._process_one_pid(pid, needs_query)
+                if failed is None:  # acquire returned stop / all disabled
+                    break
+                failed_nested.append(failed)
+                if needs_query:
+                    self.fetcher._mark_pid_processed(pid)
+                self._q.put(WorkerEvent("progress", (1, total)))
+
+            self._finalize(failed_nested)
+        except Exception as e:
+            from app.core.pixiv_thread_utils import output_err
+            self._emit("<p><font color='red'>邊查邊下失敗</font></p>")
+            self._emit(output_err(e))
+            self._q.put(WorkerEvent("next", -1))
+
+    def _finalize(self, failed_nested):
+        # Fetcher side: persist meta + revoked + pending list.
+        with contextlib.suppress(Exception):
+            self.fetcher._flush_url_meta_snapshot()
+            self.fetcher._persist_pending_pid_file()
+            self.fetcher._flush_revoked_pid_file()
+        # Downloader side: err_url + DB completion marks.
+        with contextlib.suppress(Exception):
+            self.downloader._finalize_downloads(failed_nested)
+        self._emit("<p><font color='green'>邊查邊下完成</font></p>")
+        self._q.put(WorkerEvent("finished", "邊查邊下完成"))
+        self._q.put(WorkerEvent("next", -1))  # terminal: Run All stops here
+
+    def flush_for_shutdown(self):
+        with contextlib.suppress(Exception):
+            self.fetcher._flush_url_meta_snapshot()
+        db = getattr(self.fetcher, "_metadata_db", None)
+        if db is not None:
+            with contextlib.suppress(Exception):
+                db.close()
