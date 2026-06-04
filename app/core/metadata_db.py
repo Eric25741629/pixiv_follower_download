@@ -1187,6 +1187,19 @@ class MetadataDB:
             cur = self._conn().execute(sql)
         return cur.fetchall()
 
+    def pids_with_pending_pages(self) -> list[str]:
+        """Distinct PIDs that still have at least one pending page.
+
+        Reads the canonical ``v_pending_pages`` view. Used by combined
+        (邊查邊下) mode to absorb PIDs that a partial Step 3 already
+        resolved (meta written, pages pending) but never downloaded.
+        """
+        try:
+            cur = self._conn().execute("SELECT DISTINCT pid FROM v_pending_pages")
+            return [str(row[0]) for row in cur.fetchall()]
+        except Exception:
+            return []
+
     def get_retriable_failed_pages(
         self, *, max_attempts: int = 5, cooldown_hours: int = 24,
     ) -> list:
