@@ -109,13 +109,25 @@ _DECORATIVE_CHARS_RE = re.compile(
 )
 
 
+def _leading_pid_int(pid) -> int | None:
+    """Return the leading-digit run of ``pid`` as an int, or None if it has
+    no leading digit. Robust to hash-form pids like ``"12345-abcdef"``."""
+    s = str(pid)
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    return int(s[:i]) if i else None
+
+
 def _within_author_sorted(pids: list[str]) -> list[str]:
-    """Sort one author's pids: numeric PIDs descending, then any
-    non-numeric pids in reverse-lexical order at the end (deterministic)."""
-    digits = sorted((p for p in pids if str(p).isdigit()),
-                    key=lambda p: int(p), reverse=True)
-    nondigits = sorted((p for p in pids if not str(p).isdigit()), reverse=True)
-    return digits + nondigits
+    """Sort one author's pids: by leading-digit value descending (so hash-form
+    pids like ``"12345-abcdef"`` still sort numerically), then any pids with no
+    leading digit in reverse-lexical order at the end (deterministic)."""
+    numeric = sorted((p for p in pids if _leading_pid_int(p) is not None),
+                     key=_leading_pid_int, reverse=True)
+    nonnumeric = sorted((p for p in pids if _leading_pid_int(p) is None),
+                        reverse=True)
+    return numeric + nonnumeric
 
 
 def compute_author_order(pid_order, pid_to_user_id):

@@ -69,3 +69,13 @@ def test_only_unknown_authors():
     flat, batches = compute_author_order(pid_order, uid)
     assert batches == [["30", "20", "10"]]   # single unknown bucket, PID desc
     assert flat == ["30", "20", "10"]
+
+
+def test_hash_form_pid_sorts_by_leading_digits():
+    # defensive hardening: a hash-form pid like "12345-abcdef" sorts by its
+    # leading-digit value (12345), not lexically.
+    pid_order = ["999", "12345-abcdef", "50"]
+    uid = {"999": "A", "12345-abcdef": "A", "50": "A"}
+    flat, batches = compute_author_order(pid_order, uid)
+    assert batches == [["12345-abcdef", "999", "50"]]
+    assert flat == ["12345-abcdef", "999", "50"]
