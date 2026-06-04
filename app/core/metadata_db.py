@@ -945,6 +945,40 @@ class MetadataDB:
             "user_name": row[12],
         }
 
+    def user_id_map_for_pids(self, pids: Iterable[str]) -> dict[str, str | None]:
+        """Return ``{original_pid: user_id|None}`` for the given pids.
+
+        Keys are the exact pid strings passed in (not the coerced digit
+        form), so callers can look up by the same values they hold. A pid
+        absent from ``artworks``, or whose ``user_id`` is NULL/empty, maps
+        to ``None``. Coerced pids are batched in chunks of 900 to stay under
+        SQLite's bound-variable limit.
+        """
+        out: dict[str, str | None] = {}
+        coerced_to_orig: dict[str, list[str]] = {}
+        for p in pids:
+            out[p] = None
+            c = self._coerce_pid(p)
+            if c:
+                coerced_to_orig.setdefault(c, []).append(p)
+        if not coerced_to_orig:
+            return out
+        conn = self._conn()
+        keys = list(coerced_to_orig.keys())
+        chunk = 900
+        for i in range(0, len(keys), chunk):
+            part = keys[i:i + chunk]
+            placeholders = ",".join("?" * len(part))
+            cur = conn.execute(
+                f"SELECT pid, user_id FROM artworks WHERE pid IN ({placeholders})",
+                part,
+            )
+            for cpid, uid in cur.fetchall():
+                val = uid if (uid is not None and str(uid).strip() != "") else None
+                for orig in coerced_to_orig.get(str(cpid), []):
+                    out[orig] = val
+        return out
+
     def mark_artwork_revoked(self, pid: str, *, revoked_at: str | None = None) -> None:
         """Mark a PID as removed by Pixiv (404 / deletion). Idempotent."""
         pid_key = self._coerce_pid(pid)
