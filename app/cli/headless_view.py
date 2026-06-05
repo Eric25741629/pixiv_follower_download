@@ -6,6 +6,8 @@ the GUI MainView does is irrelevant headless.
 """
 from __future__ import annotations
 
+import contextlib
+
 
 class HeadlessView:
     def __init__(self):
@@ -17,7 +19,5 @@ class HeadlessView:
         self.running = bool(value)
 
     def set_step_state(self, index: int, state: str) -> None:
-        try:
+        with contextlib.suppress(TypeError, ValueError, IndexError):
             self.step_states[int(index)] = str(state)
-        except (TypeError, ValueError, IndexError):
-            pass
