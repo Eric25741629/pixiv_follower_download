@@ -1,7 +1,15 @@
 import os, sys, tempfile, datetime
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import pytest
 from queue import Queue
 from app.core.thread_combined import combined_thread
+
+
+@pytest.fixture(autouse=True)
+def _isolate_appdata(tmp_path, monkeypatch):
+    """Point APPDATA at a tmp dir so construction never reads the real
+    %APPDATA% cookie-requirement JSON / history / production DB (slow)."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
 
 
 def _thread():
@@ -45,6 +53,12 @@ def test_clean_query_seeds_pending_then_marks_downloaded_and_closes_pid():
     # PIDs must be 4-12 digits to parse out of the URL (parse_pid_and_page_from_url).
     urls = ["https://i.pximg.net/img/55501_p0.jpg", "https://i.pximg.net/img/55501_p1.jpg"]
 
+    # The query path is stubbed (no real get_download_url), so seed the
+    # fetcher's url_meta with a page_count the way a real query would. This
+    # is what _persist_pid_meta lands in artworks so the closed-view becomes
+    # exact (v_complete_artworks needs a non-NULL page_count).
+    t.fetcher.url_meta = {"55501": {"pagecount": 2, "like": 100, "tag": []}}
+
     t._acquire_account = lambda: _Acc()
     t._release_account = lambda acc, ok=True: None
     t._run_with_network_retry = _retry_router((True, urls, None))
@@ -69,6 +83,11 @@ def test_clean_query_seeds_pending_then_marks_downloaded_and_closes_pid():
     assert db.page_status_counts().get("pending", 0) == 0
     # And _maybe_flush_exist_pid ran, retiring the PID from future scans.
     assert "55501" in t.downloader.exist_pid
+    # Stronger than exist_pid membership: the canonical store now treats this
+    # PID as complete (page_count met) AND closed — meta was persisted at
+    # success time, not deferred to _finalize.
+    assert db.is_pid_complete("55501") is True
+    assert db.is_pid_closed("55501") is True
 
 
 def test_failed_query_does_not_retire_pid_and_marks_not_ok():

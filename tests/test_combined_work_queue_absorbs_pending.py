@@ -1,7 +1,15 @@
 import os, sys, tempfile, datetime
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import pytest
 from queue import Queue
 from app.core.thread_combined import combined_thread
+
+
+@pytest.fixture(autouse=True)
+def _isolate_appdata(tmp_path, monkeypatch):
+    """Point APPDATA at a tmp dir so construction never reads the real
+    %APPDATA% cookie-requirement JSON / history / production DB (slow)."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
 
 
 def test_work_queue_unions_pictures_id_and_db_pending():
