@@ -45,3 +45,29 @@ def test_config_set_bool_inference(monkeypatch, tmp_path):
     with contextlib.redirect_stdout(out):
         commands.main(["config", "get", "download.combined_mode", "--json"])
     assert _json.loads(out.getvalue())["value"] is True
+
+
+def test_combined_mode_default_false_in_defaults():
+    # combined_mode is a first-class download setting, so it must resolve to a
+    # real bool default (False) rather than null when never persisted.
+    assert DEFAULTS["download"]["combined_mode"] is False
+
+
+def test_config_get_combined_mode_defaults_false(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    from app.cli import commands
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert commands.main(["config", "get", "download.combined_mode", "--json"]) == 0
+    assert _json.loads(out.getvalue())["value"] is False
+
+
+def test_config_set_combined_mode_false_stays_bool(monkeypatch, tmp_path):
+    # Regression: 'false' must store bool False, not the truthy string "false".
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    from app.cli import commands
+    assert commands.main(["config", "set", "download.combined_mode", "false"]) == 0
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        commands.main(["config", "get", "download.combined_mode", "--json"])
+    assert _json.loads(out.getvalue())["value"] is False

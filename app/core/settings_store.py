@@ -31,6 +31,9 @@ DEFAULTS = {
         # When true, Step 4 downloads one author's works fully (PID desc)
         # before moving to the next author; unknown-author works go last.
         "author_order": False,
+        # When true, Step 3 runs in 邊查邊下 (combined) mode: each PID is
+        # downloaded immediately after its meta is fetched (merges Step 3+4).
+        "combined_mode": False,
         # When Step 3 finds a cached artwork that was uploaded within this many
         # days, re-fetch its meta over the network instead of trusting the
         # cached like_count. 0 disables the feature.
