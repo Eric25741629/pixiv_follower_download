@@ -65,6 +65,8 @@ class combined_thread(PauseableThread):
             self.path = base_path
         self.Agent = Agent
         self._event_log = event_log
+        self._pending_urls_by_pid = {}
+        self._last_pid_ok = False
 
         self.fetcher = thread_url_fetch.get_img_url_thread(
             q=q, Author_list=Author_list, Agent=Agent, cookies=cookies,
@@ -99,6 +101,8 @@ class combined_thread(PauseableThread):
         self.fetcher._stop_event = self._stop_event
         self.downloader._pause_event = self._pause_event
         self.downloader._stop_event = self._stop_event
+        with contextlib.suppress(Exception):
+            self.downloader._metadata_db.close()
         self.downloader._metadata_db = self.fetcher._metadata_db
 
     def _share_scheduler(self):
@@ -121,43 +125,56 @@ class combined_thread(PauseableThread):
             raw = []
         query_pids, *_ = self.fetcher._prepare_pending_pid_tasks(raw)
         query_set = set(query_pids)
+        # Seed the in-memory pending-PID tracker from query_pids so finalize's
+        # _persist_pending_pid_file does not overwrite pictures_id.txt empty.
+        with contextlib.suppress(Exception):
+            self.fetcher._init_pending_pid_tracker(
+                query_pids, reset_with_fallback=True
+            )
+        # One full scan of v_pending_pages, grouped per PID, reused below
+        # (avoids the previous O(D x P) re-scan per download-only PID).
         db = self.fetcher._metadata_db
+        self._pending_urls_by_pid = {}
         try:
-            pending = db.pids_with_pending_pages() if db is not None else []
+            rows = db.get_pending_pages() if db is not None else []
         except Exception:
-            pending = []
+            rows = []
+        for (p, _idx, u) in rows:
+            if not u:
+                continue
+            key = normalize_pid(p) or str(p)
+            self._pending_urls_by_pid.setdefault(key, []).append(str(u))
         download_only = [
-            normalize_pid(p) or str(p)
-            for p in pending
-            if (normalize_pid(p) or str(p)) not in query_set
+            key
+            for key in self._pending_urls_by_pid
+            if key not in query_set
         ]
         return query_pids, download_only
 
     def _download_only_urls(self, pid):
-        """Per-page pending URLs for a download-only PID, from the DB."""
-        db = self.fetcher._metadata_db
-        if db is None:
-            return []
+        """Per-page pending URLs for a download-only PID (from the cached
+        per-PID grouping built once in :meth:`_build_work_lists`)."""
         pid_key = normalize_pid(pid) or str(pid)
-        try:
-            rows = db.get_pending_pages()  # [(pid, page_index, url)]
-        except Exception:
-            return []
-        urls = [
-            str(u) for (p, _idx, u) in rows
-            if (normalize_pid(p) or str(p)) == pid_key and u
-        ]
-        return urls
+        return list(getattr(self, "_pending_urls_by_pid", {}).get(pid_key, []))
 
     def _process_one_pid(self, pid, needs_query):
         """Acquire one account; query (if needed) + download this PID's pages;
-        release. Returns the per-PID failed list (possibly empty)."""
+        release. Returns the per-PID failed list (possibly empty).
+
+        Side effect: sets ``self._last_pid_ok`` to whether this PID was
+        processed cleanly (query ok / not needed, AND every page downloaded).
+        ``run()`` reads it to gate ``_mark_pid_processed`` so an exhausted
+        query or a partial-download failure is NOT silently dropped from the
+        pending list.
+        """
+        self._last_pid_ok = False
         acc = self._acquire_account()
         if acc is None:
             return None  # stop signal / all disabled -> caller breaks
         sess = pixiv_api.make_session(acc.proxy_url)
         failed = []
         ok = True
+        download_ok = True
         try:
             if needs_query:
                 ok, one, _ = self._run_with_network_retry(
@@ -167,22 +184,53 @@ class combined_thread(PauseableThread):
                         cookie_override=acc.cookie, session=sess,
                     ),
                 )
-                urls = self.fetcher._normalize_loop_result(one)
+                urls = self.fetcher._normalize_loop_result(one) if ok else []
             else:
                 urls = self._download_only_urls(pid)
 
             urls = [u for u in urls if isinstance(u, str) and u.startswith("http")]
             if urls:
+                # Seed the pending pages before download so a partial failure /
+                # crash leaves a recoverable pending trail in the DB.
+                self._seed_pending_urls(pid, urls)
                 self.downloader._current_account = acc
-                failed = self.downloader._download_pid_group(pid, urls)
-                if not failed:
+                _, failed, _ = self._run_with_network_retry(
+                    f"PID {pid} 下載",
+                    lambda: self.downloader._download_pid_group(pid, urls),
+                )
+                if not isinstance(failed, list):
+                    failed = []
+                    download_ok = False
+                elif failed:
+                    download_ok = False
+                else:
+                    self._mark_urls_done(urls)
                     self.downloader._maybe_flush_exist_pid(pid)
-                self.downloader._current_account = None
         finally:
-            self._release_account(acc, ok=ok)
+            self.downloader._current_account = None
+            self._release_account(acc, ok=ok and download_ok)
             with contextlib.suppress(Exception):
                 sess.close()
+        # "Genuine success": query succeeded (or not needed) AND downloads
+        # were clean. A query that produced no urls (revoked / filtered out)
+        # leaves ``download_ok`` True and is correctly settled. Only a failed/
+        # exhausted query or a partial download keeps the PID pending.
+        self._last_pid_ok = bool(ok) and download_ok
         return failed if isinstance(failed, list) else []
+
+    def _seed_pending_urls(self, pid, urls):
+        db = self.fetcher._metadata_db
+        if db is None:
+            return
+        with contextlib.suppress(Exception):
+            db.upsert_pending_urls([(u, pid) for u in urls])
+
+    def _mark_urls_done(self, urls):
+        db = self.fetcher._metadata_db
+        if db is None:
+            return
+        with contextlib.suppress(Exception):
+            db.mark_urls_done(list(urls))
 
     def _emit(self, html):
         with contextlib.suppress(Exception):
@@ -211,7 +259,10 @@ class combined_thread(PauseableThread):
                 if failed is None:  # acquire returned stop / all disabled
                     break
                 failed_nested.append(failed)
-                if needs_query:
+                # Only retire a queried PID from the pending list when it was
+                # processed cleanly; exhausted queries / partial downloads stay
+                # pending so the next run retries them.
+                if needs_query and self._last_pid_ok:
                     self.fetcher._mark_pid_processed(pid)
                 self._q.put(WorkerEvent("progress", (1, total)))
 

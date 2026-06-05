@@ -16,6 +16,11 @@ def test_download_only_pid_does_not_query():
     db = t.fetcher._metadata_db
     db.upsert_page("777", 0, status="pending", url="https://x/777_p0.jpg")
 
+    # Build the work lists once; this caches the per-PID pending urls
+    # (the single v_pending_pages scan that _download_only_urls reuses).
+    query_pids, download_only = t._build_work_lists()
+    assert "777" in download_only
+
     queried = {"n": 0}
 
     class _Acc:
@@ -25,6 +30,10 @@ def test_download_only_pid_does_not_query():
     t._release_account = lambda acc, ok=True: None
 
     def fake_retry(label, fn):
+        # Only the network query path increments queried; the download path
+        # ("下載" label) must actually run fn() so _download_pid_group fires.
+        if "下載" in label:
+            return True, fn(), None
         queried["n"] += 1
         return True, [], None
 

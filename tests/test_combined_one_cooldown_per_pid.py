@@ -31,6 +31,11 @@ def test_one_acquire_release_per_pid_covers_query_and_download():
         calls["release"] += 1
 
     def fake_retry(label, fn):
+        # Query is the bare label "PID 123"; download is "PID 123 下載".
+        # Both now route through _run_with_network_retry; the download call
+        # must actually invoke fn() so _download_pid_group runs.
+        if "下載" in label:
+            return True, fn(), None
         calls["query"] += 1
         return True, ["https://x/123_p0.jpg"], None
 
@@ -43,6 +48,8 @@ def test_one_acquire_release_per_pid_covers_query_and_download():
     t._run_with_network_retry = fake_retry
     t.downloader._download_pid_group = fake_download
     t.downloader._maybe_flush_exist_pid = lambda pid: None
+    t._seed_pending_urls = lambda pid, urls: None
+    t._mark_urls_done = lambda urls: None
 
     failed = t._process_one_pid("123", needs_query=True)
 
@@ -51,3 +58,4 @@ def test_one_acquire_release_per_pid_covers_query_and_download():
     assert calls["query"] == 1
     assert calls["download"] == [("123", ("https://x/123_p0.jpg",))]
     assert failed == []
+    assert t._last_pid_ok is True
