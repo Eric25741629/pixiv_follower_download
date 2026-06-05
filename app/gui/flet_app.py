@@ -341,6 +341,25 @@ def main(page: ft.Page) -> None:
     run_controller = RunController(main_view, event_q, stats_collector, event_log=event_log)
     main_view._run_controller = run_controller
 
+    # In-app scheduler: fire Run All on the configured schedule. The service
+    # reads settings live and skips when a run is already active.
+    try:
+        from app.core.scheduler_service import SchedulerService
+        _sched_cfg = _settings_store().get_section("schedule")
+        if bool(_sched_cfg.get("enabled", False)):
+            scheduler_service = SchedulerService(
+                get_cfg=lambda: _settings_store().get_section("schedule"),
+                run_all=lambda: run_controller.run_all(),
+                is_active=lambda: getattr(main_view, "_active_thread", None) is not None
+                                  and main_view._active_thread.is_alive(),
+                emit=lambda html: event_q.put(WorkerEvent("output", html)),
+            )
+            scheduler_service.start()
+            atexit.register(scheduler_service.stop)
+            _log.info("scheduler service started")
+    except Exception:
+        _log.exception("failed to start scheduler service")
+
     # If a worker survived the previous session GC, hand it to the new
     # main_view so pause/stop still work and the UI shows "running".
     # Replay the buffered log lines + restore progress/step/phase state
