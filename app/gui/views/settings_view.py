@@ -4,12 +4,25 @@ import os
 import threading
 import flet as ft
 from app.core.settings_store import SettingsStore
+import contextlib
 
 
 def _store() -> SettingsStore:
     path = os.getenv("APPDATA") + r"/pixiv_download/"
     os.makedirs(path, exist_ok=True)
     return SettingsStore(path)
+
+
+def _safe_int(value, default: int) -> int:
+    """Tolerant int parse for TextField values that may be empty / non-numeric.
+
+    Falls back to *default* on TypeError/ValueError so a stray "abc" does not
+    raise during save.
+    """
+    try:
+        return int(str(value).strip() or default)
+    except (TypeError, ValueError):
+        return default
 
 
 class SettingsView:
@@ -44,11 +57,57 @@ class SettingsView:
         self._sw_notime = ft.Switch(label="無時間不下載", value=bool(flt.get("notime", False)))
         self._tf_like_num = ft.TextField(label="最低讚數（一般）", value=str(dl.get("like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
         self._tf_r18_like_num = ft.TextField(label="最低讚數（R18）", value=str(dl.get("r18_like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
+        self._tf_rescrape_within_days = ft.TextField(
+            label="重抓上限（天數，0=關閉）",
+            value=str(dl.get("rescrape_within_days", 365)),
+            width=200,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            tooltip="作品距上傳時間小於此天數時，Step 3 會重新抓取 meta 以更新讚數，避免新作品因初始讚數不足被永久過濾。0 表示停用。已下載的作品永遠不會重抓。",
+        )
         self._tf_filename_template = ft.TextField(
             label="檔名範本（留空＝使用預設）",
             value=str(dl.get("filename_template", "") or ""),
             hint_text="例：{timetag}_PID{pid}{page}{hashtag}.{ext}",
             expand=True,
+        )
+        self._sw_tag_strip_brackets = ft.Switch(
+            label="Tag 過濾括號內容",
+            value=bool(dl.get("tag_strip_brackets", False)),
+            tooltip="開啟後，tag 中成對括號（含 () （） [] 【】 《》 〈〉 「」 『』 〔〕 〘〙）與內容會從檔名移除",
+        )
+        self._sw_tag_strip_special_chars = ft.Switch(
+            label="Tag 過濾裝飾符號與 emoji",
+            value=bool(dl.get("tag_strip_special_chars", False)),
+            tooltip="開啟後，箭頭、★☆♀♂♪♫、◯●◎、各式 emoji 等裝飾性符號會從 tag 中移除",
+        )
+        self._sw_author_order = ft.Switch(
+            label="依作者順序下載（同作者連續）",
+            value=bool(dl.get("author_order", False)),
+            tooltip="開啟後，步驟 4 會把同一作者的作品連續下載完（PID 由大到小）再換下一位；作者不明的作品排到最後",
+        )
+        self._sw_combined_mode = ft.Switch(
+            label="邊查邊下（查到即下載，合併步驟三、四）",
+            value=bool(dl.get("combined_mode", False)),
+            tooltip="開啟後，步驟 3 會逐一查詢 PID 並立即下載該 PID 的頁面（查詢與下載共用同一次帳號冷卻）；同時自動吸收上次未完成的下載",
+        )
+
+        sch = store.get_section("schedule")
+        self._sw_schedule_enabled = ft.Switch(
+            label="啟用排程（定時自動 Run All）",
+            value=bool(sch.get("enabled", False)),
+        )
+        self._dd_schedule_mode = ft.Dropdown(
+            label="排程方式",
+            value=str(sch.get("mode", "daily")),
+            options=[ft.dropdown.Option("daily", "每日固定時間"),
+                     ft.dropdown.Option("interval", "固定間隔")],
+            width=200,
+        )
+        self._tf_schedule_time = ft.TextField(
+            label="每日時間 (HH:MM)", value=str(sch.get("time", "03:00")), width=160,
+        )
+        self._tf_schedule_interval = ft.TextField(
+            label="間隔 (小時)", value=str(sch.get("interval_hours", 6)), width=160,
         )
 
         self._ban_tags: list[str] = list(dl.get("ban_tag", []))
@@ -225,10 +284,8 @@ class SettingsView:
         avg = self._safe_int_cooldown()
         self._label_cooldown_hint.value = self._cooldown_hint(avg)
         self._label_cooldown_hint.color = ft.Colors.RED_600 if avg < 30 else ft.Colors.GREY_600
-        try:
+        with contextlib.suppress(Exception):
             self._label_cooldown_hint.update()
-        except Exception:
-            pass
 
     def _on_cooldown_slider_change(self, e: ft.ControlEvent) -> None:
         try:
@@ -290,10 +347,8 @@ class SettingsView:
         from app.core.proxy_utils import parse_proxy_list, test_proxy
         lines = parse_proxy_list(self._tf_proxy_pool.value or "")
         self._proxy_test_results.controls = [ft.Text("測試中...", size=11)]
-        try:
+        with contextlib.suppress(Exception):
             self._page.update()
-        except Exception:
-            pass
 
         def _run():
             results = []
@@ -306,10 +361,8 @@ class SettingsView:
                     color = ft.Colors.GREEN_600 if ok else ft.Colors.RED_600
                     results.append(ft.Text(f"{icon} {url} — {msg}", size=11, color=color))
             self._proxy_test_results.controls = results
-            try:
+            with contextlib.suppress(Exception):
                 self._page.update()
-            except Exception:
-                pass
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -349,11 +402,24 @@ class SettingsView:
         store.update_section("download", {
             **store.get_section("download"),
             "path": self._tf_path.value,
-            "like_num": int(self._tf_like_num.value or 0),
-            "r18_like_num": int(self._tf_r18_like_num.value or 0),
+            "like_num": _safe_int(self._tf_like_num.value, 0),
+            "r18_like_num": _safe_int(self._tf_r18_like_num.value, 0),
+            "rescrape_within_days": _safe_int(self._tf_rescrape_within_days.value, 0),
             "ban_tag": self._ban_tags,
             "must_tag": self._must_tags,
             "filename_template": (self._tf_filename_template.value or "").strip(),
+            "tag_strip_brackets": bool(self._sw_tag_strip_brackets.value),
+            "tag_strip_special_chars": bool(self._sw_tag_strip_special_chars.value),
+            "author_order": bool(self._sw_author_order.value),
+            "combined_mode": bool(self._sw_combined_mode.value),
+        })
+        store.update_section("schedule", {
+            "enabled": bool(self._sw_schedule_enabled.value),
+            "mode": str(self._dd_schedule_mode.value or "daily"),
+            "time": str(self._tf_schedule_time.value or "03:00"),
+            "interval_hours": int(self._tf_schedule_interval.value or 6)
+                if str(self._tf_schedule_interval.value or "").strip().isdigit() else 6,
+            "action": "run_all",
         })
         store.update_multiple({
             "filter": {
@@ -391,21 +457,15 @@ class SettingsView:
         avg_val = self._safe_int_cooldown()
         if avg_val < 30:
             def _confirm(ev):
-                try:
+                with contextlib.suppress(Exception):
                     self._page.pop_dialog()
-                except Exception:
-                    pass
                 self.save()
-                try:
+                with contextlib.suppress(Exception):
                     self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
-                except Exception:
-                    pass
 
             def _cancel(ev):
-                try:
+                with contextlib.suppress(Exception):
                     self._page.pop_dialog()
-                except Exception:
-                    pass
 
             try:
                 self._page.show_dialog(ft.AlertDialog(
@@ -423,10 +483,8 @@ class SettingsView:
                 self.save()
             return
         self.save()
-        try:
+        with contextlib.suppress(Exception):
             self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
-        except Exception:
-            pass
 
     # ------------------------------------------------------------------
     # Layout
@@ -458,7 +516,7 @@ class SettingsView:
                 ]),
                 _tile("過濾規則", [
                     ft.Row([self._sw_hidefollow, self._sw_nogif, self._sw_notag, self._sw_notime], wrap=True),
-                    ft.Row([self._tf_like_num, self._tf_r18_like_num], spacing=16),
+                    ft.Row([self._tf_like_num, self._tf_r18_like_num, self._tf_rescrape_within_days], spacing=16, wrap=True),
                 ]),
                 _tile("檔名範本", [
                     ft.Text(
@@ -467,6 +525,14 @@ class SettingsView:
                         size=11, color=ft.Colors.GREY_700,
                     ),
                     self._tf_filename_template,
+                    ft.Text("Tag 整理（套用於 {hashtag} 佔位符）", size=12),
+                    ft.Row(
+                        [self._sw_tag_strip_brackets, self._sw_tag_strip_special_chars],
+                        wrap=True,
+                    ),
+                    ft.Text("下載順序", size=12),
+                    self._sw_author_order,
+                    self._sw_combined_mode,
                 ]),
                 _tile("資料夾分類", [
                     ft.Text(
@@ -520,6 +586,12 @@ class SettingsView:
                 _tile("User-Agent 設定", [
                     ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
                     self._label_ua_status,
+                ]),
+                _tile("排程", [
+                    self._sw_schedule_enabled,
+                    self._dd_schedule_mode,
+                    self._tf_schedule_time,
+                    self._tf_schedule_interval,
                 ]),
                 ft.Container(content=save_btn, padding=ft.Padding.only(top=8)),
             ],

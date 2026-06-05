@@ -63,7 +63,7 @@ The canonical code lives under `app/` in three layers:
   - `pixiv_api.py` wraps Pixiv HTTP endpoints, cookie handling, and response parsing.
   - `pixiv_thread_utils.py` is a helpers module: `atomic_write_json/text`, `normalize_pid`, `fetch_with_cookie_retry`, diagnostic event logging, PID cache sync.
   - `safe_io.py` provides atomic write + history-based backup (keeps latest 10 copies in a sibling `history/` directory).
-  - `tag_edit.py`, `update_selenium.py` — tag filtering and Selenium cookie refresh.
+  - `update_selenium.py` — Selenium-based cookie refresh.
 
 ### Top-level shim files
 
@@ -71,10 +71,9 @@ A few files at the repository root are thin re-exports that keep legacy absolute
 
 - `main.py` → `app.entry.main`
 - `user_info.py` → `app.gui.user_info`
-- `tag_edit.py` → `app.core.tag_edit`
 - `update_selenium.py` → `app.core.update_selenium`
 
-Note: the root `pixiv_api.py`, `pixiv_thread.py`, and `download_img.py` are still standalone copies (not shims) — the `app/core/*.py` versions are the ones loaded through `main.py → app.entry.main`. When in doubt, trace from `app/entry/main.py`; modules inside `app.core` import `from pixiv_api import *` and `import tag_edit` as bare names (not `app.core.*`), so `sys.path` must include the repo root (tests do this explicitly; `main.py` inherits it from being run at the repo root).
+Note: the root `pixiv_api.py`, `pixiv_thread.py`, and `download_img.py` are still standalone copies (not shims) — the `app/core/*.py` versions are the ones loaded through `main.py → app.entry.main`. When in doubt, trace from `app/entry/main.py`; modules inside `app.core` use `from pixiv_api import *` as a bare name (not `app.core.pixiv_api`), so `sys.path` must include the repo root (tests do this explicitly; `main.py` inherits it from being run at the repo root).
 
 ### Runtime data locations
 
@@ -96,7 +95,7 @@ Three views provide the decisions Step 3 / Step 4 consult:
 
 Helpers in `app/core/metadata_db.py`: `upsert_artwork`, `upsert_artworks` (bulk), `mark_artwork_revoked`, `upsert_page`, `mark_page_downloaded`, `mark_page_failed`, `mark_page_pending`, `upsert_pages_bulk`, `get_pending_pages`, `get_pending_urls_filtered`, `closed_artwork_set`, `is_pid_closed`, `is_pid_complete`, `page_status_counts`.
 
-**Legacy tables (`pids`, `downloaded`, `pending_urls`, `pending_pids`) are still written by shadow-write helpers** for one more transition phase. They no longer drive read decisions and will be dropped in a future revision. JSON / text files `exist_pid.json`, `all_url.txt`, `pictures_id.txt`, `err_url.txt` likewise persist for compatibility but the canonical state lives in SQLite.
+**Legacy tables (`pids`, `downloaded`, `pending_urls`, `pending_pids`) were dropped in Phase 8.** `_SCHEMA` runs `DROP TABLE IF EXISTS` on every open (`app/core/metadata_db.py:38-41`) and nothing writes to them — the `MetadataDB` methods named after them (`upsert_pending_urls`, `upsert_pending_pids`, `mark_url_done`/`mark_urls_done`) write the canonical `pages` / `artworks` tables instead, so legacy-table write-amplification is zero. (This is separate from the still-active PHASE-A `exist_pid` shadow-write into `artworks` sentinel rows described below.) JSON / text files `exist_pid.json`, `all_url.txt`, `pictures_id.txt`, `err_url.txt` likewise persist for compatibility but the canonical state lives in SQLite.
 
 #### `exist_pid` DB-only migration (in progress — search `PHASE-A`)
 
@@ -110,19 +109,25 @@ Migration utility: `python tools/db_migration.py [--dry-run]` (idempotent — re
 
 ### Event log + replay
 
-Every mutation to canonical `artworks` / `pages` tables is also appended as one JSON line to `%APPDATA%/pixiv_download/events/events-YYYYMMDD.jsonl` **before** the DB write. Files rotate daily; retention is 60 days (`othersettings.event_log.retention_days`).
+Every mutation to canonical `artworks` / `pages` tables is also appended as one JSON line to `%APPDATA%/pixiv_download/events/events-YYYYMMDD.jsonl` **before** the DB write. Files rotate by date AND by size (`event_log.rotate_size_bytes`, default 128 MB → `events-YYYYMMDD.NNN.jsonl`, zero-padded sequence; the bare name is sequence 0). Retention is time-based (`event_log.retention_days`, 60) AND byte-capped (`event_log.max_total_bytes`, default 4 GB — oldest files evicted first, never past the most recent snapshot/shutdown/checkpoint anchor).
+
+**Durability cadence:** every line is `flush()`ed (survives a process kill), but `os.fsync` is batched — forced every `event_log.fsync_every_n` events (default 200) OR `event_log.fsync_interval_sec` (default 1.0s), whichever first, plus unconditionally on anchor kinds and `close()`. Set `fsync_every_n=1` for the legacy per-event fsync (max power-loss durability). The batched default removes the per-DB-mutation disk barrier that dominated write cost; the SQLite WAL (`synchronous=NORMAL`) is the authoritative durable store, the log is a recovery aid.
 
 Emitted by `MetadataDB._emit(...)` in `app/core/metadata_db.py`. Event kinds:
 - `page.upsert` — every `upsert_page` (covers `mark_page_downloaded` / `_failed` / `_pending` via convenience wrappers that call `upsert_page` underneath; no separate event for those)
 - `pages.upsert_bulk` — `upsert_pages_bulk`
+- `pages.downloaded_bulk` — `mark_pages_downloaded_bulk` (Step-4 success path via `mark_urls_done`). Replays through an `ON CONFLICT DO UPDATE SET status='downloaded'`, so recovery correctly flips pre-seeded `pending` rows to `downloaded` (a plain `pages.upsert_bulk` uses `INSERT OR IGNORE` and would leave them stuck pending)
 - `artwork.upsert` — `upsert_artwork` (also emitted per-PID by `import_downloaded_set` so PHASE-A shadow-write inserts can be replayed)
 - `artwork.discovered` — `upsert_artworks` (bulk PID discovery)
 - `artwork.revoked` — `mark_artwork_revoked`
 - `session.start` / `session.shutdown` — anchor events emitted by `EventLog.__init__` / `close`
-- `snapshot` — emitted after a successful `MetadataDB.backup_db()` (called daily by `RunController._backup_db`, throttled via `othersettings.event_log.last_snapshot_date`; `max_history` = `max(3, retention_days // 14)`)
+- `snapshot` — emitted after a successful `MetadataDB.backup_db()` (called daily by `RunController._backup_db`, throttled via `othersettings.event_log.last_snapshot_date`; `max_history` = `max(3, retention_days // 14)`). After a verified snapshot, `RunController._backup_db` calls `EventLog.compact_before_date` to prune event files fully older than it (2-day margin), bounding the log to a small tail by construction
+- `checkpoint` — a lightweight anchor (no DB copy) emitted at startup by `app/gui/flet_app.py` **after** `recover_tail`, so the next crash recovery is bounded to one session even when the user never presses Run and force-kills
+
+Cutoff anchors (what `recover_tail` stops at) are `session.shutdown` / `snapshot` / `checkpoint`.
 
 Two recovery paths:
-- **Automatic** — `app/gui/flet_app.py` startup constructs the EventLog and, if `last_session_was_unclean`, calls `recover_tail(db, log_dir)` which re-applies events newer than the last `session.shutdown` / `snapshot` into the live DB. All DB mutation methods are idempotent (`INSERT OR IGNORE` / `ON CONFLICT DO UPDATE`), so re-application is safe. During recovery the DB's `_event_log` is temporarily set to None to prevent emit-loops.
+- **Automatic** — `app/gui/flet_app.py` startup constructs the EventLog and, if `last_session_was_unclean`, calls `recover_tail(db, log_dir)`. It **reverse-seeks** (block-streamed, never `readlines` a multi-GB file) from the newest file to the most recent cutoff anchor and applies only the orphan tail — O(tail), not O(total log), so a large backlog can never blank-screen startup. The tail scan is bounded by `RECOVER_TAIL_MAX_BYTES` (256 MB); beyond it the most-recent budget-worth is applied best-effort and a warning logged. All DB mutation methods are idempotent (`INSERT OR IGNORE` / `ON CONFLICT DO UPDATE`), so re-application is safe. During recovery the DB's `_event_log` is temporarily set to None to prevent emit-loops.
 - **Manual** — `python tools/replay_events.py [--target PATH] [--from-snapshot PATH] [--dry-run]` rebuilds a fresh DB from the latest `history/metadata.sqlite3.YYYYMMDD` snapshot plus events newer than it. Use when the live DB is unrecoverable.
 
 To disable the event log entirely, set `othersettings.event_log.enabled = false` (`MetadataDB(path, event_log=None)` reverts to SQLite-WAL-only durability).
@@ -130,6 +135,37 @@ To disable the event log entirely, set `othersettings.event_log.enabled = false`
 ### JXL post-processing
 
 `thread_download` optionally converts downloaded images to JPEG XL using an external `cjxl.exe`. `_find_default_cjxl_path()` in `app/core/thread_download.py` searches known Windows paths (`~/Downloads/jxl*/bin/cjxl.exe`) as fallback; the settings view field `jxl_cjxl_path` overrides it; persisted `othersettings.json.jxl_*` keys are the final fallback. Keep behavior optional — absence of `cjxl.exe` must not break downloads (`tests/test_jxl_fallback.py`).
+
+### Author-ordered downloads (Step 4)
+
+Optional `download.author_order` (bool, default false; UI switch 「依作者順序下載（同作者連續）」 in settings) makes Step 4 download one author's works contiguously before the next. The pure, module-level `compute_author_order(pid_order, {pid: user_id})` in `app/core/thread_download.py` reorders the `pid_order` from `_group_urls_by_pid` into `(flat_order, author_batches)`: authors sequenced by **first-encounter** order, within-author by **PID descending** (`_leading_pid_int`, robust to hash-form pids), **unknown author** (NULL/empty `artworks.user_id`) bucketed **last**. `_resolve_execution_order` gates it — off → a single batch identical to prior behavior (zero regression). Pool mode `_execute_downloads_pool` drains each author batch (`as_completed`) before submitting the next (strict per-author barrier); single-thread mode is inherently strict on `flat_order`. `user_id` is read in bulk via `MetadataDB.user_id_map_for_pids` (keys on the original pid string, chunks at 900). Wired `_LEGACY_SCALAR_KW_SCHEMA` → `download_thread.__init__` (`self.author_order`) → `run_actions._build_step4`, same path as `tag_strip_brackets`. Tests: `tests/test_compute_author_order.py`, `test_execute_downloads_pool_author_barrier.py`, `test_reorder_pid_order_by_author.py`, `test_user_id_map_for_pids.py`, `test_author_order_wiring.py`.
+
+### Combined fetch-download (邊查邊下)
+
+Optional `download.combined_mode` (bool, default false; UI switch 「邊查邊下（查到即下載，合併步驟三、四）」 in settings) merges Step 3 (query meta) and Step 4 (download) into a single per-PID pass so that resolving a PID's meta and downloading its pages both happen inside **one account cooldown window** instead of two separate full-pipeline passes. The new thin orchestrator `combined_thread(PauseableThread)` in `app/core/thread_combined.py` **composes** a `get_img_url_thread` (query engine, `self.fetcher`) and a `download_thread` (download engine, `self.downloader`) as helpers — it never calls their `run()`. The two engines share one event queue, one `AccountScheduler` (propagated post-construction via `_share_scheduler`), one `_pause_event` / `_stop_event`, and one `_metadata_db` connection (downloader's DB is reassigned to the fetcher's).
+
+The work queue is built by `_build_work_lists()` → `(query_pids, download_only_pids)`. `query_pids` come from `pictures_id.txt` via the fetcher's pure filter helpers (`check_exist` + `_prepare_pending_pid_tasks`, deliberately **not** `_load_and_filter_pid_list`, to avoid its next/progress emits). `download_only_pids` are PIDs with pending pages in the DB (`MetadataDB.pids_with_pending_pages()` reading `v_pending_pages`) that are **not** already in `query_pids` — this auto-absorbs a partial Step 3 that resolved meta but never downloaded. `_process_one_pid(pid, needs_query)` acquires one account, runs the query (via `_run_with_network_retry` + `fetcher.get_download_url`) only when `needs_query`, then downloads that PID's pages through `downloader._download_pid_group`, then releases — `ok` is initialised to `True` before the try so the `finally` `_release_account` is always valid. Download-only PIDs skip the network query and source their URLs from the DB via `_download_only_urls`. `run()` emits 「邊查邊下階段開始」, iterates query-then-download-only, finalizes both engines (`_flush_url_meta_snapshot` / `_persist_pending_pid_file` / `_flush_revoked_pid_file` on the fetcher; `_finalize_downloads` on the downloader), and emits a **terminal `WorkerEvent("next", -1)`** so `Run All` stops after combined mode rather than chaining into a separate Step 4.
+
+Routed in `RunController._build_thread(3)`: when `download.combined_mode` is on, `_build_combined` (mirrors the `_build_step3` + `_build_step4` arg assembly) is returned instead of `_build_step3`; off → unchanged Step 3 (zero regression). Tests: `tests/test_metadata_pids_with_pending.py`, `test_combined_mode_wiring.py`, `test_combined_work_queue_absorbs_pending.py`, `test_combined_one_cooldown_per_pid.py`, `test_combined_cache_hit_no_network.py`, `test_combined_run_all_terminal_next.py`.
+
+### Headless CLI + in-app scheduler
+
+The same `RunController` pipeline can run with no Flet GUI. `RunController`'s only GUI coupling is three things on its view (`set_running(bool)`, `set_step_state(i, state)`, and read/write of `_active_thread`); `HeadlessView` in `app/cli/headless_view.py` is a tiny stub satisfying exactly that surface so the controller runs unchanged headless.
+
+`run_headless(step)` in `app/cli/headless_runner.py` mirrors `flet_app.main`: it builds the event `queue.Queue` + an `EventLog` (with the same crash-recovery `recover_tail` + `checkpoint` emit), constructs `RunController(HeadlessView(), event_q, event_log=...)`, kicks off the action, then pumps the queue via `_pump`. `step` is one of `{1,2,3,4,combined,all}`: `all` → `controller.run_all()`; `combined` → sets `controller.force_combined = True` then `run_step(3)` (the `force_combined` flag, honored in `_build_thread(3)`, forces `_build_combined` even when `download.combined_mode` is off); `1`/`2`/`3`/`4` → `run_step(int(step))`. `_pump` reads `WorkerEvent.type` / `.data` (the dataclass field is `type`, not `kind`), prints `output`/`finished` text to **stderr** (HTML stripped via `_strip_html`), and forwards `next n` to `controller.on_next(n)` so Run-All chains. Terminal detection disambiguates the overloaded `next == -1` (both a failed step's error terminal AND combined mode's normal terminal) by whether a `finished` immediately preceded it: single step exits 0 on `finished` / 1 on `next == -1`; run_all exits 0 when the pipeline reaches step ≥ 4 `finished` or when `finished` precedes `next == -1` (combined success), and 1 when `next == -1` arrives with no preceding `finished` (step failure). Queue starvation (`Empty` after 600 s) exits 2.
+
+`cli.py` (repo root) is a thin entry calling `app.cli.commands.main`; `python cli.py <subcommand>`. Subcommands (`app/cli/commands.py`, argparse `prog="pixiv-cli"`):
+- `run --step {1,2,3,4,combined,all}` — delegates to `run_headless`; its process exit code is the pump's.
+- `status [--json]` — reads `MetadataDB.page_status_counts()` + `meta_count()`; JSON keys `pending_pages` / `downloaded_pages` / `failed_pages` / `revoked_pages` / `meta_count` / `db_path`.
+- `config get|set <section>.<field> [value] [--json]` — `set` infers the stored type from the existing/default value (`_coerce_like`; bool/int/list), falling back to `_infer_from_literal` (bool/int/string) for keys absent from `DEFAULTS`.
+- `cookie test [--json]` — runs `pixiv_api.Test_cookies` per configured cookie; JSON `tested` / `valid`; exit 0 iff at least one valid.
+- `following export [--json]` — prints `run_actions._load_author_list()`.
+
+CLI contract: read commands print JSON to **stdout** (with `--json`); all human/log text goes to **stderr**; exit codes are meaningful (0 ok, non-zero on error). `APPDATA` selects the data dir (tests set it to a tmp dir), so the CLI shares the GUI's `%APPDATA%/pixiv_download/` state.
+
+`SchedulerService` (`app/core/scheduler_service.py`) is a daemon thread that fires Run All on the `schedule` settings section (`DEFAULTS["schedule"]`: `enabled` False, `mode` `"daily"|"interval"`, `time` `"03:00"`, `interval_hours` 6, `action` `"run_all"`). The pure `compute_next_fire(now, cfg, last_fire)` computes the next datetime (daily: today at `time` if future else tomorrow; interval: `(last_fire or now) + interval_hours`; bad `time` → midnight) and is unit-testable with no clock access. The thread loops in ≤30 s slices (so config/stop changes apply fast) and calls `_fire_if_due(now, due)`, which **skips** (emitting a gray 「排程時間到，但已有任務執行中，略過本次」 log) when `is_active()` reports a run in progress. It is decoupled via three callables (`get_cfg` / `run_all` / `is_active`, plus optional `emit`). `flet_app.main` starts it (after `run_controller` is built) only when `schedule.enabled` — `run_all` → `run_controller.run_all()`, `is_active` → live thread aliveness on `main_view._active_thread`, `emit` → `event_q.put(WorkerEvent("output", html))` — and registers `scheduler_service.stop` via `atexit`; the settings 「排程」tile binds the section.
+
+Tests: `tests/test_scheduler_next_fire_time.py`, `test_scheduler_skips_when_active.py`, `test_headless_runner_runs_step.py`, `test_headless_run_all_chaining.py`, `test_cli_status_json.py`, `test_cli_config_get_set.py`.
 
 ### Cookie pool
 

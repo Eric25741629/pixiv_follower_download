@@ -24,6 +24,20 @@ DEFAULTS = {
         "rule_tag_2": "",
         "rule_like_2": 0,
         "filename_template": "",
+        # tag cleanup options applied to the {hashtag} placeholder in filenames.
+        # Default false to preserve historical behavior.
+        "tag_strip_brackets": False,
+        "tag_strip_special_chars": False,
+        # When true, Step 4 downloads one author's works fully (PID desc)
+        # before moving to the next author; unknown-author works go last.
+        "author_order": False,
+        # When true, Step 3 runs in 邊查邊下 (combined) mode: each PID is
+        # downloaded immediately after its meta is fetched (merges Step 3+4).
+        "combined_mode": False,
+        # When Step 3 finds a cached artwork that was uploaded within this many
+        # days, re-fetch its meta over the network instead of trusting the
+        # cached like_count. 0 disables the feature.
+        "rescrape_within_days": 365,
     },
     "filter": {
         "pass_tag": False,
@@ -70,6 +84,30 @@ DEFAULTS = {
     },
     "ui": {
         "theme_mode": "SYSTEM",  # "LIGHT" | "DARK" | "SYSTEM"
+    },
+    "event_log": {
+        "enabled": True,
+        "retention_days": 60,
+        "auto_snapshot_on_run": True,
+        # Durability cadence: fsync every N events OR every interval seconds,
+        # whichever comes first; anchor kinds (session.*/snapshot/checkpoint) and
+        # close() always force an fsync. Batched defaults remove the per-DB-write
+        # disk barrier that dominated write cost (set fsync_every_n=1 to restore
+        # the legacy per-event fsync for maximum power-loss durability).
+        "fsync_every_n": 200,
+        "fsync_interval_sec": 1.0,
+        # Hard ceiling on the events/ directory; oldest files are evicted first,
+        # never past the most recent snapshot/shutdown/checkpoint anchor.
+        "max_total_bytes": 4294967296,    # 4 GB
+        # Roll the day's file to the next sequence once it exceeds this size.
+        "rotate_size_bytes": 134217728,   # 128 MB
+    },
+    "schedule": {
+        "enabled": False,
+        "mode": "daily",          # "daily" | "interval"
+        "time": "03:00",          # daily mode trigger, HH:MM 24h local
+        "interval_hours": 6,       # interval mode period
+        "action": "run_all",      # fixed: Run All (1 -> 2 -> combined)
     },
 }
 
@@ -167,16 +205,19 @@ class SettingsStore:
                 merged[section_key] = {**default_section, **raw_section}
         # Migration: derive pid_cooldown_avg from old pid_wait_min/max if absent.
         raw_perf = raw.get("performance", {})
-        if isinstance(raw_perf, dict) and "pid_cooldown_avg" not in raw_perf:
-            if "pid_wait_min" in raw_perf or "pid_wait_max" in raw_perf:
-                try:
-                    old_min = int(raw_perf.get("pid_wait_min", 10))
-                    old_max = int(raw_perf.get("pid_wait_max", 60))
-                    avg = (old_min + old_max) // 2
-                    avg = max(5, min(300, avg))
-                    merged["performance"]["pid_cooldown_avg"] = avg
-                except (TypeError, ValueError):
-                    pass
+        if (
+            isinstance(raw_perf, dict)
+            and "pid_cooldown_avg" not in raw_perf
+            and ("pid_wait_min" in raw_perf or "pid_wait_max" in raw_perf)
+        ):
+            try:
+                old_min = int(raw_perf.get("pid_wait_min", 10))
+                old_max = int(raw_perf.get("pid_wait_max", 60))
+                avg = (old_min + old_max) // 2
+                avg = max(5, min(300, avg))
+                merged["performance"]["pid_cooldown_avg"] = avg
+            except (TypeError, ValueError):
+                pass
         return merged
 
     def _read_legacy(self, fname):

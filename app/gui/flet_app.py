@@ -29,6 +29,41 @@ def _settings_store() -> SettingsStore:
     return SettingsStore(path)
 
 
+def _event_log_kwargs() -> dict:
+    """Read othersettings.event_log durability/rotation knobs for EventLog.
+
+    Defaults batch the fsync (200 events / 1s) so the common write path no
+    longer pays a per-mutation disk barrier; anchor kinds and close() still
+    fsync. Missing/invalid values fall back to the defaults.
+    """
+    try:
+        cfg = _settings_store().get_section("event_log")
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    def _i(key, default):
+        try:
+            return int(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _f(key, default):
+        try:
+            return float(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "retention_days": _i("retention_days", 60),
+        "fsync_every_n": _i("fsync_every_n", 200),
+        "fsync_interval_sec": _f("fsync_interval_sec", 1.0),
+        "max_total_bytes": _i("max_total_bytes", 4 * 1024 * 1024 * 1024),
+        "rotate_size_bytes": _i("rotate_size_bytes", 128 * 1024 * 1024),
+    }
+
+
 def _load_theme_mode() -> ft.ThemeMode:
     try:
         name = _settings_store().get_section("ui").get("theme_mode", "SYSTEM")
@@ -242,7 +277,7 @@ def main(page: ft.Page) -> None:
             try:
                 from app.core.event_log import EventLog, recover_tail
                 from app.core.metadata_db import MetadataDB as _MetadataDB
-                _el = EventLog(_base_path)
+                _el = EventLog(_base_path, **_event_log_kwargs())
                 atexit.register(_el.close)
                 _PERSISTENT_EVENT_LOG = _el
                 # Auto recover_tail if the previous session was unclean.
@@ -262,6 +297,25 @@ def main(page: ft.Page) -> None:
                             _PERSISTENT_RECOVERY_COUNT = _n
                     except Exception:
                         _log.exception("event_log: recover_tail failed")
+                # STR2: after recovery, durably checkpoint the live DB then drop
+                # a cheap 'checkpoint' anchor. This bounds the NEXT crash
+                # recovery to just this session's tail even when the user never
+                # presses Run (the only other anchor source) and force-kills.
+                # Emitted AFTER recover_tail so it never swallows this session's
+                # orphans, and after the WAL checkpoint so the anchor only
+                # vouches for DB state that is durably on disk.
+                try:
+                    from app.core.metadata_db import DB_FILENAME as _DBF
+                    _ckpt_path = os.path.join(_base_path, _DBF)
+                    if os.path.isfile(_ckpt_path):
+                        _cc = sqlite3.connect(_ckpt_path, timeout=5.0, isolation_level=None)
+                        try:
+                            _cc.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        finally:
+                            _cc.close()
+                    _el.emit("checkpoint", pid=os.getpid())
+                except Exception:
+                    _log.exception("event_log: startup checkpoint anchor failed")
             except Exception:
                 _log.exception("event_log: failed to initialise EventLog")
 
@@ -286,6 +340,25 @@ def main(page: ft.Page) -> None:
 
     run_controller = RunController(main_view, event_q, stats_collector, event_log=event_log)
     main_view._run_controller = run_controller
+
+    # In-app scheduler: fire Run All on the configured schedule. The service
+    # reads settings live and skips when a run is already active.
+    try:
+        from app.core.scheduler_service import SchedulerService
+        _sched_cfg = _settings_store().get_section("schedule")
+        if bool(_sched_cfg.get("enabled", False)):
+            scheduler_service = SchedulerService(
+                get_cfg=lambda: _settings_store().get_section("schedule"),
+                run_all=lambda: run_controller.run_all(),
+                is_active=lambda: getattr(main_view, "_active_thread", None) is not None
+                                  and main_view._active_thread.is_alive(),
+                emit=lambda html: event_q.put(WorkerEvent("output", html)),
+            )
+            scheduler_service.start()
+            atexit.register(scheduler_service.stop)
+            _log.info("scheduler service started")
+    except Exception:
+        _log.exception("failed to start scheduler service")
 
     # If a worker survived the previous session GC, hand it to the new
     # main_view so pause/stop still work and the UI shows "running".

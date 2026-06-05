@@ -16,9 +16,8 @@ import subprocess
 import tempfile
 from queue import Queue, Empty
 from PIL import Image
-from pixiv_api import *
+from pixiv_api import *  # noqa: F403  (intentional: re-exports Pixiv_info/gif_download/etc.)
 from app.core.worker_event import WorkerEvent
-import tag_edit
 import pixiv_api
 from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
@@ -27,24 +26,20 @@ from app.core.pixiv_thread_utils import (
     count_text_lines,
     fetch_with_cookie_retry,
     init_cookie_fields,
-    load_exist_pid_set,
     mirror_meta_dict_to_db,
     normalize_filter_tags,
     normalize_pid,
     output_err,
-    safe_read_json,
     to_int_lenient,
-    trash_file,
     write_all_url_file,
 )
-from app.core.metadata_db import MetadataDB, emit_db_stats, mirror_exist_pid_set, open_metadata_db
+from app.core.metadata_db import emit_db_stats, mirror_exist_pid_set, open_metadata_db
 from app.core.pixiv_thread_base import (
     PauseableThread,
     _normalize_special_like_rules,
     _resolve_like_threshold,
     _is_ai_artwork_tagged,
     _cookie_usage_label,
-    _format_cookie_usage_summary,
 )
 
 def _safe_meta_count(db) -> int:
@@ -52,6 +47,119 @@ def _safe_meta_count(db) -> int:
         return int(db.meta_count())
     except Exception:
         return 0
+
+
+# Tag-cleanup regexes used by _normalize_tag_for_filename. Kept at module level
+# so they compile once on import.
+#
+# _ZERO_WIDTH_RE: zero-width / invisible chars that take up no display width
+# but still consume filename-length budget. Always stripped (no toggle).
+#   U+200B-200D zero-width space / non-joiner / joiner
+#   U+FEFF     byte-order mark / zero-width no-break space
+#   U+00AD     soft hyphen
+_ZERO_WIDTH_RE = re.compile(r"[​-‍﻿­]")
+
+# _BRACKET_CONTENT_RE: matched bracket pairs with their content. Each
+# alternative uses a tight negated char class so we only consume the innermost
+# pair — a second pass over the same string mops up any outer pair that became
+# empty after the inner content vanished. Order: ASCII (), full-width （）,
+# ASCII [], CJK 【】《》〈〉「」『』〔〕〘〙. Unmatched single-side brackets
+# are intentionally left alone so `R-18(警告` stays readable.
+_BRACKET_CONTENT_RE = re.compile(
+    r"(?:"
+    r"\([^()]*\)"
+    r"|（[^（）]*）"
+    r"|\[[^\[\]]*\]"
+    r"|【[^【】]*】"
+    r"|《[^《》]*》"
+    r"|〈[^〈〉]*〉"
+    r"|「[^「」]*」"
+    r"|『[^『』]*』"
+    r"|〔[^〔〕]*〕"
+    r"|〘[^〘〙]*〙"
+    r")"
+)
+
+# _DECORATIVE_CHARS_RE: Unicode-range blocklist for the
+# tag_strip_special_chars toggle. Covers arrows, geometric shapes, misc
+# symbols (★ ♀ ♪ etc.), dingbats, and the full emoji span U+1F000-U+1FAFF.
+# Also strips Variation Selectors U+FE00-U+FE0F — these combine with a base
+# character to switch between text-style and emoji-style rendering (e.g.
+# "♪️"). If we strip the base ♪ but leave the VS16 selector behind,
+# the filename ends up with a stray invisible codepoint, so VS selectors
+# must go alongside the emoji they decorate.
+# Deliberately excludes the CJK Symbols and Punctuation block (U+3000-U+303F)
+# because that overlaps with the bracket characters handled by the brackets
+# toggle; if special_chars is on but brackets is off, we still want brackets
+# preserved. Extend by adding more ranges to this character class.
+_DECORATIVE_CHARS_RE = re.compile(
+    r"["
+    r"←-⇿"   # Arrows
+    r"⌀-⏿"   # Misc Technical
+    r"①-⓿"   # Enclosed Alphanumerics
+    r"─-▟"   # Box Drawing + Block Elements
+    r"■-◿"   # Geometric Shapes (◯ ● ◎ ◇ ◆)
+    r"☀-⛿"   # Misc Symbols (★ ☆ ♀ ♂ ♪ ♫)
+    r"✀-➿"   # Dingbats (✂ ✈ ✏)
+    r"⬀-⯿"   # Misc Symbols and Arrows
+    r"︀-️"  # Variation Selectors (VS1-VS16, esp. ️ U+FE0F)
+    r"\U0001F000-\U0001FAFF"  # All emoji blocks
+    r"※〝〞〽"            # explicit additions outside the range blocks above
+    r"]"
+)
+
+
+def _leading_pid_int(pid) -> int | None:
+    """Return the leading-digit run of ``pid`` as an int, or None if it has
+    no leading digit. Robust to hash-form pids like ``"12345-abcdef"``."""
+    s = str(pid)
+    i = 0
+    while i < len(s) and s[i].isdigit():
+        i += 1
+    return int(s[:i]) if i else None
+
+
+def _within_author_sorted(pids: list[str]) -> list[str]:
+    """Sort one author's pids: by leading-digit value descending (so hash-form
+    pids like ``"12345-abcdef"`` still sort numerically), then any pids with no
+    leading digit in reverse-lexical order at the end (deterministic)."""
+    numeric = sorted((p for p in pids if _leading_pid_int(p) is not None),
+                     key=_leading_pid_int, reverse=True)
+    nonnumeric = sorted((p for p in pids if _leading_pid_int(p) is None),
+                        reverse=True)
+    return numeric + nonnumeric
+
+
+def compute_author_order(pid_order, pid_to_user_id):
+    """Reorder pids so each author's works are contiguous.
+
+    - Authors are sequenced by first-encounter order in ``pid_order``.
+    - Within an author, pids are PID-descending (see _within_author_sorted).
+    - pids whose user_id is None/empty/missing form one "unknown" bucket
+      appended last.
+
+    Returns ``(flat_order, author_batches)`` where ``author_batches`` is a
+    list of per-author pid lists (one batch per author, unknown bucket last)
+    and ``flat_order`` is those batches concatenated.
+    """
+    author_seq: list[str] = []
+    groups: dict[str, list[str]] = {}
+    unknown: list[str] = []
+    for pid in pid_order:
+        uid = pid_to_user_id.get(pid)
+        key = "" if uid is None else str(uid).strip()
+        if not key:
+            unknown.append(pid)
+            continue
+        if key not in groups:
+            groups[key] = []
+            author_seq.append(key)
+        groups[key].append(pid)
+    author_batches = [_within_author_sorted(groups[k]) for k in author_seq]
+    if unknown:
+        author_batches.append(_within_author_sorted(unknown))
+    flat_order = [pid for batch in author_batches for pid in batch]
+    return flat_order, author_batches
 
 
 class download_thread(PauseableThread):
@@ -83,6 +191,8 @@ class download_thread(PauseableThread):
         stats_collector=None,
         *legacy_args,
         event_log=None,
+        defer_step4_scan=False,
+        db_base_path=None,
         **legacy_kwargs,
     ):
         super().__init__(q, scheduler=scheduler)
@@ -99,6 +209,7 @@ class download_thread(PauseableThread):
         # Backward compatibility: accept older positional/keyword constructor calls.
         overrides = self._apply_legacy_constructor_args(legacy_args, legacy_kwargs)
         self.ai_gen_dir = overrides.get("ai_gen_dir", self.ai_gen_dir)
+        self.author_order = bool(overrides.get("author_order", False))
         self._init_jxl_config(
             overrides.get("jxl_enable", jxl_enable),
             overrides.get("jxl_cjxl_path", jxl_cjxl_path),
@@ -111,16 +222,30 @@ class download_thread(PauseableThread):
             overrides.get("must_tag", []),
             overrides.get("special_like_rules", []),
             overrides.get("filename_template", ""),
+            tag_strip_brackets=bool(overrides.get("tag_strip_brackets", False)),
+            tag_strip_special_chars=bool(overrides.get("tag_strip_special_chars", False)),
         )
         self._init_step4_paths_and_state()
 
-        if not os.path.exists(self.download_path):
-            os.mkdir(self.download_path)
+        os.makedirs(self.download_path, exist_ok=True)
+        # The metadata DB may live in a different directory than ``self.path``
+        # (combined mode shares the fetcher's data dir while keeping err_url /
+        # all_url writes under ``self.path``). ``self.path`` is left untouched.
+        self._db_base = db_base_path or self.path
         # Order matters: ``_load_initial_exist_pid_set`` now reads from
         # ``v_closed_artworks`` in the SQLite cache, so ``_metadata_db``
         # has to be initialised first.
         self.url_meta = self._load_initial_url_meta()
         self._metadata_db = self._init_metadata_db(self.url_meta)
+        if defer_step4_scan:
+            # Lightweight init: skip the Step-4-only heavy scans (closed-set
+            # read, mirror, stats, all_url load + task prep). Safe defaults
+            # keep every attribute the rest of the class reads present.
+            self.exist_pid = set()
+            self.allurl = []
+            self._task_filter_stats = {}
+            self.pid_max = 0
+            return
         self.exist_pid = self._load_initial_exist_pid_set()
         self._mirror_exist_pid_to_db()
         self._emit_metadata_db_stats(stage="Step4")
@@ -213,13 +338,17 @@ class download_thread(PauseableThread):
         self._jxl_worker_thread: threading.Thread | None = None
 
     def _init_filter_state(self, like_num, ban_tag, must_tag, special_like_rules,
-                           filename_template=""):
+                           filename_template="", *,
+                           tag_strip_brackets=False,
+                           tag_strip_special_chars=False):
         """Normalize tag/like filters and seed the per-PID decision cache."""
         self.like_num = like_num if like_num > 0 else 0
         self.ban_tag = ban_tag
         self.must_tag = must_tag
         self.special_like_rules = special_like_rules
         self.filename_template = str(filename_template or "").strip()
+        self.tag_strip_brackets = bool(tag_strip_brackets)
+        self.tag_strip_special_chars = bool(tag_strip_special_chars)
         self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
         self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
         self._pid_filter_decision = {}
@@ -286,14 +415,12 @@ class download_thread(PauseableThread):
             return
         if int(self.like_num or 0) <= 0 and not self.special_like_rules:
             return
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 "<p><font color='red'>[警告] all_url_meta.json 為空，"
                 "且設定了愛心過濾門檻；步驟 4 將嘗試即時補抓 meta，"
                 "若仍失敗會被全部標為「無meta」跳過。建議先重跑步驟 3。</font></p>"
             ))
-        except Exception:
-            pass
 
     def _sql_like_min(self) -> int:
         """Compute the conservative SQL-level like threshold.
@@ -322,7 +449,7 @@ class download_thread(PauseableThread):
         return 0  # conservative: skip SQL likes filter on error
 
     def _read_all_url_file_into_state(self):
-        """Read pending URLs into ``self.allurl``; DB-first with file fallback."""
+        """Read pending URLs into ``self.allurl`` from the canonical DB."""
         db = getattr(self, "_metadata_db", None)
         if db is not None:
             try:
@@ -343,7 +470,7 @@ class download_thread(PauseableThread):
                 return
             except Exception:
                 pass
-        # Fallback: file
+        # Fallback: file (no DB available)
         try:
             print("正在讀取 all_url.txt...", self.path + r"/all_url.txt")
             with open(self.path + r"/all_url.txt") as file:
@@ -409,10 +536,8 @@ class download_thread(PauseableThread):
         )
 
     def _diag(self, event, **fields):
-        try:
+        with contextlib.suppress(Exception):
             append_diagnostic_event(self.path, event, stage="step4", **fields)
-        except Exception:
-            pass
 
     def _count_text_lines(self, file_path):
         return count_text_lines(file_path)
@@ -457,18 +582,12 @@ class download_thread(PauseableThread):
         key = str(target_tag).strip().lower()
         if not key:
             return False
-        for tag in artwork_tags:
-            if key in tag:
-                return True
-        return False
+        return any(key in tag for tag in artwork_tags)
 
     def _is_r18g_artwork(self, tag):
         """Gore-adjacent adult content: r-18g / 糞 / 子宮脫."""
         artwork_tags = self._normalize_artwork_tags(tag)
-        for marker in ("r-18g", "糞", "子宮脫"):
-            if self._tag_hit(marker, artwork_tags):
-                return True
-        return False
+        return any(self._tag_hit(marker, artwork_tags) for marker in ("r-18g", "糞", "子宮脫"))
 
     def _is_r18_artwork(self, tag):
         """General adult content (r-18) excluding r-18g markers."""
@@ -536,10 +655,8 @@ class download_thread(PauseableThread):
 
     def _record_step4_filter_skip(self, reason, pid_key=None):
         key = self._bump_step4_skip_count(reason)
-        try:
+        with contextlib.suppress(Exception):
             self._diag("step4_filter_skip", reason=key, pid=str(pid_key or ""))
-        except Exception:
-            pass
         self._maybe_emit_step4_skip_notice()
         self._maybe_emit_step4_skip_summary(self._step4_skip_total())
 
@@ -550,7 +667,7 @@ class download_thread(PauseableThread):
             total = 0
         if total <= 0:
             return
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 "<p><font color='gray'>[Step4過濾完成] 共略過 {} 筆（標籤={}、低愛心={}、無meta={}）</font></p>".format(
                     total,
@@ -560,8 +677,6 @@ class download_thread(PauseableThread):
                 )
             ))
 
-        except Exception:
-            pass
 
     def _refresh_cookie_requirement(self, pid, fallback=None):
         pid_key = normalize_pid(pid)
@@ -640,10 +755,8 @@ class download_thread(PauseableThread):
         if info == [404]:
             db = getattr(self, "_metadata_db", None)
             if db is not None:
-                try:
+                with contextlib.suppress(Exception):
                     db.mark_artwork_revoked(pid)
-                except Exception:
-                    pass
         return self._normalize_pixiv_info(info)
 
     def _build_artwork_headers(self, pid, pid_cookie, need_cookie, *, honour_pid_used=False):
@@ -675,10 +788,8 @@ class download_thread(PauseableThread):
             f"final_status={htmlfile.status_code}"
         )
         if first_try_resp is not None:
-            try:
+            with contextlib.suppress(Exception):
                 print(f"[pixiv_thread] response preview (first): {first_try_resp.text[:500]}")
-            except Exception:
-                pass
         try:
             stage = "retry" if meta_trace.get("retry_used") else "first"
             print(f"[pixiv_thread] response preview ({stage}): {htmlfile.text[:500]}")
@@ -764,19 +875,15 @@ class download_thread(PauseableThread):
         if info == [404]:
             db = getattr(self, "_metadata_db", None)
             if db is not None:
-                try:
+                with contextlib.suppress(Exception):
                     db.mark_artwork_revoked(pid_key)
-                except Exception:
-                    pass
         normalized = self._normalize_pixiv_info(info)
         if not normalized:
             return None
         tag, like, pagecount, img_url = normalized
         meta = self._build_filter_meta_entry(url, tag, like, pagecount, img_url, need_cookie)
-        try:
+        with contextlib.suppress(Exception):
             self.url_meta[pid_key] = meta
-        except Exception:
-            pass
         return meta
 
     def _filter_no_meta_decision(self):
@@ -857,6 +964,9 @@ class download_thread(PauseableThread):
         ("like_num", lambda v: int(v or 0)),
         ("ai_gen_dir", bool),
         ("filename_template", lambda v: str(v or "").strip() or None),
+        ("tag_strip_brackets", bool),
+        ("tag_strip_special_chars", bool),
+        ("author_order", bool),
     ]
 
     @staticmethod
@@ -903,12 +1013,10 @@ class download_thread(PauseableThread):
         """Run special_like_rules through the normalizer when present."""
         if "special_like_rules" not in kwargs:
             return
-        try:
+        with contextlib.suppress(Exception):
             overrides["special_like_rules"] = _normalize_special_like_rules(
                 kwargs.get("special_like_rules", [])
             )
-        except Exception:
-            pass
 
     @staticmethod
     def _apply_legacy_constructor_args(legacy_args, legacy_kwargs):
@@ -957,7 +1065,14 @@ class download_thread(PauseableThread):
 
     def _run_cjxl_once(self, src_path, dst_path):
         cmd = self._build_jxl_command(src_path, dst_path)
-        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        try:
+            completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(Exception):
+                self._q.put(WorkerEvent("output",
+                    f"<p><font color='orange'>JXL 轉檔逾時（120s），跳過：{os.path.basename(str(src_path))}</font></p>"
+                ))
+            return False, "cjxl timeout (120s)"
         if completed.returncode == 0 and os.path.isfile(dst_path):
             return True, ""
         reason = (completed.stderr or completed.stdout or "").strip()
@@ -986,10 +1101,8 @@ class download_thread(PauseableThread):
         except Exception as err:
             return False, str(err)
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 shutil.rmtree(workdir, ignore_errors=True)
-            except Exception:
-                pass
 
     _JXL_SUPPORTED_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 
@@ -998,12 +1111,10 @@ class download_thread(PauseableThread):
         if self._jxl_path_warned:
             return
         self._jxl_path_warned = True
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='orange'>JXL 已啟用，但找不到 cjxl：{self.jxl_cjxl_path}</font></p>"
             ))
-        except Exception:
-            pass
 
     def _handle_existing_jxl_destination(self, src_path):
         """Bump ok counter and optionally delete the original when .jxl already exists."""
@@ -1053,10 +1164,7 @@ class download_thread(PauseableThread):
         if (not ok) and ext != ".gif":
             # Retry with short ASCII temp path to avoid unicode/long-path decode failures.
             ok, reason2 = self._run_cjxl_with_temp_ascii_path(src_path, dst_path)
-            if ok:
-                reason = ""
-            else:
-                reason = reason2 or reason
+            reason = "" if ok else reason2 or reason
         # GIF intentionally does not fall back to first-frame static conversion
         # so animation correctness is preserved.
         return ok, reason
@@ -1105,10 +1213,8 @@ class download_thread(PauseableThread):
         """Delete the source file when jxl_delete_original is True (best-effort)."""
         if not self.jxl_delete_original:
             return
-        try:
+        with contextlib.suppress(Exception):
             os.remove(src_path)
-        except Exception:
-            pass
 
     def _jxl_emit_failure_log(self, src_path, reason):
         """Print the per-file failure log line; trims very long reasons."""
@@ -1116,13 +1222,11 @@ class download_thread(PauseableThread):
         msg = reason if len(reason) <= 120 else reason[:117] + "..."
         if not msg:
             msg = "cjxl conversion failed"
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='orange'>JXL 轉檔失敗：{os.path.basename(src_path)} "
                 f"({msg})</font></p>"
             ))
-        except Exception:
-            pass
 
     def _jxl_record_outcome(self, src_path, dst_path, ok, reason):
         """Update counters, emit log lines and optionally delete the source."""
@@ -1152,9 +1256,15 @@ class download_thread(PauseableThread):
 
     def _jxl_worker_loop(self):
         """Process queued source paths one at a time.  Exits cleanly on the
-        ``None`` sentinel pushed by ``_drain_jxl_queue``."""
-        while True:
-            src_path = self._jxl_queue.get()
+        ``None`` sentinel pushed by ``_drain_jxl_queue``.  Uses a 1-second
+        polling timeout so the thread can exit if the main thread crashes
+        before pushing the sentinel."""
+        import queue as _queue_mod
+        while not self._stop_event.is_set():
+            try:
+                src_path = self._jxl_queue.get(timeout=1.0)
+            except _queue_mod.Empty:
+                continue
             if src_path is None:
                 with contextlib.suppress(Exception):
                     self._jxl_queue.task_done()
@@ -1268,14 +1378,43 @@ class download_thread(PauseableThread):
         )
 
     def _normalize_tag_for_filename(self, raw_tag):
+        """Clean one tag for inclusion in the {hashtag} filename segment.
+
+        Pipeline (in order):
+          1. Strip zero-width / invisible chars (always on — they have no
+             display value but eat filename budget).
+          2. Optionally strip matched-bracket pairs and their content
+             (``tag_strip_brackets`` toggle). Two passes so newly-empty outer
+             pairs after the inner content disappears also get cleaned.
+          3. Optionally strip decorative symbols and the entire emoji range
+             (``tag_strip_special_chars`` toggle).
+          4. Collapse any remaining empty-bracket pairs that survived steps
+             1-3 (cosmetic — Pixiv sometimes ships ``tag（）`` shapes).
+          5. Unify all whitespace variants (full-width, no-break, etc.) into
+             single ASCII space and trim.
+        """
         text = str(raw_tag or "").strip()
         if not text:
             return ""
-        # Remove empty bracket pairs after tag cleanup/transliteration.
+        # 1. Zero-width / invisible chars — drop entirely.
+        text = _ZERO_WIDTH_RE.sub("", text)
+        # 2. Bracket-content stripping (toggle).
+        if getattr(self, "tag_strip_brackets", False):
+            # Two passes: nested brackets like ((a)(b)) → ((a)(b)) loses the
+            # innermost first; the second sub picks up the now-empty outer.
+            text = _BRACKET_CONTENT_RE.sub("", text)
+            text = _BRACKET_CONTENT_RE.sub("", text)
+        # 3. Decorative symbols / emoji (toggle).
+        if getattr(self, "tag_strip_special_chars", False):
+            text = _DECORATIVE_CHARS_RE.sub("", text)
+        # 4. Mop up empty bracket pairs left behind by translation/cleanup.
         text = re.sub(r"\(\s*\)", "", text)
         text = re.sub(r"（\s*）", "", text)
         text = re.sub(r"\[\s*\]", "", text)
         text = re.sub(r"【\s*】", "", text)
+        # 5. Whitespace unification: \s matches 　 (full-width space) and
+        #   (no-break space) in Python 3, so a single \s+ collapse here
+        # handles all width variants the user encounters in Pixiv tags.
         text = re.sub(r"\s+", " ", text).strip()
         text = text.strip(" _-")
         return text
@@ -1392,13 +1531,11 @@ class download_thread(PauseableThread):
         """Print the '[下載等待][label] 等待 N 秒' header at the start of a wait."""
         cookie_used = self._is_cookie_used_for_pid(pid)
         ratio_text = '1.0x' if cookie_used else '0.5x'
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='{color}'>[下載等待][{label}] 等待 {delay} 秒 "
                 f"(PID {pid}, 倍率 {ratio_text}, cookie_used={cookie_used})</font></p>"
             ))
-        except Exception:
-            pass
 
     def _countdown_tick(self, remaining, respect_group_stop):
         """Run one 1-second tick. Returns True iff the loop should break."""
@@ -1412,10 +1549,8 @@ class download_thread(PauseableThread):
             self._pause_event.wait(timeout=0.5)
         if self._stop_event.is_set():
             return True
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("countdown", remaining))
-        except Exception:
-            pass
         return self._stop_event.wait(timeout=1.0)
 
     def _run_download_countdown(self, pid, min_sec, max_sec, *, label, color, respect_group_stop):
@@ -1426,10 +1561,8 @@ class download_thread(PauseableThread):
         for remaining in range(int(delay), 0, -1):
             if self._countdown_tick(remaining, respect_group_stop):
                 break
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("countdown", 0))
-        except Exception:
-            pass
 
     def _sleep_between_downloads(self, pid):
         # Inter-PID cooldown is owned by AccountScheduler.release() when active.
@@ -1663,14 +1796,12 @@ class download_thread(PauseableThread):
             from app.core.safe_io import atomic_write_text
             ordered = sorted(merged, key=lambda s: int(s) if s.isdigit() else s)
             atomic_write_text(pending_path, ordered, backup=False)
-            try:
+            with contextlib.suppress(Exception):
                 self._q.put(WorkerEvent("output",
                     f"<p><font color='orange'>[補meta] {added} 個缺 meta 的 PID "
                     f"已加回 pictures_id.txt（共 {len(merged)} 筆待辦），"
                     f"請再跑一次步驟 3 補抓資料</font></p>"
                 ))
-            except Exception:
-                pass
         except Exception:
             pass
     def _group_urls_by_pid(self, urls):
@@ -1685,6 +1816,38 @@ class download_thread(PauseableThread):
                 order.append(pid)
             groups[pid].append(u)
         return order, groups
+
+    def _reorder_pid_order_by_author(self, pid_order):
+        """Reorder pid_order so same-author works are contiguous.
+
+        Returns ``(flat_order, author_batches)``. Falls back to a single
+        batch (current behavior) when no metadata DB is available."""
+        db = getattr(self, "_metadata_db", None)
+        if db is None:
+            return list(pid_order), [list(pid_order)]
+        try:
+            uid_map = db.user_id_map_for_pids(pid_order)
+        except Exception:
+            return list(pid_order), [list(pid_order)]
+        flat_order, author_batches = compute_author_order(pid_order, uid_map)
+        unknown_count = sum(
+            1 for p in pid_order if not str(uid_map.get(p) or "").strip()
+        )
+        if unknown_count:
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='orange'>[作者排序] {unknown_count} 筆作品作者不明，"
+                f"已排到最後；重跑步驟 2/3 可補作者資料</font></p>"))
+        return flat_order, author_batches
+
+    def _resolve_execution_order(self, pid_order):
+        """Decide final PID sequence + per-author batches for the executors.
+
+        author_order off -> (pid_order unchanged, single batch) [zero regression]
+        author_order on  -> author-grouped reorder
+        """
+        if getattr(self, "author_order", False):
+            return self._reorder_pid_order_by_author(pid_order)
+        return list(pid_order), [list(pid_order)]
 
     def _download_pid_group(self, pid, urls):
         failed = []
@@ -1711,10 +1874,8 @@ class download_thread(PauseableThread):
                 if self._stop_event.is_set():
                     break
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 sess.close()
-            except Exception:
-                pass
         return failed
 
     @staticmethod
@@ -1785,20 +1946,16 @@ class download_thread(PauseableThread):
         return file_list
     
     def _emit_phase(self, text: str) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("phase", text))
-        except Exception:
-            pass
 
     def _emit_step4_header(self):
         self._q.put(WorkerEvent("output", "<p><font color='red'>下載階段開始...</font></p>"))
         self._q.put(WorkerEvent("output", f"<p><font color='red'>Pending URL: {len(self.allurl)}</font></p>"))
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4過濾設定] like_min={self.like_num}, special_rules={len(self.special_like_rules)}, ban_tag={len(self._ban_tag_norm)}, must_tag={len(self._must_tag_norm)}, ai_dir={bool(self.ai_gen_dir)}</font></p>"
             ))
-        except Exception:
-            pass
         if self.jxl_enable:
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>JXL 轉檔啟用：cjxl='{self.jxl_cjxl_path}' effort={self.jxl_effort} delete_original={self.jxl_delete_original}</font></p>"
@@ -1908,33 +2065,43 @@ class download_thread(PauseableThread):
                 self._sleep_between_downloads(pid)
         return failed_nested
 
-    def _execute_downloads_pool(self, pid_order, pid_groups):
-        """Multi-thread per-PID-group download via ThreadPoolExecutor (4 workers)."""
+    def _execute_downloads_pool(self, author_batches, pid_groups):
+        """Multi-thread per-PID-group download via ThreadPoolExecutor.
+
+        Processes ``author_batches`` one batch (= one author) at a time:
+        submit all of a batch's PIDs, drain them (as_completed), then move to
+        the next batch. With a single batch this is identical to the previous
+        submit-all behavior. Author-order strictness is the per-batch barrier.
+        """
         self._q.put(WorkerEvent("output",
             "<p><font color='gray'>下載模式：多執行緒（以 PID 為單位分派；每個 PID 仍共用單一 Session）</font></p>"))
         failed_nested = []
+        total = getattr(self, "_step4_pid_total",
+                        sum(len(b) for b in author_batches))
+        done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as self.executor:
-            futures = [
-                self.executor.submit(self._download_pid_group, pid, pid_groups.get(pid, []))
-                for pid in pid_order
-            ]
-            total = getattr(self, "_step4_pid_total", len(pid_order))
-            done = 0
-            for fu in concurrent.futures.as_completed(futures):
-                try:
-                    failed_nested.append(fu.result())
-                except Exception:
-                    failed_nested.append([])
-                done += 1
-                self._step4_pid_done = done
-                self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
-                self._maybe_flush_url_meta_periodically(done)
+            for batch in author_batches:
+                if self._stop_event.is_set():
+                    break
+                futures = [
+                    self.executor.submit(self._download_pid_group, pid, pid_groups.get(pid, []))
+                    for pid in batch
+                ]
+                for fu in concurrent.futures.as_completed(futures):
+                    try:
+                        failed_nested.append(fu.result())
+                    except Exception:
+                        failed_nested.append([])
+                    done += 1
+                    self._step4_pid_done = done
+                    self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
+                    self._maybe_flush_url_meta_periodically(done)
         return failed_nested
 
-    def _execute_downloads(self, pid_order, pid_groups):
+    def _execute_downloads(self, pid_order, pid_groups, author_batches):
         if self.single_mode_flag:
             return self._execute_downloads_single(pid_order, pid_groups)
-        return self._execute_downloads_pool(pid_order, pid_groups)
+        return self._execute_downloads_pool(author_batches, pid_groups)
 
     @staticmethod
     def _classify_one_fail_item(item):
@@ -1997,7 +2164,8 @@ class download_thread(PauseableThread):
 
     def _init_metadata_db(self, json_meta):
         """Open the SQLite metadata cache and migrate JSON contents on first use."""
-        return open_metadata_db(self.path, json_meta, event_log=getattr(self, "_event_log", None))
+        base = getattr(self, "_db_base", None) or self.path
+        return open_metadata_db(base, json_meta, event_log=getattr(self, "_event_log", None))
 
     def _emit_metadata_db_stats(self, stage="Step"):
         """Print a one-liner with current SQLite cache size."""
@@ -2041,10 +2209,8 @@ class download_thread(PauseableThread):
         db = getattr(self, "_metadata_db", None)
         if db is None or not pid_key:
             return
-        try:
+        with contextlib.suppress(Exception):
             db.upsert_meta(pid_key, **self._meta_to_db_kwargs(meta))
-        except Exception:
-            pass
 
     def _persist_url_meta(self):
         """Sync self.url_meta to SQLite (DB is now the primary store)."""
@@ -2080,7 +2246,12 @@ class download_thread(PauseableThread):
             atomic_write_text(self.path + "/err_url.txt", err_lines, backup=False)
             self._shadow_mark_failures(fail_records)
         self._diag("step4_fail_records", fail_record_count=len(fail_records))
-        stop_to_download = [self.q.get() for _ in range(self.q.qsize())]
+        stop_to_download = []
+        while True:
+            try:
+                stop_to_download.append(self.q.get_nowait())
+            except Empty:
+                break
         remaining_urls = self._compute_remaining_urls(stop_to_download, fail_records)
         self._mark_completed_urls_in_db(fail_records)
         self._write_all_url_file(remaining_urls, reason="step4_remaining")
@@ -2114,16 +2285,19 @@ class download_thread(PauseableThread):
             pass
 
     def _maybe_flush_exist_pid(self, pid: str) -> None:
-        """Add pid to exist_pid and mark downloaded in DB immediately."""
+        """Add pid to exist_pid and mark it closed in DB immediately.
+
+        Uses :meth:`~MetadataDB.import_downloaded_set` which writes a
+        sentinel ``artworks`` row — visible to ``v_closed_artworks`` and
+        therefore to :meth:`~MetadataDB.is_downloaded`.
+        """
         pid_key = normalize_pid(pid) or str(pid)
         if pid_key:
             self.exist_pid.add(pid_key)
             db = getattr(self, "_metadata_db", None)
             if db is not None:
-                try:
-                    db.mark_downloaded(pid_key)
-                except Exception:
-                    pass
+                with contextlib.suppress(Exception):
+                    db.import_downloaded_set([pid_key])
 
     # 每 N 個 PID 組之後額外 flush url_meta；exist_pid + DB 已逐筆寫，
     # 這裡只是把每組 cookie_used / requires_cookie 等 url_meta 變動推到 DB。
@@ -2139,28 +2313,20 @@ class download_thread(PauseableThread):
             return
         if done_count % every != 0:
             return
-        try:
+        with contextlib.suppress(Exception):
             self._persist_url_meta()
-        except Exception:
-            pass
 
-    def _refresh_and_write_exist_pid(self):
-        # Merge disk state into memory (full scan catches PIDs from previous runs)
-        disk_pids = load_exist_pid_set(self.path)
-        self.exist_pid.update(disk_pids)
-        download_id = self.splitID(self.get_filelist(self.download_path))
-        self.exist_pid.update(download_id)
-        # SQLite is now the primary store — bulk sync the final set
+    def _sync_exist_pid_to_db(self):
+        """Bulk-sync the current exist_pid set into the canonical DB.
+
+        Replaces the old ``_refresh_and_write_exist_pid`` which additionally
+        scanned the download folder and wrote a JSON file.  Now that the DB
+        is the sole source of truth, we only need the sentinel import.
+        """
         db = getattr(self, "_metadata_db", None)
         if db is not None:
-            try:
+            with contextlib.suppress(Exception):
                 db.import_downloaded_set(self.exist_pid)
-            except Exception:
-                pass
-        # Trash any remaining legacy files
-        for old in [self.legacy_exist_json_path, self.exist_txt_path]:
-            if os.path.isfile(old):
-                trash_file(old, self.path)
 
     def _emit_step4_summary_and_finalize(self, remaining_urls):
         if self.jxl_enable:
@@ -2236,23 +2402,26 @@ class download_thread(PauseableThread):
                 return
             self._emit_phase("步驟 4：分組 PID 中...")
             self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[Step4] 開始 PID 分組...</font></p>"))
+                "<p><font color='gray'>[Step4] 開始 PID 分組...</font></p>"))
             pid_order, pid_groups = self._group_urls_by_pid(self.allurl)
+            if getattr(self, "author_order", False):
+                self._emit_phase("步驟 4：依作者排序中...")
+            pid_order, author_batches = self._resolve_execution_order(pid_order)
             self._diag("step4_grouped", pid_count=len(pid_order), url_count=len(self.allurl))
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4] PID 分組完成：{len(pid_order)} 個 PID、{len(self.allurl)} 個 URL</font></p>"))
             self._emit_phase(f"步驟 4：下載中（0 / {len(pid_order)} PID 完成）")
             self._step4_pid_total = len(pid_order)
             self._step4_pid_done = 0
-            failed_nested = self._execute_downloads(pid_order, pid_groups)
+            failed_nested = self._execute_downloads(pid_order, pid_groups, author_batches)
             self._emit_phase("步驟 4：整理失敗項目...")
             self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[Step4] 下載迴圈結束，整理失敗項目中...</font></p>"))
+                "<p><font color='gray'>[Step4] 下載迴圈結束，整理失敗項目中...</font></p>"))
             remaining_urls = self._finalize_downloads(failed_nested)
             self._emit_phase("步驟 4：更新已下載紀錄...")
             self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[Step4] 寫入已下載 PID 紀錄...</font></p>"))
-            self._refresh_and_write_exist_pid()
+                "<p><font color='gray'>[Step4] 寫入已下載 PID 紀錄...</font></p>"))
+            self._sync_exist_pid_to_db()
             self._emit_phase("步驟 4：產生摘要...")
             self._emit_step4_summary_and_finalize(remaining_urls)
             self._emit_phase("")
@@ -2352,10 +2521,8 @@ class download_thread(PauseableThread):
     def _mark_gif_cookie_usage(self, pid, used, source="unknown"):
         pid_key = normalize_pid(pid) or str(pid)
         used_flag = bool(used)
-        try:
+        with contextlib.suppress(Exception):
             self._pid_cookie_used[pid_key] = used_flag
-        except Exception:
-            pass
         if not used_flag:
             return
 
@@ -2371,12 +2538,10 @@ class download_thread(PauseableThread):
             if lock is not None:
                 lock.release()
 
-        try:
+        with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='blue'>[GIF][Cookie] PID {pid_key} 使用 cookies（來源：{source}），已更新 all_url_meta 暫存</font></p>"
             ))
-        except Exception:
-            pass
 
     def _stream_ugoira_zip_bytes(self, url, headers, http, pid_cookie):
         """Fetch a ugoira zip URL and return the full bytes blob (or None on error).
@@ -2394,9 +2559,6 @@ class download_thread(PauseableThread):
             return None
         if resp.status_code != 200:
             return None
-        with self.timelock:
-            self.download_time = self.download_time + datetime.timedelta(seconds=1)
-            print(datetime.datetime.strftime(self.download_time, '%Y-%m-%d %H:%M:%S'))
         chunks = [data for data in resp.iter_content(chunk_size=65536) if data]
         zip_bytes = b"".join(chunks)
         if self._stats_collector is not None and zip_bytes:
@@ -2436,7 +2598,7 @@ class download_thread(PauseableThread):
 
     def _diag_ugoira_meta_fetch(self, pid, meta_trace):
         """Append a step4 diagnostic record describing the ugoira meta fetch result."""
-        try:
+        with contextlib.suppress(Exception):
             self._diag(
                 "ugoira_meta_fetch",
                 pid=str(pid),
@@ -2445,8 +2607,6 @@ class download_thread(PauseableThread):
                 retry_with_cookie_status=meta_trace.get("retry_with_cookie_status"),
                 final_status=meta_trace.get("final_status"),
             )
-        except Exception:
-            pass
 
     def _maybe_mark_meta_retry_cookie(self, pid, meta_trace):
         """If the with-cookie retry succeeded, record cookie usage and return True."""
@@ -2476,7 +2636,7 @@ class download_thread(PauseableThread):
     def _fetch_ugoira_meta(self, pid, pid_cookie, need_cookie, session):
         """Fetch ugoira_meta with cookie-retry. Returns (download_url, delay_info, need_cookie)
         on success, or ``None`` on any failure (404 / parse error / non-200)."""
-        url = 'https://www.pixiv.net/ajax/illust/%s/ugoira_meta?lang=zh_tw' % pid
+        url = f'https://www.pixiv.net/ajax/illust/{pid}/ugoira_meta?lang=zh_tw'
         headers = self._build_artwork_headers(pid, pid_cookie, need_cookie)
         self._mark_gif_cookie_usage(
             pid,
@@ -2508,17 +2668,16 @@ class download_thread(PauseableThread):
         return download_url, delay_info, need_cookie
 
     def gif_download(self, url, session=None):
-        my_time = self.download_time
+        with self.timelock:
+            my_time = self.download_time
         try:
             pid, pid_cookie, need_cookie = self._resolve_pid_and_cookie(url, source="step4")
             normalized = self._load_artwork_metadata(pid, pid_cookie)
             if not normalized:
-                try:
+                with contextlib.suppress(Exception):
                     self._q.put(WorkerEvent("output",
                         f"<p><font color='orange'>PID {pid} 取得 ugoira 資訊失敗，"
                         f"已標記為失敗任務</font></p>"))
-                except Exception:
-                    pass
                 return [url, my_time.strftime('%Y%m%d_%H%M%S')]
             tag, like, pagecount, img_url = normalized
             meta = self._fetch_ugoira_meta(pid, pid_cookie, need_cookie, session)
@@ -2528,7 +2687,9 @@ class download_thread(PauseableThread):
             url = download_url
             http = session if session is not None else requests
             headers = self._build_artwork_headers(pid, pid_cookie, need_cookie, honour_pid_used=True)
-            my_time = self.download_time
+            with self.timelock:
+                my_time = self.download_time
+                self.download_time = self.download_time + datetime.timedelta(seconds=1)
             zip_bytes = self._stream_ugoira_zip_bytes(url, headers, http, pid_cookie)
             if not zip_bytes:
                 return [url, my_time.strftime('%Y%m%d_%H%M%S')]
@@ -2614,17 +2775,13 @@ class download_thread(PauseableThread):
         if like == 404 and tag == 404:
             db = getattr(self, "_metadata_db", None)
             if db is not None:
-                try:
+                with contextlib.suppress(Exception):
                     db.mark_artwork_revoked(pid)
-                except Exception:
-                    pass
             return 0  # treat as success — nothing to download
         page, picture_format = self._jpg_extract_page_and_format(url)
         headers = self._jpg_build_headers(pid, pid_cookie, need_cookie)
-        try:
+        with contextlib.suppress(Exception):
             self._pid_cookie_used[str(pid)] = bool(need_cookie is True and pid_cookie)
-        except Exception:
-            pass
         http = session if session is not None else requests
         htmlfile = http.get(url, headers=headers, stream=True, timeout=5)
         htmlfile.raise_for_status()
@@ -2674,16 +2831,12 @@ class download_thread(PauseableThread):
         flush completes even when the process is about to be killed; safe to
         call multiple times (best-effort throughout).
         """
-        try:
+        with contextlib.suppress(Exception):
             self._persist_url_meta()
-        except Exception:
-            pass
         db = getattr(self, "_metadata_db", None)
         if db is not None:
-            try:
+            with contextlib.suppress(Exception):
                 db.close()
-            except Exception:
-                pass
 
     def stop(self):
         if self.single_mode_flag:

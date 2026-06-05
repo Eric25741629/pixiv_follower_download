@@ -15,11 +15,11 @@ from app.core.worker_event import WorkerEvent
 from app.core.account_scheduler import AccountState, AccountScheduler
 from app.core.proxy_utils import parse_proxy_url
 from app.core.pixiv_thread_utils import (
-    safe_read_json, load_exist_pid_set, normalize_cookie_entries, backup_file,
-    sync_exist_pid_with_download_folder,
+    safe_read_json, normalize_cookie_entries, sync_exist_pid_with_download_folder,
 )
-from app.core.metadata_db import DB_FILENAME
+from app.core.metadata_db import DB_FILENAME, MetadataDB
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
+import contextlib
 
 DEFAULT_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -30,6 +30,18 @@ DEFAULT_AGENT = (
 # this window. Cookies that hit a runtime error (proxy_dead) get marked
 # 失效 in settings, so the cache invalidates itself when something breaks.
 _RETEST_INTERVAL_SEC = 30 * 86400  # 30 days
+
+
+def _coerce_int(value, default: int) -> int:
+    """Tolerant int parse for settings.json values that may be hand-edited.
+
+    Falls back to *default* on TypeError/ValueError. Keeps thread construction
+    from crashing when a user pastes a non-numeric value into a settings field.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _data_path() -> str:
@@ -55,10 +67,8 @@ def _read_event_log_cfg() -> dict:
 
 def _write_event_log_cfg(new_cfg: dict) -> None:
     """Persist new_cfg as the event_log section. Silently ignored on error."""
-    try:
+    with contextlib.suppress(Exception):
         _store().update_fields("event_log", new_cfg)
-    except Exception:
-        pass
 
 
 def _agent(auth: dict) -> str:
@@ -83,6 +93,8 @@ class RunController:
     # Class-level default so tests that do ``RunController.__new__(RunController)``
     # (bypassing __init__) can still read ``self._event_log`` without AttributeError.
     _event_log = None
+
+    force_combined = False  # CLI 'combined' step sets this to force combined mode
 
     def __init__(self, main_view, event_q: Queue, stats_collector=None, event_log=None):
         self._main_view = main_view
@@ -121,6 +133,21 @@ class RunController:
                 return
 
             _write_event_log_cfg({**cfg, "last_snapshot_date": today})
+
+            # STR3: the snapshot is a verified, fsync'd full DB image, so event
+            # files fully older than it are redundant. Prune them (keeping a
+            # 2-day margin for tools/replay_events.py), bounding the log to a
+            # small tail by construction. compact_before_date never crosses the
+            # latest anchor or the current file.
+            try:
+                if self._event_log is not None:
+                    import datetime as _dt
+                    cutoff = (
+                        _dt.datetime.now() - _dt.timedelta(days=2)
+                    ).strftime("%Y%m%d")
+                    self._event_log.compact_before_date(cutoff)
+            except Exception:
+                pass
         except Exception:
             # Best-effort; never break Run All if snapshot fails.
             pass
@@ -468,7 +495,7 @@ class RunController:
             agent,
             path,
             self._attach_aliases(valid_cookies, auth),
-            load_exist_pid_set(path),  # PHASE-A: Phase B → MetadataDB(path).closed_artwork_set()
+            MetadataDB(path).closed_artwork_set(),
             bool(perf.get("single_thread_mode", False)),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
@@ -544,7 +571,7 @@ class RunController:
             Author_list=authors,
             Agent=agent,
             cookies=self._attach_aliases(valid_cookies, auth),
-            exist_pid=load_exist_pid_set(path),  # PHASE-A: Phase B → MetadataDB(path).closed_artwork_set()
+            exist_pid=MetadataDB(path).closed_artwork_set(),
             ban_tag=list(dl.get("ban_tag", [])),
             must_tag=list(dl.get("must_tag", [])),
             like_num=int(dl.get("like_num", 0)),
@@ -556,6 +583,52 @@ class RunController:
             special_like_rules=[],
             stats_collector=self._stats_collector,
             event_log=self._event_log,
+            rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
+        )
+        t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
+        return t
+
+    def _build_combined(self, auth, agent, dl, flt, perf, directory, jxl, path):
+        authors = _load_author_list()
+        valid_cookies = self._validate_cookies_for_step(auth, agent, 3)
+        if not valid_cookies:
+            return None
+        dl_path = str(dl.get("path", "")).strip()
+        if not dl_path:
+            self._log("<p><font color='red'>請先在「設定」指定下載路徑</font></p>")
+            return None
+        self._sync_exist_pid_from_download_folder(dl_path, path, step_num=3)
+        from app.core import thread_combined
+        t = thread_combined.combined_thread(
+            q=self._event_q, Author_list=authors, Agent=agent,
+            cookies=self._attach_aliases(valid_cookies, auth),
+            exist_pid=MetadataDB(path).closed_artwork_set(),
+            ban_tag=list(dl.get("ban_tag", [])),
+            must_tag=list(dl.get("must_tag", [])),
+            like_num=int(dl.get("like_num", 0)), no_to_check=[], base_path=path,
+            single_thread_mode=bool(perf.get("single_thread_mode", False)),
+            download_path=dl_path,
+            download_time=self._parse_download_time(dl.get("download_time")),
+            nogif=bool(flt.get("nogif", False)), notag=bool(flt.get("notag", False)),
+            notime=bool(flt.get("notime", False)),
+            create_dir=bool(directory.get("create_dir", False)),
+            no_R18G_dir=bool(directory.get("no_R18G_dir", False)),
+            no_R18_dir=bool(directory.get("no_R18_dir", False)),
+            intra_pid_wait_min=int(perf.get("intra_pid_wait_min", 5)),
+            intra_pid_wait_max=int(perf.get("intra_pid_wait_max", 15)),
+            pid_wait_nocookie_min=int(perf.get("pid_wait_nocookie_min", 1)),
+            pid_wait_nocookie_max=int(perf.get("pid_wait_nocookie_max", 6)),
+            jxl_enable=bool(jxl.get("enable", False)),
+            jxl_cjxl_path=str(jxl.get("cjxl_path", "")),
+            jxl_delete_original=bool(jxl.get("delete_original", False)),
+            jxl_effort=int(jxl.get("effort", 7)),
+            ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
+            filename_template=str(dl.get("filename_template", "") or ""),
+            tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
+            tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
+            author_order=bool(dl.get("author_order", False)),
+            rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
+            stats_collector=self._stats_collector, event_log=self._event_log,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
@@ -606,6 +679,9 @@ class RunController:
             special_like_rules=[],
             ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
             filename_template=str(dl.get("filename_template", "") or ""),
+            tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
+            tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
+            author_order=bool(dl.get("author_order", False)),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
         )
@@ -628,6 +704,8 @@ class RunController:
         if n == 2:
             return self._build_step2(auth, agent, perf, path)
         if n == 3:
+            if bool(dl.get("combined_mode", False)) or getattr(self, "force_combined", False):
+                return self._build_combined(auth, agent, dl, flt, perf, directory, jxl, path)
             return self._build_step3(auth, agent, dl, perf, path)
         if n == 4:
             return self._build_step4(auth, agent, dl, flt, perf, directory, jxl)

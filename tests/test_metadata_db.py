@@ -38,6 +38,28 @@ def test_upsert_and_read_meta(tmp_path):
     db.close()
 
 
+def test_get_meta_returns_upload_date(tmp_path):
+    """get_meta() must surface upload_date so the rescrape-window staleness
+    check in thread_url_fetch can compare it against now. Regression: before
+    this was added, the SELECT omitted upload_date and the rescrape feature
+    silently no-op'd for every PID that lived only in the DB (i.e. all PIDs
+    after the first run, since the in-memory url_meta cache starts empty)."""
+    db = MetadataDB(str(tmp_path))
+    db.upsert_artwork(
+        "98765",
+        page_count=2,
+        like_count=100,
+        tags=["x"],
+        img_url_template="https://i.pximg.net/.../98765_p.jpg",
+        upload_date="2024-01-15T12:30:00+09:00",
+        meta_updated_at="2026-05-01T00:00:00",
+    )
+    out = db.get_meta("98765")
+    assert out is not None
+    assert out["upload_date"] == "2024-01-15T12:30:00+09:00"
+    db.close()
+
+
 def test_upsert_partial_update_preserves_other_fields(tmp_path):
     db = MetadataDB(str(tmp_path))
     db.upsert_meta("1", tags=["a"], like_count=10, page_count=1, img_url="u")
