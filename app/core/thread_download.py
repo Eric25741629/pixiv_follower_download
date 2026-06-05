@@ -191,6 +191,8 @@ class download_thread(PauseableThread):
         stats_collector=None,
         *legacy_args,
         event_log=None,
+        defer_step4_scan=False,
+        db_base_path=None,
         **legacy_kwargs,
     ):
         super().__init__(q, scheduler=scheduler)
@@ -226,11 +228,24 @@ class download_thread(PauseableThread):
         self._init_step4_paths_and_state()
 
         os.makedirs(self.download_path, exist_ok=True)
+        # The metadata DB may live in a different directory than ``self.path``
+        # (combined mode shares the fetcher's data dir while keeping err_url /
+        # all_url writes under ``self.path``). ``self.path`` is left untouched.
+        self._db_base = db_base_path or self.path
         # Order matters: ``_load_initial_exist_pid_set`` now reads from
         # ``v_closed_artworks`` in the SQLite cache, so ``_metadata_db``
         # has to be initialised first.
         self.url_meta = self._load_initial_url_meta()
         self._metadata_db = self._init_metadata_db(self.url_meta)
+        if defer_step4_scan:
+            # Lightweight init: skip the Step-4-only heavy scans (closed-set
+            # read, mirror, stats, all_url load + task prep). Safe defaults
+            # keep every attribute the rest of the class reads present.
+            self.exist_pid = set()
+            self.allurl = []
+            self._task_filter_stats = {}
+            self.pid_max = 0
+            return
         self.exist_pid = self._load_initial_exist_pid_set()
         self._mirror_exist_pid_to_db()
         self._emit_metadata_db_stats(stage="Step4")
@@ -2149,7 +2164,8 @@ class download_thread(PauseableThread):
 
     def _init_metadata_db(self, json_meta):
         """Open the SQLite metadata cache and migrate JSON contents on first use."""
-        return open_metadata_db(self.path, json_meta, event_log=getattr(self, "_event_log", None))
+        base = getattr(self, "_db_base", None) or self.path
+        return open_metadata_db(base, json_meta, event_log=getattr(self, "_event_log", None))
 
     def _emit_metadata_db_stats(self, stage="Step"):
         """Print a one-liner with current SQLite cache size."""
