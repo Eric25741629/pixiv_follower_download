@@ -85,6 +85,11 @@ class SettingsView:
             value=bool(dl.get("author_order", False)),
             tooltip="開啟後，步驟 4 會把同一作者的作品連續下載完（PID 由大到小）再換下一位；作者不明的作品排到最後",
         )
+        self._sw_combined_mode = ft.Switch(
+            label="邊查邊下（查到即下載，合併步驟三、四）",
+            value=bool(dl.get("combined_mode", False)),
+            tooltip="開啟後，步驟 3 會逐一查詢 PID 並立即下載該 PID 的頁面（查詢與下載共用同一次帳號冷卻）；同時自動吸收上次未完成的下載",
+        )
 
         self._ban_tags: list[str] = list(dl.get("ban_tag", []))
         self._must_tags: list[str] = list(dl.get("must_tag", []))
@@ -387,6 +392,7 @@ class SettingsView:
             "tag_strip_brackets": bool(self._sw_tag_strip_brackets.value),
             "tag_strip_special_chars": bool(self._sw_tag_strip_special_chars.value),
             "author_order": bool(self._sw_author_order.value),
+            "combined_mode": bool(self._sw_combined_mode.value),
         })
         store.update_multiple({
             "filter": {
@@ -499,6 +505,7 @@ class SettingsView:
                     ),
                     ft.Text("下載順序", size=12),
                     self._sw_author_order,
+                    self._sw_combined_mode,
                 ]),
                 _tile("資料夾分類", [
                     ft.Text(
