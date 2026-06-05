@@ -91,6 +91,25 @@ class SettingsView:
             tooltip="開啟後，步驟 3 會逐一查詢 PID 並立即下載該 PID 的頁面（查詢與下載共用同一次帳號冷卻）；同時自動吸收上次未完成的下載",
         )
 
+        sch = store.get_section("schedule")
+        self._sw_schedule_enabled = ft.Switch(
+            label="啟用排程（定時自動 Run All）",
+            value=bool(sch.get("enabled", False)),
+        )
+        self._dd_schedule_mode = ft.Dropdown(
+            label="排程方式",
+            value=str(sch.get("mode", "daily")),
+            options=[ft.dropdown.Option("daily", "每日固定時間"),
+                     ft.dropdown.Option("interval", "固定間隔")],
+            width=200,
+        )
+        self._tf_schedule_time = ft.TextField(
+            label="每日時間 (HH:MM)", value=str(sch.get("time", "03:00")), width=160,
+        )
+        self._tf_schedule_interval = ft.TextField(
+            label="間隔 (小時)", value=str(sch.get("interval_hours", 6)), width=160,
+        )
+
         self._ban_tags: list[str] = list(dl.get("ban_tag", []))
         self._must_tags: list[str] = list(dl.get("must_tag", []))
         self._ban_tag_row = ft.Row(wrap=True, spacing=4)
@@ -394,6 +413,14 @@ class SettingsView:
             "author_order": bool(self._sw_author_order.value),
             "combined_mode": bool(self._sw_combined_mode.value),
         })
+        store.update_section("schedule", {
+            "enabled": bool(self._sw_schedule_enabled.value),
+            "mode": str(self._dd_schedule_mode.value or "daily"),
+            "time": str(self._tf_schedule_time.value or "03:00"),
+            "interval_hours": int(self._tf_schedule_interval.value or 6)
+                if str(self._tf_schedule_interval.value or "").strip().isdigit() else 6,
+            "action": "run_all",
+        })
         store.update_multiple({
             "filter": {
                 **store.get_section("filter"),
@@ -559,6 +586,12 @@ class SettingsView:
                 _tile("User-Agent 設定", [
                     ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
                     self._label_ua_status,
+                ]),
+                _tile("排程", [
+                    self._sw_schedule_enabled,
+                    self._dd_schedule_mode,
+                    self._tf_schedule_time,
+                    self._tf_schedule_interval,
                 ]),
                 ft.Container(content=save_btn, padding=ft.Padding.only(top=8)),
             ],
