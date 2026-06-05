@@ -94,6 +94,7 @@ class combined_thread(PauseableThread):
             tag_strip_special_chars=tag_strip_special_chars,
             author_order=author_order, stats_collector=stats_collector,
             event_log=event_log,
+            defer_step4_scan=True, db_base_path=self.path,
         )
 
         # Share one set of control events + one DB connection.
@@ -206,6 +207,13 @@ class combined_thread(PauseableThread):
                 else:
                     self._mark_urls_done(urls)
                     self.downloader._maybe_flush_exist_pid(pid)
+                    # A queried PID's meta lives only in the fetcher's
+                    # in-memory url_meta until _finalize. Persist it now so
+                    # page_count + meta_updated_at land immediately, making
+                    # v_complete_artworks / v_closed_artworks exact and
+                    # crash-safe. Download-only PIDs already have DB meta.
+                    if needs_query:
+                        self._persist_pid_meta(pid)
         finally:
             self.downloader._current_account = None
             self._release_account(acc, ok=ok and download_ok)
@@ -231,6 +239,22 @@ class combined_thread(PauseableThread):
             return
         with contextlib.suppress(Exception):
             db.mark_urls_done(list(urls))
+
+    def _persist_pid_meta(self, pid):
+        """Persist a queried PID's meta (page_count, etc.) to the DB now.
+
+        Called only for needs_query clean-success PIDs so the canonical
+        v_complete_artworks / v_closed_artworks views become exact at the
+        moment of success instead of waiting for _finalize.
+        """
+        db = self.fetcher._metadata_db
+        if db is None:
+            return
+        key = normalize_pid(pid) or str(pid)
+        entry = (self.fetcher.url_meta or {}).get(key)
+        if isinstance(entry, dict):
+            with contextlib.suppress(Exception):
+                db.import_meta_dict({key: entry})
 
     def _emit(self, html):
         with contextlib.suppress(Exception):
@@ -279,9 +303,21 @@ class combined_thread(PauseableThread):
             self.fetcher._flush_url_meta_snapshot()
             self.fetcher._persist_pending_pid_file()
             self.fetcher._flush_revoked_pid_file()
-        # Downloader side: err_url + DB completion marks.
+        # Downloader side: failures only. We do NOT call
+        # _finalize_downloads — under defer_step4_scan downloader.allurl is []
+        # so its all_url.txt rewrite would clobber the file, and its DB
+        # completion marks are redundant (combined marks per-PID via
+        # _mark_urls_done). Record err_url + shadow-mark failed pages only.
         with contextlib.suppress(Exception):
-            self.downloader._finalize_downloads(failed_nested)
+            fail_records = self.downloader._classify_download_results(failed_nested)
+            if fail_records:
+                from app.core.pixiv_thread_utils import atomic_write_text
+                atomic_write_text(
+                    self.downloader.path + "/err_url.txt",
+                    [f"{u} {i}" for (u, i) in fail_records],
+                    backup=False,
+                )
+                self.downloader._shadow_mark_failures(fail_records)
         self._emit("<p><font color='green'>邊查邊下完成</font></p>")
         self._q.put(WorkerEvent("finished", "邊查邊下完成"))
         self._q.put(WorkerEvent("next", -1))  # terminal: Run All stops here
