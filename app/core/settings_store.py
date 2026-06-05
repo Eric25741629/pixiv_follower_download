@@ -99,6 +99,13 @@ DEFAULTS = {
         # Roll the day's file to the next sequence once it exceeds this size.
         "rotate_size_bytes": 134217728,   # 128 MB
     },
+    "schedule": {
+        "enabled": False,
+        "mode": "daily",          # "daily" | "interval"
+        "time": "03:00",          # daily mode trigger, HH:MM 24h local
+        "interval_hours": 6,       # interval mode period
+        "action": "run_all",      # fixed: Run All (1 -> 2 -> combined)
+    },
 }
 
 LEGACY_FILES = [
