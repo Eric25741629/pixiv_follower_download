@@ -94,6 +94,8 @@ class RunController:
     # (bypassing __init__) can still read ``self._event_log`` without AttributeError.
     _event_log = None
 
+    force_combined = False  # CLI 'combined' step sets this to force combined mode
+
     def __init__(self, main_view, event_q: Queue, stats_collector=None, event_log=None):
         self._main_view = main_view
         self._event_q = event_q
@@ -702,7 +704,7 @@ class RunController:
         if n == 2:
             return self._build_step2(auth, agent, perf, path)
         if n == 3:
-            if bool(dl.get("combined_mode", False)):
+            if bool(dl.get("combined_mode", False)) or getattr(self, "force_combined", False):
                 return self._build_combined(auth, agent, dl, flt, perf, directory, jxl, path)
             return self._build_step3(auth, agent, dl, perf, path)
         if n == 4:
