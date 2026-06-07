@@ -507,6 +507,9 @@ def _dispatch_table():
                            discovered_at=e.get("discovered_at"),
                            user_id=e.get("user_id"))
 
+    def _artwork_user_id_backfill(db, e):
+        db.backfill_user_ids(e.get("pids", []), e.get("user_id"))
+
     def _artwork_revoked(db, e):
         db.mark_artwork_revoked(pid=e["pid"], revoked_at=e.get("revoked_at"))
 
@@ -525,6 +528,7 @@ def _dispatch_table():
         "pages.downloaded_bulk": _pages_downloaded_bulk,
         "artwork.upsert": _artwork_upsert,
         "artwork.discovered": _artwork_discovered,
+        "artwork.user_id_backfill": _artwork_user_id_backfill,
         "artwork.revoked": _artwork_revoked,
         "artwork.imported_set": _artwork_imported_set,
         "session.start": _noop,
@@ -562,9 +566,13 @@ def replay(
 ) -> ReplayResult:
     """Rebuild a DB at db_path from snapshot (optional) + all events in log_dir.
 
-    Restore snapshot first (via SQLite backup API), then apply every event with
-    timestamp > snapshot's. If no snapshot is provided, apply everything from
-    the start of the log.
+    Restore snapshot first (via SQLite backup API), then apply every event whose
+    timestamp is >= the snapshot's (a strict '<' cutoff for *skipping*). The
+    boundary millisecond is re-applied rather than skipped because 't' is only
+    millisecond-resolution: an event emitted in the same millisecond as the
+    snapshot but AFTER the backup ran must not be dropped, and re-applying is
+    idempotent. If no snapshot is provided, apply everything from the start of
+    the log.
     """
     import sqlite3
     from app.core.metadata_db import DB_FILENAME, MetadataDB
@@ -596,7 +604,7 @@ def replay(
     result = ReplayResult()
     if dry_run:
         for ev in _iter_events(log_dir):
-            if snapshot_ts and ev.get("t", "") <= snapshot_ts:
+            if snapshot_ts and ev.get("t", "") < snapshot_ts:
                 result.skipped_pre_snapshot += 1
             else:
                 result.applied += 1
@@ -606,7 +614,13 @@ def replay(
     dispatch = _dispatch_table()
     try:
         for ev in _iter_events(log_dir):
-            if snapshot_ts and ev.get("t", "") <= snapshot_ts:
+            # Strict '<': re-apply the snapshot's own millisecond instead of
+            # skipping it. 't' is millisecond-resolution, so a mutation emitted
+            # in the same ms as the snapshot but AFTER the backup ran would be
+            # dropped by '<='. Re-applying the boundary ms is safe (every
+            # dispatched mutation is INSERT OR IGNORE / ON CONFLICT idempotent),
+            # whereas dropping a post-snapshot event silently loses data.
+            if snapshot_ts and ev.get("t", "") < snapshot_ts:
                 result.skipped_pre_snapshot += 1
                 continue
             handler = dispatch.get(ev.get("k", ""))

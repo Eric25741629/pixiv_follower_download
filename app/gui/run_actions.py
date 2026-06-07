@@ -479,7 +479,7 @@ class RunController:
             bool(flt.get("hidefollow", False)),
         )
 
-    def _build_step2(self, auth, agent, perf, path):
+    def _build_step2(self, auth, agent, dl, perf, path):
         authors = _load_author_list()
         if not authors:
             self._log(
@@ -489,6 +489,10 @@ class RunController:
         valid_cookies = self._validate_cookies_for_step(auth, agent, 2)
         if not valid_cookies:
             return None
+        force_rescan = (
+            bool(dl.get("force_full_rescan", False))
+            or bool(getattr(self, "force_rescan", False))
+        )
         t = thread_pid_scan.get_pixiv_author_imgID_Thread(
             self._event_q,
             authors,
@@ -499,7 +503,15 @@ class RunController:
             bool(perf.get("single_thread_mode", False)),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
+            author_order=bool(dl.get("author_order", False)),
+            force_rescan=force_rescan,
         )
+        # One-shot: consume the GUI flag so later Step 2 runs stop ignoring the
+        # 30-day skip. (The CLI --force-rescan path sets self.force_rescan, which
+        # is per-invocation and needs no reset.)
+        if dl.get("force_full_rescan", False):
+            with contextlib.suppress(Exception):
+                _store().update_fields("download", {"force_full_rescan": False})
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
 
@@ -702,7 +714,7 @@ class RunController:
         if n == 1:
             return self._build_step1(auth, agent, flt)
         if n == 2:
-            return self._build_step2(auth, agent, perf, path)
+            return self._build_step2(auth, agent, dl, perf, path)
         if n == 3:
             if bool(dl.get("combined_mode", False)) or getattr(self, "force_combined", False):
                 return self._build_combined(auth, agent, dl, flt, perf, directory, jxl, path)

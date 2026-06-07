@@ -136,7 +136,7 @@ def _cmd_following_export(args) -> int:
 
 def _cmd_run(args) -> int:
     from app.cli.headless_runner import run_headless
-    return run_headless(args.step)
+    return run_headless(args.step, force_rescan=bool(getattr(args, "force_rescan", False)))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,6 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("run", help="run a pipeline step / all / combined")
     pr.add_argument("--step", required=True,
                     choices=["1", "2", "3", "4", "combined", "all"])
+    pr.add_argument("--force-rescan", action="store_true",
+                    help="Step 2 only: ignore the 30-day skip and re-scan all "
+                         "artists to backfill author user_id")
     pr.set_defaults(func=_cmd_run)
 
     ps = sub.add_parser("status", help="print DB status")

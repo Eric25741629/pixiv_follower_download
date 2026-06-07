@@ -90,6 +90,11 @@ class SettingsView:
             value=bool(dl.get("combined_mode", False)),
             tooltip="開啟後，步驟 3 會逐一查詢 PID 並立即下載該 PID 的頁面（查詢與下載共用同一次帳號冷卻）；同時自動吸收上次未完成的下載",
         )
+        self._sw_force_rescan = ft.Switch(
+            label="強制重新掃描全部畫家（忽略30天，一次性）",
+            value=bool(dl.get("force_full_rescan", False)),
+            tooltip="開啟後，下次步驟2 會忽略「30天內已掃過」的跳過、重新掃描全部畫家，把每位作者的全部作品 user_id 補齊（供依作者分組）。執行步驟2 後會自動關閉。",
+        )
 
         sch = store.get_section("schedule")
         self._sw_schedule_enabled = ft.Switch(
@@ -203,6 +208,57 @@ class SettingsView:
             "重新偵測 Chrome", on_click=self._on_detect_chrome,
         )
         self._label_ua_status = ft.Text("", size=11, color=ft.Colors.GREY_600)
+
+        # Flipping any Switch persists that one field immediately (主動紀錄),
+        # so a toggle sticks without the user having to click 「儲存設定」.
+        # Text fields / sliders still rely on the explicit save button.
+        self._wire_switch_autosave()
+
+    # ------------------------------------------------------------------
+    # Auto-save (per-switch)
+    # ------------------------------------------------------------------
+
+    def _switch_autosave_map(self):
+        """(switch, section, key, invert) for every persisted toggle.
+
+        invert=True stores the logical negation: the R-18 / R-18G dir
+        switches read as "建立分類資料夾" but persist as ``no_*_dir``.
+        """
+        return [
+            (self._sw_hidefollow, "filter", "hidefollow", False),
+            (self._sw_nogif, "filter", "nogif", False),
+            (self._sw_notag, "filter", "notag", False),
+            (self._sw_notime, "filter", "notime", False),
+            (self._sw_tag_strip_brackets, "download", "tag_strip_brackets", False),
+            (self._sw_tag_strip_special_chars, "download", "tag_strip_special_chars", False),
+            (self._sw_author_order, "download", "author_order", False),
+            (self._sw_combined_mode, "download", "combined_mode", False),
+            (self._sw_force_rescan, "download", "force_full_rescan", False),
+            (self._sw_schedule_enabled, "schedule", "enabled", False),
+            (self._sw_create_dir, "directory", "create_dir", False),
+            (self._sw_r18_dir, "directory", "no_R18_dir", True),
+            (self._sw_r18g_dir, "directory", "no_R18G_dir", True),
+            (self._sw_ai_dir, "directory", "ai_gen_dir", False),
+            (self._sw_jxl, "jxl", "enable", False),
+            (self._sw_jxl_delete, "jxl", "delete_original", False),
+            (self._sw_single_thread, "performance", "single_thread_mode", False),
+        ]
+
+    def _wire_switch_autosave(self) -> None:
+        for switch, section, key, invert in self._switch_autosave_map():
+            switch.on_change = self._make_autosave_handler(switch, section, key, invert)
+
+    def _make_autosave_handler(self, switch, section, key, invert):
+        """Persist just *key* in *section* whenever *switch* is toggled.
+
+        Uses update_fields (single-field read-modify-write) so it never
+        clobbers unsaved TextField / Slider edits in the same section.
+        """
+        def _handler(_e) -> None:
+            value = (not bool(switch.value)) if invert else bool(switch.value)
+            with contextlib.suppress(Exception):
+                _store().update_fields(section, {key: value})
+        return _handler
 
     # ------------------------------------------------------------------
     # File picker handlers
@@ -533,6 +589,7 @@ class SettingsView:
                     ft.Text("下載順序", size=12),
                     self._sw_author_order,
                     self._sw_combined_mode,
+                    self._sw_force_rescan,
                 ]),
                 _tile("資料夾分類", [
                     ft.Text(

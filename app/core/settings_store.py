@@ -34,6 +34,11 @@ DEFAULTS = {
         # When true, Step 3 runs in 邊查邊下 (combined) mode: each PID is
         # downloaded immediately after its meta is fetched (merges Step 3+4).
         "combined_mode": False,
+        # One-shot: when true, the next Step 2 run ignores the 30-day
+        # "already scanned" skip and re-scans every artist, to backfill
+        # user_id (author) for artists already inside the skip window.
+        # _build_step2 consumes it (resets to False) after building.
+        "force_full_rescan": False,
         # When Step 3 finds a cached artwork that was uploaded within this many
         # days, re-fetch its meta over the network instead of trusting the
         # cached like_count. 0 disables the feature.

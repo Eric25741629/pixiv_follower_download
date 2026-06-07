@@ -901,6 +901,32 @@ class MetadataDB:
             )
         return len(rows)
 
+    def backfill_user_ids(self, pids: Iterable, user_id: str | None) -> int:
+        """Fill ``user_id`` for EXISTING artworks rows that have no author yet.
+
+        UPDATE-only: never inserts a row, so it cannot create spurious
+        ``v_pending_artworks`` entries or otherwise disturb any work queue.
+        Callers can therefore pass an artist's full PID list (including PIDs
+        the Step 2 incremental scan truncated) to fill the author for
+        already-known PIDs without re-querying them. First-writer-wins: a row
+        that already has a non-empty ``user_id`` is left untouched. Returns
+        the number of PIDs considered (not the number actually changed).
+        """
+        uid = None if user_id is None else str(user_id).strip()
+        if not uid:
+            return 0
+        rows = [self._coerce_pid(p) for p in (pids or ())]
+        rows = [r for r in rows if r]
+        if not rows:
+            return 0
+        self._emit("artwork.user_id_backfill", pids=rows, user_id=uid)
+        self._bulk_write(
+            "UPDATE artworks SET user_id = ? "
+            "WHERE pid = ? AND (user_id IS NULL OR user_id = '')",
+            [(uid, r) for r in rows],
+        )
+        return len(rows)
+
     def get_artwork(self, pid: str) -> dict | None:
         """Read one artwork row as a dict, decoding the JSON tag blob.
 

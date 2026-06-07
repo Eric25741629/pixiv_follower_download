@@ -28,11 +28,14 @@ global pid_num
 pid_num = 0
 global pid_len
 pid_len = 0
+_pid_count_lock = threading.Lock()
 
 class get_pixiv_author_imgID_Thread(PauseableThread):
     '''抓取畫師作品下所有圖片的 Pixiv ID'''
-    def __init__(self, q, Author_list, Agent, path, cookies, exist_pid, single_thread_mode=False, scheduler=None, stats_collector=None, *, event_log=None):
+    def __init__(self, q, Author_list, Agent, path, cookies, exist_pid, single_thread_mode=False, scheduler=None, stats_collector=None, *, event_log=None, author_order=False, force_rescan=False):
         super().__init__(q, scheduler=scheduler)
+        self.author_order = bool(author_order)
+        self.force_rescan = bool(force_rescan)
         self.Author_list = Author_list
         self.Agent = Agent
         self.path = path
@@ -44,6 +47,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         self._step2_cookie_usage_counts = {}
         self._step2_cookie_usage_seen = set()
         self._last_step2_cookie_label = ""
+        self._step2_cookie_usage_lock = threading.Lock()
         self._step2_early_skip_pids = set()
         self._step2_skip_lock = threading.Lock()
         self._stats_collector = stats_collector
@@ -121,14 +125,17 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
     def _record_step2_cookie_usage(self, aid, cookie_value):
         cookie_text = str(cookie_value or "").strip()
         label = _cookie_usage_label(cookie_text, self.cookie_pool, self._cookie_alias_map)
-        self._last_step2_cookie_label = label
         if not cookie_text:
+            with self._step2_cookie_usage_lock:
+                self._last_step2_cookie_label = label
             return label
         aid_key = str(aid)
         try:
-            if aid_key not in self._step2_cookie_usage_seen:
-                self._step2_cookie_usage_seen.add(aid_key)
-                self._step2_cookie_usage_counts[label] = int(self._step2_cookie_usage_counts.get(label, 0)) + 1
+            with self._step2_cookie_usage_lock:
+                self._last_step2_cookie_label = label
+                if aid_key not in self._step2_cookie_usage_seen:
+                    self._step2_cookie_usage_seen.add(aid_key)
+                    self._step2_cookie_usage_counts[label] = int(self._step2_cookie_usage_counts.get(label, 0)) + 1
         except Exception:
             pass
         return label
@@ -267,6 +274,10 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             self._collected_pids_lock = threading.Lock()
         # 增量寫入用：避免兩個 worker 同時 flush；用 try-acquire 跳過已在跑的呼叫
         self._step2_flush_lock = threading.Lock()
+        # Serialises the per-artist user_id backfill DB writes across the 2
+        # scan workers (no busy_timeout is set on the connection, so concurrent
+        # writers would otherwise risk "database is locked").
+        self._step2_db_write_lock = threading.Lock()
         self._step2_artists_done = 0
 
     def _load_author_progress(self):
@@ -277,10 +288,11 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
     def _filter_work_list(self, progress):
         work_list = []
         now = datetime.datetime.now()
+        force = getattr(self, "force_rescan", False)
         for aid in self.Author_list:
             last = progress.get(str(aid))
             do_process = True
-            if last:
+            if last and not force:
                 try:
                     last_dt = datetime.datetime.fromisoformat(last)
                     if (now - last_dt).days < 30:
@@ -289,6 +301,10 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                     do_process = True
             if do_process:
                 work_list.append(aid)
+        if force:
+            with contextlib.suppress(Exception):
+                self._q.put(WorkerEvent("output",
+                    "<p><font color='orange'>[強制重掃] 忽略 30 天跳過，重新掃描全部畫家以補齊作者資料</font></p>"))
         try:
             self._q.put(WorkerEvent("output",f"<p><font color='black'>畫師總數：{len(self.Author_list)}，待處理：{len(work_list)}</font></p>"))
         except Exception:
@@ -302,7 +318,8 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
 
     def _execute_artist_tasks(self, work_list):
         global pid_len
-        pid_len = len(work_list)
+        with _pid_count_lock:
+            pid_len = len(work_list)
         results = []
         if self.single_mode_flag:
             try:
@@ -389,16 +406,40 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             pass
 
     def _collect_step2_pids_from_queue(self, end):
-        """收集 collected pids（從鎖保護的 buffer）並與 end 合併。回傳 (combined_iterable,)。"""
+        """收集 ``_collected_pids``（鎖保護的 ``(pid, user_id)`` buffer）並與 ``end`` 合併。
+
+        ``end`` 是 run() 階段組出來的 flat PID 字串清單（已過濾 exist_pid），這條路徑
+        沒有 user_id 資訊；``_collected_pids`` 來自 worker 在抓 profile/all 時即時
+        附上的 author。
+
+        合併策略：先以 ``end`` 的順序為主（保留 ``pictures_id.txt`` 的歷史寫入順序
+        契約），用 ``collected`` 建 ``pid -> user_id`` lookup 把 user_id 補上去；
+        ``collected`` 中**多出來**（end 沒有，例如 incremental flush 時還沒進 end
+        的）的 PID 接在最後。下游 ``_merge_step2_pids_with_existing`` 依 PID 字串
+        做 first-occurrence dedup，因此「end 提供順序、collected 提供 user_id」
+        兩個語意都被保住。"""
         try:
             with self._collected_pids_lock:
                 collected = list(self._collected_pids)
         except Exception:
             collected = list(getattr(self, '_collected_pids', []))
-        return list(end) + collected
+        # Build pid → user_id lookup, keeping the first non-None uid seen.
+        uid_lookup = {}
+        for entry in collected:
+            if not isinstance(entry, tuple) or not entry:
+                continue
+            pid = str(entry[0])
+            uid = entry[1] if len(entry) > 1 else None
+            if uid is not None and pid not in uid_lookup:
+                uid_lookup[pid] = uid
+        end_tuples = [(str(pid), uid_lookup.get(str(pid))) for pid in end]
+        return end_tuples + collected
 
     def _merge_step2_pids_with_existing(self, pics_file, combined_pids):
-        """讀現有 pictures_id.txt 並 dedup，回傳 (existing_list, new_candidates)。"""
+        """讀現有 pictures_id.txt 並 dedup，回傳 ``(existing_list, new_candidates)``。
+
+        ``combined_pids`` 是 ``(pid, user_id)`` tuple list；``new_candidates``
+        保持同樣 tuple 形狀，給下游分頭使用（txt 只寫 PID、DB 寫 PID + user_id）。"""
         existing_list = []
         if os.path.isfile(pics_file):
             try:
@@ -408,23 +449,32 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                 existing_list = []
         existing_seen = set(existing_list)
         new_candidates = []
-        for pid in combined_pids:
-            spid = str(pid).strip()
+        for entry in combined_pids:
+            if isinstance(entry, tuple):
+                raw_pid = entry[0]
+                uid = entry[1] if len(entry) > 1 else None
+            else:
+                raw_pid = entry
+                uid = None
+            spid = str(raw_pid).strip()
             if not spid or spid in self.exist_pid or spid in existing_seen:
                 continue
-            new_candidates.append(spid)
+            new_candidates.append((spid, uid))
             existing_seen.add(spid)
         return existing_list, new_candidates
 
-    def _append_new_pids_to_file(self, pics_file: str, new_candidates: list[str]) -> None:
+    def _append_new_pids_to_file(self, pics_file: str, new_candidates: list) -> None:
+        """寫 pictures_id.txt——只寫 PID 字串，user_id 純由 DB 路徑承載。"""
         try:
             with open(pics_file, 'a+', encoding='utf-8') as pf:
-                for text in new_candidates:
-                    pf.write(str(text) + '\n')
+                for entry in new_candidates:
+                    pid = entry[0] if isinstance(entry, tuple) else entry
+                    pf.write(str(pid) + '\n')
         except Exception as e2:
             self._emit_output(f"<p><font color='red'>寫入 pictures_id 失敗：{e2}</font></p>")
 
-    def _persist_pending_pids_to_db(self, new_candidates: list[str]) -> None:
+    def _persist_pending_pids_to_db(self, new_candidates: list) -> None:
+        """寫 DB——tuples 直接 forward 給 ``upsert_pending_pids``。"""
         db = getattr(self, "_metadata_db", None)
         if db is None or not new_candidates:
             return
@@ -465,6 +515,48 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         except Exception:
             pass
 
+    def _regroup_pictures_id_by_author(self):
+        """最終把 pictures_id.txt 依作者重排（同作者連續，作者不明排最後）。
+
+        只在 run() 收尾呼叫一次——增量 flush 仍維持 append-only（崩潰安全）。
+        此時新 PID 的 user_id 已寫進 DB，重排讀整檔 + DB user_id，重用步驟4
+        的純函式 compute_author_order。重排前的版本經 atomic_write_text
+        (backup=True) 留進 history/。DB 不可用 / 取 uid_map 失敗 / 檔案空 /
+        已是分組順序 → 跳過（不報錯）。
+        """
+        if not getattr(self, "author_order", False):
+            return
+        db = getattr(self, "_metadata_db", None)
+        if db is None:
+            return
+        pics_file = os.path.join(self.path, "pictures_id.txt")
+        try:
+            with open(pics_file, encoding="utf-8") as pf:
+                pids = [line.strip() for line in pf if line.strip()]
+        except Exception:
+            return
+        if not pids:
+            return
+        try:
+            uid_map = db.user_id_map_for_pids(pids)
+        except Exception:
+            return
+        from app.core.thread_download import compute_author_order
+        flat, _ = compute_author_order(pids, uid_map)
+        if flat == pids:
+            return  # 已是分組順序，免寫
+        unknown = sum(1 for p in pids if not str(uid_map.get(p) or "").strip())
+        try:
+            atomic_write_text(pics_file, flat, backup=True)
+        except Exception as e:
+            self._emit_output(f"<p><font color='red'>依作者重排 pictures_id 失敗：{e}</font></p>")
+            return
+        tail = f"，其中 {unknown} 筆作者不明排最後" if unknown else ""
+        self._emit_output(
+            f"<p><font color='gray'>[作者排序] 已依作者重排 pictures_id.txt"
+            f"（{len(flat)} 筆{tail}）</font></p>"
+        )
+
     def _commit_step2_outputs(self, end):
         progress_file = os.path.join(self.path, 'author_progress.json')
         self._persist_author_progress(progress_file)
@@ -472,13 +564,15 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         try:
             self._write_step2_pictures_id(end)
             self._write_step2_skip_pids()
+            self._regroup_pictures_id_by_author()
         except Exception:
             pass
 
     def run(self):
         global pid_len, pid_num
-        pid_num = 0
-        pid_len = 0
+        with _pid_count_lock:
+            pid_num = 0
+            pid_len = 0
         self._init_step2_run_state()
         progress = self._load_author_progress()
         work_list = self._filter_work_list(progress)
@@ -534,6 +628,36 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             except Exception:
                 pass
 
+    def _step2_backfill_author_user_ids(self, full_pids, author_pids):
+        """把整個畫師清單的 user_id 補進 DB（UPDATE-only，不新增列、不影響佇列/截斷）。
+
+        Step 2 掃一個畫師時本來就拿到他全部作品的 PID；即使增量掃描截斷了舊
+        PID，這裡仍把『已在 artworks 的』那些舊 PID 補上作者，讓「依作者分組」
+        對既有大量待下載資料也能生效，不必逐筆重新查詢。
+
+        只在開啟 author_order（或一次性 force_rescan 重掃）時做（其餘情況零
+        成本）。DB 寫入經 ``_step2_db_write_lock`` 序列化，避免兩條掃描 worker
+        同時寫（連線沒設 busy_timeout）。全程吞例外——best-effort，失敗下次
+        重跑會自癒。
+        """
+        if not (getattr(self, "author_order", False) or getattr(self, "force_rescan", False)):
+            return
+        db = getattr(self, "_metadata_db", None)
+        if db is None or not full_pids:
+            return
+        uid = None if author_pids in (None, "") else str(author_pids)
+        if not uid:
+            return
+        lock = getattr(self, "_step2_db_write_lock", None)
+        try:
+            if lock is not None:
+                with lock:
+                    db.backfill_user_ids(full_pids, uid)
+            else:
+                db.backfill_user_ids(full_pids, uid)
+        except Exception:
+            pass
+
     def _step2_record_skipped_pids(self, step2_skipped_pid):
         '''把增量略過的 PID 加進 _step2_early_skip_pids（線程安全，吞例外）'''
         try:
@@ -564,18 +688,23 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         except Exception:
             pass
 
-    def _step2_append_new_pids(self, pid):
-        '''把新 PID 追加到 _collected_pids，並更新 _seen_pids（避免跨 worker 重複，吞例外）'''
+    def _step2_append_new_pids(self, pid, author_id=None):
+        '''把新 PID 追加到 _collected_pids，並更新 _seen_pids（避免跨 worker 重複，吞例外）。
+
+        ``_collected_pids`` 存的是 ``(pid, user_id)`` tuple——畫師 ID 就是 ``author_id``
+        參數，由呼叫端（``thread_no_use_seleium_get_pid``）傳入。``user_id`` 為 ``None``
+        時代表無作者資訊（不應發生於正常路徑，僅為防禦寫法）。'''
         try:
             new_pids = [p for p in pid if p not in getattr(self, '_seen_pids', set())]
             if not new_pids:
                 return
+            uid = None if author_id in (None, "") else str(author_id)
             try:
                 with self._collected_pids_lock:
                     for npid in new_pids:
                         if npid in self._seen_pids:
                             continue
-                        self._collected_pids.append(npid)
+                        self._collected_pids.append((npid, uid))
                         self._mark_pid_seen(npid)
             except Exception as e:
                 self._emit_pid_write_error(e)
@@ -607,22 +736,30 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
     def thread_no_use_seleium_get_pid(self, cookie, Agent, path, num, author_pids, proxies=None):
         global pid_num
         global pid_len
-        pid_num = pid_num + 1
+        with _pid_count_lock:
+            pid_num = pid_num + 1
+            _current_pid_num = pid_num
+            _current_pid_len = pid_len
         if not self._stop_event.is_set():
-            self._q.put(WorkerEvent("progress", (1, pid_len - 1)))
+            self._q.put(WorkerEvent("progress", (1, _current_pid_len - 1)))
         self._pause_event.wait()
         if self._stop_event.is_set():
             return 'stop'
-        if (pid_num % 10 == 0):
-            self._q.put(WorkerEvent("output", f"<p><font color='black'>PID progress: {pid_num}</font></p>"))
+        if (_current_pid_num % 10 == 0):
+            self._q.put(WorkerEvent("output", f"<p><font color='black'>PID progress: {_current_pid_num}</font></p>"))
         try:
             pid = self._step2_fetch_artist_pid_list(author_pids, cookie, Agent, proxies=proxies)
             if self._stats_collector is not None:
-                self._stats_collector.report_request(self._last_step2_cookie_label)
+                _req_label = _cookie_usage_label(str(cookie or "").strip(), self.cookie_pool, self._cookie_alias_map)
+                self._stats_collector.report_request(_req_label)
             pid, step2_skipped_pid, pid_stats = self._collect_step2_incremental_pid(pid)
+            # Backfill user_id for the artist's FULL list (kept + truncated),
+            # so author-grouping works for already-known older PIDs without
+            # re-querying them. No-op when author_order is off.
+            self._step2_backfill_author_user_ids(pid + step2_skipped_pid, author_pids)
             self._step2_emit_incremental_status(author_pids, pid_stats)
             self._step2_record_skipped_pids(step2_skipped_pid)
-            self._step2_append_new_pids(pid)
+            self._step2_append_new_pids(pid, author_id=author_pids)
             self._step2_record_author_progress(author_pids)
             return pid
         except (requests.exceptions.ProxyError,

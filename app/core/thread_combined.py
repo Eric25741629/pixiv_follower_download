@@ -67,6 +67,7 @@ class combined_thread(PauseableThread):
         self._event_log = event_log
         self._pending_urls_by_pid = {}
         self._last_pid_ok = False
+        self.author_order = bool(author_order)
 
         self.fetcher = thread_url_fetch.get_img_url_thread(
             q=q, Author_list=Author_list, Agent=Agent, cookies=cookies,
@@ -151,6 +152,51 @@ class combined_thread(PauseableThread):
             if key not in query_set
         ]
         return query_pids, download_only
+
+    def _resolve_combined_order(self, query_pids, download_only):
+        """Return ``[(pid, needs_query), ...]`` for :meth:`run` to iterate.
+
+        author_order off -> query batch then download-only batch (unchanged,
+            zero regression).
+        author_order on  -> both batches merged, deduped by normalized pid
+            (the query batch is prepended so a query pid wins over a
+            download-only dup), then grouped so each author's works are
+            contiguous via :func:`thread_download.compute_author_order`;
+            author-unknown pids bucket last (mirrors Step 4). combined mode is
+            inherently per-PID sequential (one account per PID), so reordering
+            the flat list is enough — no per-author barrier needed.
+
+        Falls back to the unchanged order when no metadata DB is available or
+        the user_id lookup fails.
+        """
+        pairs = [(p, True) for p in query_pids] + [(p, False) for p in download_only]
+        if not getattr(self, "author_order", False):
+            return pairs
+        db = getattr(getattr(self, "fetcher", None), "_metadata_db", None)
+        if db is None:
+            return pairs
+        needs_by_pid = {}
+        ordered_pids = []
+        seen = set()
+        for pid, needs in pairs:
+            key = normalize_pid(pid) or str(pid)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered_pids.append(pid)
+            needs_by_pid[pid] = needs
+        try:
+            uid_map = db.user_id_map_for_pids(ordered_pids)
+        except Exception:
+            return pairs
+        flat, _ = thread_download.compute_author_order(ordered_pids, uid_map)
+        unknown = sum(1 for p in ordered_pids if not str(uid_map.get(p) or "").strip())
+        if unknown:
+            self._emit(
+                f"<p><font color='orange'>[作者排序] {unknown} 筆作品作者不明，"
+                f"已排到最後；重跑步驟 2/3 可補作者資料</font></p>"
+            )
+        return [(p, needs_by_pid[p]) for p in flat]
 
     def _download_only_urls(self, pid):
         """Per-page pending URLs for a download-only PID (from the cached
@@ -266,7 +312,10 @@ class combined_thread(PauseableThread):
             self._emit("<p><font color='red'>邊查邊下階段開始</font></p>")
             self.fetcher._reset_run_counters()
             query_pids, download_only = self._build_work_lists()
-            total = len(query_pids) + len(download_only)
+            # Resolve the (optionally author-grouped) iteration order once so the
+            # progress denominator always matches what we actually iterate.
+            order = self._resolve_combined_order(query_pids, download_only)
+            total = len(order)
             self._q.put(WorkerEvent("progress", (0, total)))
             self._emit(
                 f"<p><font color='red'>待處理：查詢+下載 {len(query_pids)} 筆、"
@@ -274,9 +323,7 @@ class combined_thread(PauseableThread):
             )
 
             failed_nested = []
-            for pid, needs_query in (
-                [(p, True) for p in query_pids] + [(p, False) for p in download_only]
-            ):
+            for pid, needs_query in order:
                 if self._stop_event.is_set():
                     break
                 failed = self._process_one_pid(pid, needs_query)

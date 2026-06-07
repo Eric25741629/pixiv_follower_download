@@ -92,8 +92,12 @@ def _build_event_log(base_path):
         return None
 
 
-def run_headless(step: str) -> int:
-    """Run one pipeline action headless. step in {1,2,3,4,combined,all}."""
+def run_headless(step: str, *, force_rescan: bool = False) -> int:
+    """Run one pipeline action headless. step in {1,2,3,4,combined,all}.
+
+    ``force_rescan`` (Step 2 only) makes the scan ignore the 30-day
+    "already scanned" skip and re-scan every artist to backfill user_id.
+    """
     from app.cli.headless_view import HeadlessView
     from app.gui.run_actions import RunController
 
@@ -102,6 +106,8 @@ def run_headless(step: str) -> int:
     event_q: Queue = Queue()
     event_log = _build_event_log(base)
     controller = RunController(HeadlessView(), event_q, event_log=event_log)
+    if force_rescan:
+        controller.force_rescan = True
 
     step = str(step).strip().lower()
     run_all = step == "all"
