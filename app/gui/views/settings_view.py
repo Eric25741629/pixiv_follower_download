@@ -136,7 +136,7 @@ class SettingsView:
             value=not bool(directory.get("no_R18G_dir", False)),
         )
         self._sw_ai_dir = ft.Switch(
-            label="AI 生成作品分類資料夾",
+            label="AI 生成作品分類資料夾（關閉後下載到一般路徑）",
             value=bool(directory.get("ai_gen_dir", False)),
         )
 
@@ -557,59 +557,53 @@ class SettingsView:
             )
 
         save_btn = ft.FilledButton("儲存設定", icon=ft.Icons.SAVE, on_click=self._save_and_notify)
+        note = lambda text: ft.Text(text, size=11, color=ft.Colors.GREY_700)
+        subhead = lambda text: ft.Text(text, size=12, weight=ft.FontWeight.BOLD)
 
         return ft.Column(
             controls=[
                 ft.Text("設定", size=20, weight=ft.FontWeight.BOLD),
-                _tile("帳號設定", [
+                _tile("帳號與連線", [
+                    subhead("Pixiv 帳號"),
                     self._tf_account,
                     self._tf_password,
                     self._tf_userid,
+                    subhead("User-Agent"),
+                    ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
+                    self._label_ua_status,
+                    subhead("Proxy"),
+                    self._tf_proxy_pool,
+                    ft.Row([
+                        ft.OutlinedButton("測試全部 Proxy", on_click=self._on_test_proxies),
+                    ]),
+                    self._proxy_test_results,
+                ]),
+                _tile("下載輸出", [
+                    subhead("下載位置"),
                     ft.Row([self._tf_path, ft.IconButton(
                         icon=ft.Icons.FOLDER_OPEN,
                         on_click=self._pick_folder,
                     )]),
-                ]),
-                _tile("過濾規則", [
-                    ft.Row([self._sw_hidefollow, self._sw_nogif, self._sw_notag, self._sw_notime], wrap=True),
-                    ft.Row([self._tf_like_num, self._tf_r18_like_num, self._tf_rescrape_within_days], spacing=16, wrap=True),
-                ]),
-                _tile("檔名範本", [
-                    ft.Text(
-                        "可用佔位符：{pid} {page} {ext} {tag} {hashtag} {timetag} {date} {time}\n"
-                        "留空時使用預設規則。檔名會自動清掉 Windows 不允許的字元。",
-                        size=11, color=ft.Colors.GREY_700,
-                    ),
-                    self._tf_filename_template,
-                    ft.Text("Tag 整理（套用於 {hashtag} 佔位符）", size=12),
-                    ft.Row(
-                        [self._sw_tag_strip_brackets, self._sw_tag_strip_special_chars],
-                        wrap=True,
-                    ),
-                    ft.Text("下載順序", size=12),
-                    self._sw_author_order,
-                    self._sw_combined_mode,
-                    self._sw_force_rescan,
-                ]),
-                _tile("資料夾分類", [
-                    ft.Text(
-                        "啟用後將在下載目錄底下，依作品屬性建立子資料夾。",
-                        size=11, color=ft.Colors.GREY_700,
-                    ),
+                    subhead("資料夾分類"),
+                    note("啟用後將在下載目錄底下，依作品屬性建立子資料夾。"),
                     self._sw_create_dir,
                     self._sw_r18_dir,
                     self._sw_r18g_dir,
                     self._sw_ai_dir,
-                ]),
-                _tile("標籤過濾", [
-                    ft.Text("禁止 tag", size=12),
-                    self._ban_tag_row,
-                    ft.Row([self._tf_ban_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_ban_tag)]),
-                    ft.Text("必須 tag", size=12),
-                    self._must_tag_row,
-                    ft.Row([self._tf_must_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_must_tag)]),
-                ]),
-                _tile("JXL 轉檔", [
+                    subhead("檔名範本"),
+                    note(
+                        "可用佔位符：{pid} {page} {ext} {tag} {hashtag} {timetag} {date} {time}\n"
+                        "留空時使用預設規則。檔名會自動清掉 Windows 不允許的字元。"
+                    ),
+                    self._tf_filename_template,
+                    subhead("檔名內容"),
+                    ft.Row([self._sw_notag, self._sw_notime], wrap=True),
+                    subhead("Tag 整理（套用於 {hashtag} 佔位符）"),
+                    ft.Row(
+                        [self._sw_tag_strip_brackets, self._sw_tag_strip_special_chars],
+                        wrap=True,
+                    ),
+                    subhead("JXL 轉檔"),
                     self._sw_jxl,
                     ft.Row([self._tf_jxl_path, ft.IconButton(
                         icon=ft.Icons.FILE_OPEN,
@@ -618,7 +612,23 @@ class SettingsView:
                     self._sw_jxl_delete,
                     ft.Row([ft.Text("Effort（1-9）"), self._sl_jxl_effort]),
                 ]),
-                _tile("冷卻設定", [
+                _tile("作品篩選", [
+                    ft.Row([self._sw_hidefollow, self._sw_nogif], wrap=True),
+                    ft.Row([self._tf_like_num, self._tf_r18_like_num, self._tf_rescrape_within_days], spacing=16, wrap=True),
+                    subhead("禁止 tag"),
+                    self._ban_tag_row,
+                    ft.Row([self._tf_ban_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_ban_tag)]),
+                    subhead("必須 tag"),
+                    self._must_tag_row,
+                    ft.Row([self._tf_must_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_must_tag)]),
+                ]),
+                _tile("執行流程", [
+                    self._sw_combined_mode,
+                    self._sw_author_order,
+                    self._sw_force_rescan,
+                ]),
+                _tile("速度與自動化", [
+                    subhead("冷卻與等待"),
                     ft.Row([self._tf_cooldown, self._label_cooldown_hint], spacing=12),
                     self._sl_cooldown,
                     ft.Row(
@@ -632,19 +642,7 @@ class SettingsView:
                         spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     self._sw_single_thread,
-                ]),
-                _tile("Proxy 設定", [
-                    self._tf_proxy_pool,
-                    ft.Row([
-                        ft.OutlinedButton("測試全部 Proxy", on_click=self._on_test_proxies),
-                    ]),
-                    self._proxy_test_results,
-                ]),
-                _tile("User-Agent 設定", [
-                    ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
-                    self._label_ua_status,
-                ]),
-                _tile("排程", [
+                    subhead("排程"),
                     self._sw_schedule_enabled,
                     self._dd_schedule_mode,
                     self._tf_schedule_time,
