@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import contextlib
+import os
 import queue
 import threading
 import time
@@ -54,6 +55,12 @@ _PROG_BAR_HEIGHT = 12
 _PROG_BAR_RADIUS = 6
 _PROG_ROW_SPACING = 12
 
+
+
+def _settings_base_path() -> str:
+    path = os.getenv("APPDATA") + r"/pixiv_download/"
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 class MainView:
@@ -116,6 +123,33 @@ class MainView:
             controls=[self._phase_ring, self._phase_label],
             spacing=6,
             visible=False,
+        )
+        self._following_scope = "all"
+        self._scope_label = ft.Text(
+            "追隨範圍",
+            size=12,
+            weight=ft.FontWeight.BOLD,
+            color=ft.Colors.BLUE_GREY_700,
+        )
+        self._btn_scope_public = ft.OutlinedButton(
+            "公開", on_click=lambda e: self._on_following_scope_change("public")
+        )
+        self._btn_scope_private = ft.OutlinedButton(
+            "非公開", on_click=lambda e: self._on_following_scope_change("private")
+        )
+        self._btn_scope_all = ft.OutlinedButton(
+            "全部", on_click=lambda e: self._on_following_scope_change("all")
+        )
+        self._following_scope_row = ft.Row(
+            controls=[
+                self._scope_label,
+                self._btn_scope_public,
+                self._btn_scope_private,
+                self._btn_scope_all,
+            ],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            wrap=True,
         )
 
         # Modal overlay shown while a step is launching or stopping.
@@ -331,6 +365,62 @@ class MainView:
 
     def _on_scroll_to_bottom(self, e: ft.ControlEvent) -> None:
         self._enable_auto_scroll()
+
+    @staticmethod
+    def _normalize_scope(scope: str) -> str:
+        scope = str(scope or "all")
+        return scope if scope in {"public", "private", "all"} else "all"
+
+    @staticmethod
+    def _make_scope_button(text: str, active: bool, on_click):
+        if active:
+            return ft.FilledButton(text, on_click=on_click)
+        return ft.OutlinedButton(text, on_click=on_click)
+
+    @staticmethod
+    def _read_following_scope_setting() -> str:
+        try:
+            from app.core.settings_store import SettingsStore
+            dl = SettingsStore(_settings_base_path()).get_section("download")
+            return str(dl.get("following_scope", "all") or "all")
+        except Exception:
+            return "all"
+
+    def apply_following_scope(self, scope: str) -> None:
+        scope = self._normalize_scope(scope)
+        self._following_scope = scope
+        self._btn_scope_public = self._make_scope_button(
+            "公開", scope == "public", lambda e: self._on_following_scope_change("public")
+        )
+        self._btn_scope_private = self._make_scope_button(
+            "非公開", scope == "private", lambda e: self._on_following_scope_change("private")
+        )
+        self._btn_scope_all = self._make_scope_button(
+            "全部", scope == "all", lambda e: self._on_following_scope_change("all")
+        )
+        self._following_scope_row.controls = [
+            self._scope_label,
+            self._btn_scope_public,
+            self._btn_scope_private,
+            self._btn_scope_all,
+        ]
+        with contextlib.suppress(Exception):
+            self._following_scope_row.update()
+
+    def refresh_following_scope(self) -> None:
+        self.apply_following_scope(self._read_following_scope_setting())
+
+    def _persist_following_scope(self, scope: str) -> None:
+        with contextlib.suppress(Exception):
+            from app.core.settings_store import SettingsStore
+            SettingsStore(_settings_base_path()).update_fields(
+                "download", {"following_scope": self._normalize_scope(scope)}
+            )
+
+    def _on_following_scope_change(self, scope: str) -> None:
+        scope = self._normalize_scope(scope)
+        self._persist_following_scope(scope)
+        self.apply_following_scope(scope)
 
     @staticmethod
     def _safe_update(*controls) -> None:
@@ -628,6 +718,7 @@ class MainView:
             self._event_q.put(WorkerEvent("loading", (False, "")))
 
     def build(self) -> ft.Column:
+        self.refresh_following_scope()
         self._paint_progress()
         top_row = ft.Row(
             controls=[
@@ -643,6 +734,7 @@ class MainView:
         )
         return ft.Column(
             controls=[
+                self._following_scope_row,
                 top_row,
                 self._progress_row,
                 self._page_progress_row,

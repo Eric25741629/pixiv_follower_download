@@ -31,6 +31,7 @@ def test_load_missing_returns_defaults(tmp_path):
     assert "download" in data
     assert "auth" in data
     assert data["jxl"]["effort"] == 7
+    assert data["download"]["following_scope"] == "all"
 
 
 def test_load_existing_settings(tmp_path):
@@ -133,11 +134,20 @@ def test_migration_othersettings_json(tmp_path):
     SettingsStore(str(tmp_path)).migrate_from_legacy()
     data = _read_settings(tmp_path)
     assert data["filter"]["hidefollow"] is True
+    assert data["download"]["following_scope"] == "public"
     assert data["directory"]["create_dir"] is True
     assert data["performance"]["single_thread_mode"] is True
     assert data["jxl"]["enable"] is True
     assert data["jxl"]["cjxl_path"] == "/bin/cjxl"
     assert data["jxl"]["effort"] == 9
+
+
+def test_existing_hidefollow_setting_maps_to_public_following_scope(tmp_path):
+    _write(tmp_path, "settings.json", {"filter": {"hidefollow": True}})
+
+    dl = SettingsStore(str(tmp_path)).get_section("download")
+
+    assert dl["following_scope"] == "public"
 
 
 def test_migration_cookies_json(tmp_path):

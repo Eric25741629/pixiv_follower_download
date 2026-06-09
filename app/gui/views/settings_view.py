@@ -93,6 +93,16 @@ class SettingsView:
             value=bool(dl.get("combined_mode", False)),
             tooltip="開啟後，步驟 3 會逐一查詢 PID 並立即下載該 PID 的頁面（查詢與下載共用同一次帳號冷卻）；同時自動吸收上次未完成的下載",
         )
+        self._dd_following_scope = ft.Dropdown(
+            label="追隨範圍",
+            value=str(dl.get("following_scope", "all") or "all"),
+            options=[
+                ft.dropdown.Option("public", "公開追隨"),
+                ft.dropdown.Option("private", "非公開追隨"),
+                ft.dropdown.Option("all", "全部追隨"),
+            ],
+            width=220,
+        )
         self._sw_force_rescan = ft.Switch(
             label="強制重新掃描全部畫家（忽略30天，一次性）",
             value=bool(dl.get("force_full_rescan", False)),
@@ -474,6 +484,7 @@ class SettingsView:
             "tag_strip_special_chars": bool(self._sw_tag_strip_special_chars.value),
             "author_order": bool(self._sw_author_order.value),
             "combined_mode": bool(self._sw_combined_mode.value),
+            "following_scope": str(self._dd_following_scope.value or "all"),
         })
         store.update_section("schedule", {
             "enabled": bool(self._sw_schedule_enabled.value),
@@ -632,6 +643,7 @@ class SettingsView:
                     ft.Row([self._tf_must_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_must_tag)]),
                 ]),
                 _tile("執行流程", [
+                    self._dd_following_scope,
                     self._sw_combined_mode,
                     self._sw_author_order,
                     self._sw_force_rescan,

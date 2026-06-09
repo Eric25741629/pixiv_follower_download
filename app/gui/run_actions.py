@@ -559,7 +559,7 @@ class RunController:
             return None
         return valid_cookies
 
-    def _build_step1(self, auth, agent, flt):
+    def _build_step1(self, auth, agent, dl, flt):
         userid = str(auth.get("userid", "")).strip()
         if not userid:
             self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
@@ -572,7 +572,7 @@ class RunController:
             userid,
             valid_cookies[0],
             agent,
-            bool(flt.get("hidefollow", False)),
+            str(dl.get("following_scope", "all") or "all"),
         )
 
     def _build_step2(self, auth, agent, dl, perf, path):
@@ -816,7 +816,7 @@ class RunController:
                 self._active_snapshot = self._live.sections()
 
         if n == 1:
-            return self._build_step1(auth, agent, flt)
+            return self._build_step1(auth, agent, dl, flt)
         if n == 2:
             return self._build_step2(auth, agent, dl, perf, path)
         if n == 3:

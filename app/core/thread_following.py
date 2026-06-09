@@ -19,7 +19,7 @@ from app.core.pixiv_thread_base import (
 
 class get_following(PauseableThread):
     '''抓取使用者關注的畫師清單'''
-    def __init__(self, q, userid, cookies, Agent, hide_mode):
+    def __init__(self, q, userid, cookies, Agent, following_scope):
         super().__init__(q)
         self.userid=userid
         self.cookies=cookies
@@ -27,14 +27,34 @@ class get_following(PauseableThread):
         self.path=os.getenv('APPDATA')+r'/pixiv_download/'
         self._partial_following = []
         self._partial_lock = threading.Lock()
-        if hasattr(hide_mode, "isChecked"):
-            try:
-                self.hide = bool(hide_mode.isChecked())
-            except Exception:
-                self.hide = False
-        else:
-            self.hide = bool(hide_mode)
+        self.following_scope = self._coerce_following_scope(following_scope)
+        # Legacy compatibility: old hide=True meant "public following only".
+        self.hide = self.following_scope == "public"
         self.max=0
+
+    @staticmethod
+    def _coerce_following_scope(value):
+        if hasattr(value, "isChecked"):
+            try:
+                return "public" if bool(value.isChecked()) else "all"
+            except Exception:
+                return "all"
+        if isinstance(value, bool):
+            return "public" if value else "all"
+        scope = str(value or "all").strip().lower()
+        if scope == "show":
+            return "public"
+        if scope == "hide":
+            return "private"
+        return scope if scope in {"public", "private", "all"} else "all"
+
+    @staticmethod
+    def _following_rest_values(scope):
+        if scope == "public":
+            return ["show"]
+        if scope == "private":
+            return ["hide"]
+        return ["show", "hide"]
 
     def _flush_following_snapshot(self):
         try:
@@ -88,39 +108,33 @@ class get_following(PauseableThread):
             ,'referer': 'https://www.pixiv.net/users/'+str(self.userid)+'/following',        
         }
         times=0
-        url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=1&rest=show&tag=&lang=zh_tw') # 先查公開關注總數
-        print(url.format(self.userid))
-
-        res = requests.get(url.format(self.userid), headers=headers, timeout=(10, 30))
-        print(res.text)
-        show_total_num = safe_json(res, 'body', 'total', default=0)
-        show_list = list(range(0, show_total_num+200, 100))
-
-        if (self.hide==False):
-            #print("yes")
-            url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=1&rest=hide&tag=&lang=zh_tw')
+        rest_values = self._following_rest_values(self.following_scope)
+        page_ranges = {}
+        total_by_rest = {}
+        for rest in rest_values:
+            url = (
+                'https://www.pixiv.net/ajax/user/{}/following?offset='
+                + str(times)
+                + '&limit=1&rest='
+                + rest
+                + '&tag=&lang=zh_tw'
+            )
+            print(url.format(self.userid))
             res = requests.get(url.format(self.userid), headers=headers, timeout=(10, 30))
-            hide_total_num = safe_json(res, 'body', 'total', default=0)
-            hide_list=[i for i in range(0,hide_total_num+200,100)]
-            self.max=int(hide_total_num+show_total_num)
-        else:
-            self.max=int(show_total_num)
+            if rest == "show":
+                print(res.text)
+            total_num = safe_json(res, 'body', 'total', default=0)
+            total_by_rest[rest] = total_num
+            page_ranges[rest] = list(range(0, total_num+200, 100))
+        self.max=int(sum(total_by_rest.values()))
         self._q.put(WorkerEvent("output", f'total following: {self.max}'))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as self.executor:
-            func=partial(self.get_follow_illust,self.userid,headers,'show')
-            pixiv_following = list(self.executor.map(func,show_list))
-            results1=([i for item in pixiv_following for i in item]) 
-            #print(len(results1))
-        if (self.hide==False):
-        
+        results = []
+        for rest in rest_values:
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as self.executor:
-                func=partial(self.get_follow_illust,self.userid,headers,'hide')
-                pixiv_following2 = list(self.executor.map(func,hide_list))
-                results2=([i for item in pixiv_following2 for i in item]) 
-                #print(len(results2))
-                return results1+results2
-        else:
-            return results1
+                func=partial(self.get_follow_illust,self.userid,headers,rest)
+                pixiv_following = list(self.executor.map(func,page_ranges[rest]))
+                results.extend([i for item in pixiv_following for i in item])
+        return results
     def run(self):
         try:
             all_pixiv_ids = self.illusts()

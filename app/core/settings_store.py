@@ -43,6 +43,9 @@ DEFAULTS = {
         # days, re-fetch its meta over the network instead of trusting the
         # cached like_count. 0 disables the feature.
         "rescrape_within_days": 365,
+        # Pixiv following privacy scope: "public" -> rest=show,
+        # "private" -> rest=hide, "all" -> both.
+        "following_scope": "all",
     },
     "filter": {
         "pass_tag": False,
@@ -223,6 +226,17 @@ class SettingsStore:
                 merged["performance"]["pid_cooldown_avg"] = avg
             except (TypeError, ValueError):
                 pass
+        raw_dl = raw.get("download", {})
+        raw_filter = raw.get("filter", {})
+        if (
+            isinstance(raw_dl, dict)
+            and "following_scope" not in raw_dl
+            and isinstance(raw_filter, dict)
+            and "hidefollow" in raw_filter
+        ):
+            merged["download"]["following_scope"] = (
+                "public" if bool(raw_filter.get("hidefollow", False)) else "all"
+            )
         return merged
 
     def _read_legacy(self, fname):
@@ -268,6 +282,9 @@ class SettingsStore:
             "notag": bool(d.get("notag", False)),
             "notime": bool(d.get("notime", False)),
         })
+        merged["download"]["following_scope"] = (
+            "public" if bool(d.get("hidefollow", False)) else "all"
+        )
         merged["directory"].update({
             "create_dir": bool(d.get("create_dir", False)),
             "no_R18G_dir": bool(d.get("no_R18G_dir", False)),
