@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import contextlib
 import queue
 import threading
 import time
@@ -44,6 +45,16 @@ def _state_palette(page: ft.Page) -> dict[str, tuple[str, str]]:
 
 _MAX_LOG_LINES = 2000
 
+# Shared geometry for the two stacked progress bars (整體進度 / 本作分頁).
+# Both rows use the same leading label width, trailing count width and spacing
+# so the expand=True bars start and end at exactly the same x.
+_PROG_LEAD_W = 84
+_PROG_TRAIL_W = 210
+_PROG_BAR_HEIGHT = 12
+_PROG_BAR_RADIUS = 6
+_PROG_ROW_SPACING = 12
+
+
 
 class MainView:
     """The primary workflow view: step cards, controls, progress, log."""
@@ -65,39 +76,30 @@ class MainView:
         self._is_paused = False
         self._cards_disabled = False
 
-        self._progress_bar = ft.ProgressBar(value=0, expand=True)
-        self._progress_text = ft.Text("", size=12, color=ft.Colors.GREY_600, width=120)
-        self._eta_text = ft.Text(
-            "",
-            size=12,
-            color=ft.Colors.BLUE_GREY_500,
-            width=160,
+        # Built by one shared helper so 整體進度 and 本作分頁 have identical
+        # geometry and the same visible-gated render lifecycle.
+        self._progress_bar, self._progress_text, self._progress_row = (
+            self._make_progress_row("整體進度", ft.Colors.BLUE_500)
         )
-        self._page_progress_bar = ft.ProgressBar(value=0, expand=True)
-        self._page_progress_text = ft.Text(
-            "",
-            size=11,
-            color=ft.Colors.BLUE_GREY_500,
-            width=180,
-        )
-        self._page_progress_row = ft.Row(
-            controls=[
-                ft.Container(width=24),
-                self._page_progress_bar,
-                self._page_progress_text,
-            ],
-            spacing=8,
-            visible=False,
+        self._page_progress_bar, self._page_progress_text, self._page_progress_row = (
+            self._make_progress_row("本作分頁", ft.Colors.TEAL_500)
         )
         self._page_progress_value = 0
         self._page_progress_total = 0
         self._page_progress_pid = ""
+
+        self._eta_text = ft.Text("", size=12, color=ft.Colors.BLUE_GREY_500)
         self._countdown_text = ft.Text(
-            "",
-            size=13,
-            color=ft.Colors.ORANGE_600,
-            weight=ft.FontWeight.BOLD,
-            width=140,
+            "", size=12, color=ft.Colors.ORANGE_600, weight=ft.FontWeight.BOLD,
+        )
+        self._meta_row = ft.Row(
+            controls=[
+                ft.Container(width=_PROG_LEAD_W),
+                self._eta_text,
+                self._countdown_text,
+            ],
+            spacing=18,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         self._progress_value = 0
         self._progress_total = 0
@@ -330,6 +332,74 @@ class MainView:
     def _on_scroll_to_bottom(self, e: ft.ControlEvent) -> None:
         self._enable_auto_scroll()
 
+    @staticmethod
+    def _safe_update(*controls) -> None:
+        """update() each control, swallowing detached-control errors."""
+        for c in controls:
+            with contextlib.suppress(Exception):
+                c.update()
+
+    @staticmethod
+    def _make_progress_row(label: str, color: str):
+        """Build one labeled progress row: [label] [expand bar] [count text]."""
+        bar = ft.ProgressBar(
+            value=0,
+            expand=True,
+            bar_height=_PROG_BAR_HEIGHT,
+            border_radius=_PROG_BAR_RADIUS,
+            color=color,
+            bgcolor=ft.Colors.with_opacity(0.18, color),
+        )
+        text = ft.Text(
+            "",
+            size=13,
+            color=ft.Colors.BLUE_GREY_700,
+            weight=ft.FontWeight.W_600,
+            width=_PROG_TRAIL_W,
+            text_align=ft.TextAlign.LEFT,
+        )
+        row = ft.Row(
+            controls=[
+                ft.Text(label, size=12, color=ft.Colors.BLUE_GREY_500,
+                        width=_PROG_LEAD_W),
+                bar,
+                text,
+            ],
+            spacing=_PROG_ROW_SPACING,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            visible=False,
+        )
+        return bar, text, row
+
+    def _render_progress_row(self, row, bar, text, value: int, total: int,
+                             trailing: str) -> None:
+        """Shared render path for 整體進度 and 本作分頁."""
+        if total > 0:
+            bar.value = max(0.0, min(1.0, value / total))
+            text.value = trailing
+            row.visible = True
+        else:
+            bar.value = 0
+            text.value = ""
+            row.visible = False
+        self._safe_update(row)
+
+    def _paint_progress(self, now: float | None = None) -> None:
+        """Render overall progress into the shared progress row."""
+        t = self._progress_total
+        if t > 0:
+            self._eta_text.value = self._format_eta(
+                now if now is not None else time.monotonic()
+            )
+            trailing = f"{self._progress_value} / {t}"
+        else:
+            self._eta_text.value = ""
+            trailing = ""
+        self._render_progress_row(
+            self._progress_row, self._progress_bar, self._progress_text,
+            self._progress_value, t, trailing,
+        )
+
     def update_progress(self, delta: int, total: int) -> None:
         # Workers emit (delta, total) per step, with delta == 0 marking a reset
         # at the start of a phase. We accumulate locally so the bar grows.
@@ -347,21 +417,8 @@ class MainView:
             if self._progress_started_at is None:
                 self._progress_started_at = now
         self._progress_total = t
-        if t > 0:
-            ratio = self._progress_value / t
-            self._progress_bar.value = max(0.0, min(1.0, ratio))
-            self._progress_text.value = f"{self._progress_value}/{t}"
-            self._eta_text.value = self._format_eta(now)
-        else:
-            self._progress_bar.value = 0
-            self._progress_text.value = ""
-            self._eta_text.value = ""
-        try:
-            self._progress_bar.update()
-            self._progress_text.update()
-            self._eta_text.update()
-        except Exception:
-            pass
+        self._paint_progress(now)
+        self._safe_update(self._meta_row)
 
     def update_page_progress(self, delta: int, total: int, pid: str = "") -> None:
         """Update the current PID's page progress without touching PID progress."""
@@ -386,31 +443,20 @@ class MainView:
         self._page_progress_pid = pid_text
         self._page_progress_value = max(0, min(self._page_progress_value, t))
         label = f"PID {pid_text} 分頁" if pid_text else "分頁"
-        self._page_progress_text.value = (
-            f"{label} {self._page_progress_value}/{self._page_progress_total}"
+        trailing = f"{label} {self._page_progress_value}/{self._page_progress_total}"
+        self._render_progress_row(
+            self._page_progress_row, self._page_progress_bar,
+            self._page_progress_text, self._page_progress_value, t, trailing,
         )
-        self._page_progress_bar.value = self._page_progress_value / t
-        self._page_progress_row.visible = True
-        try:
-            self._page_progress_row.update()
-            self._page_progress_bar.update()
-            self._page_progress_text.update()
-        except Exception:
-            pass
 
     def clear_page_progress(self) -> None:
         self._page_progress_value = 0
         self._page_progress_total = 0
         self._page_progress_pid = ""
-        self._page_progress_bar.value = 0
-        self._page_progress_text.value = ""
-        self._page_progress_row.visible = False
-        try:
-            self._page_progress_row.update()
-            self._page_progress_bar.update()
-            self._page_progress_text.update()
-        except Exception:
-            pass
+        self._render_progress_row(
+            self._page_progress_row, self._page_progress_bar,
+            self._page_progress_text, 0, 0, "",
+        )
 
     def _format_eta(self, now: float) -> str:
         if self._progress_started_at is None:
@@ -439,10 +485,7 @@ class MainView:
         except (TypeError, ValueError):
             r = 0
         self._countdown_text.value = f"倒數：{r} 秒" if r > 0 else ""
-        try:
-            self._countdown_text.update()
-        except Exception:
-            pass
+        self._safe_update(self._meta_row)
 
     def set_phase(self, text: str) -> None:
         """Update the phase indicator row below the progress bar."""
@@ -585,6 +628,7 @@ class MainView:
             self._event_q.put(WorkerEvent("loading", (False, "")))
 
     def build(self) -> ft.Column:
+        self._paint_progress()
         top_row = ft.Row(
             controls=[
                 self._btn_run_all,
@@ -597,20 +641,12 @@ class MainView:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             wrap=True,
         )
-        progress_row = ft.Row(
-            controls=[
-                self._progress_bar,
-                self._progress_text,
-                self._eta_text,
-                self._countdown_text,
-            ],
-            spacing=12,
-        )
         return ft.Column(
             controls=[
                 top_row,
-                progress_row,
+                self._progress_row,
                 self._page_progress_row,
+                self._meta_row,
                 self._phase_row,
                 ft.Divider(),
                 ft.Text("即時 Log", size=12, weight=ft.FontWeight.BOLD),

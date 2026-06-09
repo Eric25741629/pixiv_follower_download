@@ -51,6 +51,32 @@ class _CombinedPageProgressQueue:
             return 1
 
 
+class _DropOverallProgressQueue:
+    """Forward everything to the real queue EXCEPT overall ``"progress"`` events.
+
+    In combined mode the fetcher's :meth:`get_download_url` calls
+    ``_step3_advance_progress`` once per PID, which emits
+    ``WorkerEvent("progress", (1, fetcher.pid_max))``. The fetcher's ``pid_max``
+    is **0** here — its ``run()`` / ``_load_and_filter_pid_list`` (the only place
+    that sets it) never runs in combined mode — so that event reaches
+    ``MainView.update_progress`` as ``(1, 0)`` and, because ``total <= 0``, blanks
+    (or, after the visible-gating fix, hides) the 整體進度 bar **every time a PID
+    is queried**. That is the "整體進度 shows when a PID finishes but disappears
+    the moment the next PID starts" bug. combined owns overall progress (exactly
+    one tick per PID, emitted from :meth:`combined_thread.run`), so the fetcher's
+    per-PID ``progress`` events are dropped while querying. All other event kinds
+    (output / countdown / page_progress / next / ...) pass straight through.
+    """
+
+    def __init__(self, target_q):
+        self._target_q = target_q
+
+    def put(self, event, *args, **kwargs):
+        if isinstance(event, WorkerEvent) and getattr(event, "type", None) == "progress":
+            return
+        self._target_q.put(event, *args, **kwargs)
+
+
 class combined_thread(PauseableThread):
     """邊查邊下: per PID, query meta (Step 3) then immediately download
     its pages (Step 4) inside one account cooldown window.
@@ -267,13 +293,25 @@ class combined_thread(PauseableThread):
         download_ok = True
         try:
             if needs_query:
-                ok, one, _ = self._run_with_network_retry(
-                    f"PID {pid}",
-                    lambda: self.fetcher.get_download_url(
-                        self.path, self.Agent, 1, pid,
-                        cookie_override=acc.cookie, session=sess,
-                    ),
-                )
+                # The fetcher's get_download_url emits one ("progress",(1,
+                # fetcher.pid_max)) per PID via _step3_advance_progress, and
+                # fetcher.pid_max is 0 in combined mode (run() never ran). That
+                # (1, 0) would blank/hide the 整體進度 bar on every query — the
+                # "bar disappears when the next PID starts" bug. combined owns
+                # overall progress (one tick per PID in run()), so drop the
+                # fetcher's progress events for the duration of the query.
+                prev_fetcher_q = self.fetcher._q
+                self.fetcher._q = _DropOverallProgressQueue(prev_fetcher_q)
+                try:
+                    ok, one, _ = self._run_with_network_retry(
+                        f"PID {pid}",
+                        lambda: self.fetcher.get_download_url(
+                            self.path, self.Agent, 1, pid,
+                            cookie_override=acc.cookie, session=sess,
+                        ),
+                    )
+                finally:
+                    self.fetcher._q = prev_fetcher_q
                 urls = self.fetcher._normalize_loop_result(one) if ok else []
             else:
                 urls = self._download_only_urls(pid)
