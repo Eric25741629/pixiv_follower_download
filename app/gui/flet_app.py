@@ -137,6 +137,29 @@ def _activate_view(views: list, idx: int) -> int:
         view.visible = i == active_idx
     return active_idx
 
+
+def _handle_page_progress_event(main_view: MainView, data) -> None:
+    """Normalize page-progress event payloads before touching MainView."""
+    if not data:
+        main_view.clear_page_progress()
+        return
+    if isinstance(data, dict):
+        delta = data.get("delta", 0)
+        total = data.get("total", 0)
+        pid = data.get("pid", "")
+    elif isinstance(data, tuple):
+        if len(data) >= 3:
+            delta, total, pid = data[:3]
+        elif len(data) == 2:
+            delta, total = data
+            pid = ""
+        else:
+            main_view.clear_page_progress()
+            return
+    else:
+        return
+    main_view.update_page_progress(delta, total, pid)
+
 # ── crash-safe flush ───────────────────────────────────────────────────────
 # Without this, an unhandled exception (in main thread, in any worker, or
 # during interpreter shutdown via a non-window-close path) tears the
@@ -523,6 +546,9 @@ def main(page: ft.Page) -> None:
         _PERSISTENT_UI_STATE["progress_total"] = main_view._progress_total
         _PERSISTENT_UI_STATE["progress_started_at"] = main_view._progress_started_at
 
+    def handle_page_progress(data) -> None:
+        _handle_page_progress_event(main_view, data)
+
     def handle_countdown(data: int) -> None:
         main_view.update_countdown(data)
         try:
@@ -549,6 +575,7 @@ def main(page: ft.Page) -> None:
         _PERSISTENT_UI_STATE["is_paused"] = False
         _PERSISTENT_UI_STATE["loading_open"] = False
         _PERSISTENT_UI_STATE["loading_message"] = ""
+        main_view.clear_page_progress()
 
     def handle_next(data: int) -> None:
         global _PERSISTENT_ACTIVE_THREAD
@@ -567,6 +594,7 @@ def main(page: ft.Page) -> None:
             _PERSISTENT_UI_STATE["loading_message"] = ""
             _PERSISTENT_UI_STATE["countdown"] = 0
             _PERSISTENT_UI_STATE["phase"] = ""
+            main_view.clear_page_progress()
             return
         for i, st in enumerate(main_view._step_states):
             if st == "running":
@@ -613,6 +641,7 @@ def main(page: ft.Page) -> None:
     disp = EventDispatcher(page, event_q, {
         "output":        handle_output,
         "progress":      handle_progress,
+        "page_progress": handle_page_progress,
         "countdown":     handle_countdown,
         "finished":      handle_finished,
         "next":          handle_next,

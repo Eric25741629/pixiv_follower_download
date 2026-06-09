@@ -8,6 +8,49 @@ from app.core import thread_url_fetch, thread_download
 import pixiv_api
 
 
+class _CombinedPageProgressQueue:
+    """Translate Step 4 page progress while combined mode owns PID progress."""
+
+    def __init__(self, target_q, pid, total):
+        self._target_q = target_q
+        self._pid = str(normalize_pid(pid) or pid)
+        self._total = int(total)
+
+    def put(self, event, *args, **kwargs):
+        if isinstance(event, WorkerEvent) and event.type == "progress":
+            self._target_q.put(
+                WorkerEvent(
+                    "page_progress",
+                    {
+                        "delta": self._coerce_delta(event.data),
+                        "total": self._total,
+                        "pid": self._pid,
+                    },
+                ),
+                *args,
+                **kwargs,
+            )
+            return
+        self._target_q.put(event, *args, **kwargs)
+
+    def reset(self):
+        self._target_q.put(
+            WorkerEvent(
+                "page_progress",
+                {"delta": 0, "total": self._total, "pid": self._pid},
+            )
+        )
+
+    @staticmethod
+    def _coerce_delta(data):
+        try:
+            if isinstance(data, (tuple, list)) and data:
+                return int(data[0])
+            return int(data)
+        except Exception:
+            return 1
+
+
 class combined_thread(PauseableThread):
     """邊查邊下: per PID, query meta (Step 3) then immediately download
     its pages (Step 4) inside one account cooldown window.
@@ -243,7 +286,7 @@ class combined_thread(PauseableThread):
                 self.downloader._current_account = acc
                 _, failed, _ = self._run_with_network_retry(
                     f"PID {pid} 下載",
-                    lambda: self.downloader._download_pid_group(pid, urls),
+                    lambda: self._download_pid_group_with_page_progress(pid, urls),
                 )
                 if not isinstance(failed, list):
                     failed = []
@@ -260,6 +303,8 @@ class combined_thread(PauseableThread):
                     # crash-safe. Download-only PIDs already have DB meta.
                     if needs_query:
                         self._persist_pid_meta(pid)
+            else:
+                self._clear_page_progress()
         finally:
             self.downloader._current_account = None
             self._release_account(acc, ok=ok and download_ok)
@@ -271,6 +316,20 @@ class combined_thread(PauseableThread):
         # exhausted query or a partial download keeps the PID pending.
         self._last_pid_ok = bool(ok) and download_ok
         return failed if isinstance(failed, list) else []
+
+    def _download_pid_group_with_page_progress(self, pid, urls):
+        page_q = _CombinedPageProgressQueue(self._q, pid, len(urls))
+        original_q = self.downloader._q
+        self.downloader._q = page_q
+        try:
+            page_q.reset()
+            return self.downloader._download_pid_group(pid, urls)
+        finally:
+            self.downloader._q = original_q
+
+    def _clear_page_progress(self):
+        with contextlib.suppress(Exception):
+            self._q.put(WorkerEvent("page_progress", None))
 
     def _seed_pending_urls(self, pid, urls):
         db = self.fetcher._metadata_db

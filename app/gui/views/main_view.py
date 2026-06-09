@@ -73,6 +73,25 @@ class MainView:
             color=ft.Colors.BLUE_GREY_500,
             width=160,
         )
+        self._page_progress_bar = ft.ProgressBar(value=0, expand=True)
+        self._page_progress_text = ft.Text(
+            "",
+            size=11,
+            color=ft.Colors.BLUE_GREY_500,
+            width=180,
+        )
+        self._page_progress_row = ft.Row(
+            controls=[
+                ft.Container(width=24),
+                self._page_progress_bar,
+                self._page_progress_text,
+            ],
+            spacing=8,
+            visible=False,
+        )
+        self._page_progress_value = 0
+        self._page_progress_total = 0
+        self._page_progress_pid = ""
         self._countdown_text = ft.Text(
             "",
             size=13,
@@ -344,6 +363,55 @@ class MainView:
         except Exception:
             pass
 
+    def update_page_progress(self, delta: int, total: int, pid: str = "") -> None:
+        """Update the current PID's page progress without touching PID progress."""
+        try:
+            d = int(delta)
+            t = int(total)
+        except (TypeError, ValueError):
+            return
+        pid_text = "" if pid is None else str(pid)
+        if t <= 0:
+            self.clear_page_progress()
+            return
+
+        if pid_text != self._page_progress_pid:
+            self._page_progress_value = 0
+        if d <= 0:
+            self._page_progress_value = 0
+        else:
+            self._page_progress_value += d
+
+        self._page_progress_total = t
+        self._page_progress_pid = pid_text
+        self._page_progress_value = max(0, min(self._page_progress_value, t))
+        label = f"PID {pid_text} 分頁" if pid_text else "分頁"
+        self._page_progress_text.value = (
+            f"{label} {self._page_progress_value}/{self._page_progress_total}"
+        )
+        self._page_progress_bar.value = self._page_progress_value / t
+        self._page_progress_row.visible = True
+        try:
+            self._page_progress_row.update()
+            self._page_progress_bar.update()
+            self._page_progress_text.update()
+        except Exception:
+            pass
+
+    def clear_page_progress(self) -> None:
+        self._page_progress_value = 0
+        self._page_progress_total = 0
+        self._page_progress_pid = ""
+        self._page_progress_bar.value = 0
+        self._page_progress_text.value = ""
+        self._page_progress_row.visible = False
+        try:
+            self._page_progress_row.update()
+            self._page_progress_bar.update()
+            self._page_progress_text.update()
+        except Exception:
+            pass
+
     def _format_eta(self, now: float) -> str:
         if self._progress_started_at is None:
             return ""
@@ -542,6 +610,7 @@ class MainView:
             controls=[
                 top_row,
                 progress_row,
+                self._page_progress_row,
                 self._phase_row,
                 ft.Divider(),
                 ft.Text("即時 Log", size=12, weight=ft.FontWeight.BOLD),
