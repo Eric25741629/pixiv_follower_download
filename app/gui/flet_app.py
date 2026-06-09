@@ -357,12 +357,13 @@ def main(page: ft.Page) -> None:
             pass
 
     main_view = MainView(page, event_q)
-    settings_view = SettingsView(page)
-    cookies_view = CookiesView(page, event_q)
-    stats_view = StatsView(page, stats_collector)
-
     run_controller = RunController(main_view, event_q, stats_collector, event_log=event_log)
     main_view._run_controller = run_controller
+    # SettingsView notifies the controller on every save so a running task can
+    # apply in-scope settings live (and log what needs the next run).
+    settings_view = SettingsView(page, on_saved=run_controller.notify_settings_saved)
+    cookies_view = CookiesView(page, event_q)
+    stats_view = StatsView(page, stats_collector)
 
     # In-app scheduler: fire Run All on the configured schedule. The service
     # reads settings live and skips when a run is already active.

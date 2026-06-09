@@ -193,10 +193,15 @@ class download_thread(PauseableThread):
         event_log=None,
         defer_step4_scan=False,
         db_base_path=None,
+        live=None,
         **legacy_kwargs,
     ):
         super().__init__(q, scheduler=scheduler)
         self._event_log = event_log
+        # Live-apply: re-pull in-scope settings at each PID boundary when the
+        # user saves mid-run. None -> behaves exactly as before (snapshot only).
+        self._live = live
+        self._live_sig = None
         self._init_basic_options(
             nogif, notag, notime, create_dir, download_path, cookies, agent,
             download_time, no_R18G_dir, no_R18_dir, single_thread_mode, stats_collector,
@@ -352,6 +357,90 @@ class download_thread(PauseableThread):
         self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
         self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
         self._pid_filter_decision = {}
+
+    @staticmethod
+    def _parse_live_download_time(raw):
+        """Parse a settings ``download_time`` string into a datetime (epoch on error)."""
+        s = str(raw or "").strip()
+        if not s:
+            return datetime.datetime(1970, 1, 1)
+        try:
+            return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return datetime.datetime(1970, 1, 1)
+
+    def _apply_live_settings_if_changed(self):
+        """Re-pull in-scope settings when settings.json changed since last apply.
+
+        Called at each PID boundary. Refreshes filters, output path/dir flags,
+        filename options, waits, no-scheduler cooldown, and JXL options;
+        recomputes derived tag-normal forms and clears the per-PID filter
+        decision cache so cached decisions re-evaluate under the new filter.
+        Deliberately does NOT touch ``self.allurl``: the download queue stays
+        fixed, so lowering ``like_num`` mid-run never re-admits already-excluded
+        work (the accepted tighten-only semantic).
+        """
+        live = getattr(self, "_live", None)
+        if live is None:
+            return
+        sig = live.signature()
+        if sig == getattr(self, "_live_sig", None):
+            return
+        s = live.sections()
+        self._live_sig = sig
+        dl = s.get("download", {}) or {}
+        flt = s.get("filter", {}) or {}
+        directory = s.get("directory", {}) or {}
+        perf = s.get("performance", {}) or {}
+        jxl = s.get("jxl", {}) or {}
+
+        try:
+            like = int(dl.get("like_num", 0) or 0)
+        except (TypeError, ValueError):
+            like = 0
+        self.like_num = like if like > 0 else 0
+        self.ban_tag = list(dl.get("ban_tag", []) or [])
+        self.must_tag = list(dl.get("must_tag", []) or [])
+        self.special_like_rules = list(dl.get("special_like_rules", []) or [])
+        self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
+        self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
+        self.nogif = bool(flt.get("nogif", False))
+        self.notag = bool(flt.get("notag", False))
+        self.notime = bool(flt.get("notime", False))
+        self.download_time = self._parse_live_download_time(dl.get("download_time"))
+
+        new_path = str(dl.get("path", "") or "").strip()
+        if new_path:
+            self.download_path = new_path
+        self.create_dir = bool(directory.get("create_dir", False))
+        self.no_R18G_dir = bool(directory.get("no_R18G_dir", False))
+        self.no_R18_dir = bool(directory.get("no_R18_dir", False))
+        self.ai_gen_dir = bool(directory.get("ai_gen_dir", False))
+
+        self.filename_template = str(dl.get("filename_template", "") or "").strip()
+        self.tag_strip_brackets = bool(dl.get("tag_strip_brackets", False))
+        self.tag_strip_special_chars = bool(dl.get("tag_strip_special_chars", False))
+
+        self.intra_pid_wait_min, self.intra_pid_wait_max = self._resolve_intra_pid_wait_range(
+            perf.get("intra_pid_wait_min", 5), perf.get("intra_pid_wait_max", 15)
+        )
+        try:
+            self._legacy_pid_cooldown_avg = int(perf.get("pid_cooldown_avg", 35))
+        except (TypeError, ValueError):
+            self._legacy_pid_cooldown_avg = 35
+
+        self.jxl_enable = bool(jxl.get("enable", False))
+        try:
+            self.jxl_effort = max(1, min(9, int(jxl.get("effort", 7))))
+        except (TypeError, ValueError):
+            self.jxl_effort = 7
+        self.jxl_delete_original = bool(jxl.get("delete_original", False))
+        self.jxl_cjxl_path = self._resolve_cjxl_path(str(jxl.get("cjxl_path", "") or ""))
+
+        try:
+            self._pid_filter_decision.clear()
+        except Exception:
+            self._pid_filter_decision = {}
 
     def _init_step4_paths_and_state(self):
         """Initialize file paths and per-run mutable Step 4 state."""
@@ -1850,6 +1939,9 @@ class download_thread(PauseableThread):
         return list(pid_order), [list(pid_order)]
 
     def _download_pid_group(self, pid, urls):
+        # Pick up any mid-run 「儲存設定」 before this PID's pages: path/dir
+        # flags, filename options, waits, cooldown, and JXL options.
+        self._apply_live_settings_if_changed()
         failed = []
         # Build session with the bound proxy when an account is currently held.
         acc = getattr(self, '_current_account', None)

@@ -128,6 +128,7 @@ class combined_thread(PauseableThread):
         scheduler=None,
         stats_collector=None,
         event_log=None,
+        live=None,
     ):
         super().__init__(q, scheduler=scheduler)
         if isinstance(base_path, str) and base_path.strip():
@@ -148,6 +149,7 @@ class combined_thread(PauseableThread):
             special_like_rules=special_like_rules or [],
             stats_collector=stats_collector, event_log=event_log,
             rescrape_within_days=rescrape_within_days,
+            live=live,
         )
         self.downloader = thread_download.download_thread(
             q=q, nogif=nogif, notag=notag, notime=notime, create_dir=create_dir,
@@ -165,6 +167,7 @@ class combined_thread(PauseableThread):
             author_order=author_order, stats_collector=stats_collector,
             event_log=event_log,
             defer_step4_scan=True, db_base_path=self.path,
+            live=live,
         )
 
         # Share one set of control events + one DB connection.
@@ -283,6 +286,10 @@ class combined_thread(PauseableThread):
         query or a partial-download failure is NOT silently dropped from the
         pending list.
         """
+        # Pick up any mid-run 「儲存設定」 on both engines before this PID
+        # (one shared LiveSettings; the signature check makes this near-free).
+        self.fetcher._apply_live_settings_if_changed()
+        self.downloader._apply_live_settings_if_changed()
         self._last_pid_ok = False
         acc = self._acquire_account()
         if acc is None:

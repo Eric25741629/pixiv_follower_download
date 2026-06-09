@@ -70,10 +70,15 @@ class get_img_url_thread(PauseableThread):
         *,
         event_log=None,
         rescrape_within_days=0,
+        live=None,
     ):
         super().__init__(q, scheduler=scheduler)
         self._stats_collector = stats_collector
         self._event_log = event_log
+        # Live-apply: re-pull in-scope settings at each PID boundary when the
+        # user saves mid-run. None -> behaves exactly as before (snapshot only).
+        self._live = live
+        self._live_sig = None
         self._rescrape_within_days = self._coerce_rescrape_days(rescrape_within_days)
         self._init_basic_options(
             Author_list, Agent, cookies, exist_pid, ban_tag, must_tag,
@@ -147,6 +152,49 @@ class get_img_url_thread(PauseableThread):
         if hi < lo:
             hi = lo
         return lo, hi
+
+    def _apply_live_settings_if_changed(self):
+        """Re-pull in-scope filters/waits/rescrape when settings.json changed.
+
+        Called at each PID boundary in :meth:`_run_processing_loop`. Step 3
+        reads PIDs from ``pictures_id.txt`` (not like-prefiltered), so a changed
+        like/tag filter applies in both directions on the NEXT PID. Recomputes
+        derived tag-normal forms and clears the per-PID decision cache.
+        """
+        live = getattr(self, "_live", None)
+        if live is None:
+            return
+        sig = live.signature()
+        if sig == getattr(self, "_live_sig", None):
+            return
+        s = live.sections()
+        self._live_sig = sig
+        dl = s.get("download", {}) or {}
+        perf = s.get("performance", {}) or {}
+        try:
+            like = int(dl.get("like_num", 0) or 0)
+        except (TypeError, ValueError):
+            like = 0
+        self.like_num = like if like > 0 else 0
+        self.ban_tag = list(dl.get("ban_tag", []) or [])
+        self.must_tag = list(dl.get("must_tag", []) or [])
+        self.special_like_rules = _normalize_special_like_rules(
+            dl.get("special_like_rules", []) or []
+        )
+        self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
+        self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
+        self.pid_wait_nocookie_min, self.pid_wait_nocookie_max = (
+            self._resolve_nocookie_wait_range(
+                perf.get("pid_wait_nocookie_min", 1), perf.get("pid_wait_nocookie_max", 6)
+            )
+        )
+        self._rescrape_within_days = self._coerce_rescrape_days(
+            dl.get("rescrape_within_days", 0)
+        )
+        try:
+            self._pid_filter_decision.clear()
+        except Exception:
+            self._pid_filter_decision = {}
 
     def _init_step3_state(self):
         """Initialize per-run mutable Step 3 state (queues, counters, paths)."""
@@ -1466,6 +1514,9 @@ class get_img_url_thread(PauseableThread):
                 pid = task_queue.get_nowait()
             except Exception:
                 break
+
+            # Pick up any mid-run 「儲存設定」 before filtering/querying this PID.
+            self._apply_live_settings_if_changed()
 
             if self._scheduler is not None:
                 one, stop = self._fetch_one_pid_via_scheduler(pid)

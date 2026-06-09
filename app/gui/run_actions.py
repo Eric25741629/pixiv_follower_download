@@ -18,6 +18,7 @@ from app.core.pixiv_thread_utils import (
     safe_read_json, normalize_cookie_entries, sync_exist_pid_with_download_folder,
 )
 from app.core.metadata_db import DB_FILENAME, MetadataDB
+from app.core.live_settings import LiveSettings
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
 import contextlib
 
@@ -96,12 +97,25 @@ class RunController:
 
     force_combined = False  # CLI 'combined' step sets this to force combined mode
 
+    # Baseline settings snapshot captured when the active run's thread was built;
+    # notify_settings_saved() diffs against it. Class default so __new__-based
+    # tests can read it without AttributeError.
+    _active_snapshot = None
+
     def __init__(self, main_view, event_q: Queue, stats_collector=None, event_log=None):
         self._main_view = main_view
         self._event_q = event_q
         self._run_all_mode = False
         self._stats_collector = stats_collector
         self._event_log = event_log
+        # Shared live-settings reader: lets a mid-run 「儲存設定」 take effect on
+        # the next item for in-scope settings. Degrades to None (snapshot-only)
+        # if the data dir is unavailable.
+        try:
+            self._live = LiveSettings(_data_path())
+        except Exception:
+            self._live = None
+        self._active_snapshot = None
 
     def _backup_db(self) -> None:
         """Run at most once per local-time day. Persists last-success date via
@@ -170,6 +184,82 @@ class RunController:
 
     def _log(self, html: str) -> None:
         self._event_q.put(WorkerEvent("output", html))
+
+    # ── Live-apply on save ───────────────────────────────────────────────────
+    # Which settings.json keys take effect mid-run (green notice, applied on the
+    # next item by the worker's _apply_live_settings_if_changed) vs which need a
+    # fresh run because they pick the pipeline shape at construction (grey).
+    _LIVE_KEY_LABELS = {
+        "download.like_num": "最低讚數",
+        "download.ban_tag": "排除標籤",
+        "download.must_tag": "必含標籤",
+        "download.special_like_rules": "標籤讚數規則",
+        "download.download_time": "下載日期門檻",
+        "download.rescrape_within_days": "重抓天數",
+        "download.path": "下載路徑",
+        "download.filename_template": "檔名範本",
+        "download.tag_strip_brackets": "Tag 過濾括號",
+        "download.tag_strip_special_chars": "Tag 過濾特殊符號",
+        "filter.nogif": "過濾 GIF",
+        "filter.notag": "無 tag 不下載",
+        "filter.notime": "無時間不下載",
+        "directory.create_dir": "依作者建資料夾",
+        "directory.no_R18G_dir": "R-18G 分資料夾",
+        "directory.no_R18_dir": "R-18 分資料夾",
+        "directory.ai_gen_dir": "AI 生成分資料夾",
+        "performance.pid_cooldown_avg": "帳號冷卻時間",
+        "performance.pid_wait_nocookie_min": "無 Cookie 等待下限",
+        "performance.pid_wait_nocookie_max": "無 Cookie 等待上限",
+        "performance.intra_pid_wait_min": "頁間等待下限",
+        "performance.intra_pid_wait_max": "頁間等待上限",
+        "jxl.enable": "JXL 轉換",
+        "jxl.effort": "JXL 壓縮等級",
+        "jxl.delete_original": "JXL 刪除原檔",
+        "jxl.cjxl_path": "cjxl 路徑",
+    }
+    _NEXT_RUN_KEY_LABELS = {
+        "download.combined_mode": "邊查邊下",
+        "performance.single_thread_mode": "單執行緒",
+        "download.author_order": "依作者順序下載",
+        "download.force_full_rescan": "強制完整重掃",
+    }
+
+    @staticmethod
+    def _diff_setting_labels(baseline: dict, current: dict, labels: dict) -> list[str]:
+        """Labels for the keys whose value differs between baseline and current."""
+        changed = []
+        for key, label in labels.items():
+            section, _, field = key.partition(".")
+            before = (baseline.get(section) or {}).get(field)
+            after = (current.get(section) or {}).get(field)
+            if before != after:
+                changed.append(label)
+        return changed
+
+    def notify_settings_saved(self) -> None:
+        """Emit a notice after a mid-run save: what applied live (next item) vs
+        what needs the next run. No-op when no task is currently running."""
+        active = getattr(self._main_view, "_active_thread", None)
+        if active is None or not active.is_alive():
+            return
+        live = getattr(self, "_live", None)
+        if live is None:
+            return
+        current = live.sections()
+        baseline = getattr(self, "_active_snapshot", None) or {}
+        live_changed = self._diff_setting_labels(baseline, current, self._LIVE_KEY_LABELS)
+        next_changed = self._diff_setting_labels(baseline, current, self._NEXT_RUN_KEY_LABELS)
+        if live_changed:
+            self._log(
+                "<p><font color='green'>已即時套用（下一個項目起生效）："
+                + "、".join(live_changed) + "</font></p>"
+            )
+        if next_changed:
+            self._log(
+                "<p><font color='gray'>"
+                + "、".join(next_changed) + " 將於下次執行套用</font></p>"
+            )
+        self._active_snapshot = current
 
     def _extract_cookie_entries(self, auth: dict) -> list[dict]:
         """Pull configured cookie entries (cookie + alias + status +
@@ -602,6 +692,7 @@ class RunController:
             stats_collector=self._stats_collector,
             event_log=self._event_log,
             rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
+            live=self._live,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
@@ -647,6 +738,7 @@ class RunController:
             author_order=bool(dl.get("author_order", False)),
             rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
             stats_collector=self._stats_collector, event_log=self._event_log,
+            live=self._live,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
@@ -702,6 +794,7 @@ class RunController:
             author_order=bool(dl.get("author_order", False)),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
+            live=self._live,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
@@ -716,6 +809,11 @@ class RunController:
         jxl = store.get_section("jxl")
         agent = _agent(auth)
         path = _data_path()
+
+        # Baseline for the live-apply save notice (what this run was built from).
+        if self._live is not None:
+            with contextlib.suppress(Exception):
+                self._active_snapshot = self._live.sections()
 
         if n == 1:
             return self._build_step1(auth, agent, flt)

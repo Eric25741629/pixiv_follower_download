@@ -28,8 +28,11 @@ def _safe_int(value, default: int) -> int:
 class SettingsView:
     """Settings page grouped into ExpansionTile sections."""
 
-    def __init__(self, page: ft.Page):
+    def __init__(self, page: ft.Page, on_saved=None):
         self._page = page
+        # Optional callback fired after any persist (explicit save + autosave
+        # toggles) so a running task can be notified to apply live settings.
+        self._on_saved = on_saved
         # Flet 0.84: FilePicker is a Service (not a Control) and is registered
         # via page.services; methods are async and return values directly.
         self._file_picker = ft.FilePicker()
@@ -258,6 +261,9 @@ class SettingsView:
             value = (not bool(switch.value)) if invert else bool(switch.value)
             with contextlib.suppress(Exception):
                 _store().update_fields(section, {key: value})
+            if self._on_saved is not None:
+                with contextlib.suppress(Exception):
+                    self._on_saved()
         return _handler
 
     # ------------------------------------------------------------------
@@ -508,6 +514,9 @@ class SettingsView:
                 "effort": int(self._sl_jxl_effort.value),
             },
         })
+        if self._on_saved is not None:
+            with contextlib.suppress(Exception):
+                self._on_saved()
 
     def _save_and_notify(self, e) -> None:
         avg_val = self._safe_int_cooldown()
