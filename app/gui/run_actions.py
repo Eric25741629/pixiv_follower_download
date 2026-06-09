@@ -340,16 +340,22 @@ class RunController:
                 return
             now = _time.time()
             new_entries = []
+            refreshed_at = None
             for e in entries:
                 if not isinstance(e, dict):
                     new_entries.append(e)
                     continue
                 c = str(e.get("cookie", "")).strip()
                 if c == cookie.strip() and e.get("status") == "有效":
+                    refreshed_at = now
                     new_entries.append({**e, "last_tested_at": now})
                 else:
                     new_entries.append(e)
             store.update_section("auth", {**auth, "cookies_entries": new_entries})
+            if refreshed_at is not None:
+                self._event_q.put(WorkerEvent(
+                    "cookie_status", (cookie.strip(), "有效", refreshed_at)
+                ))
         except Exception:
             pass
 

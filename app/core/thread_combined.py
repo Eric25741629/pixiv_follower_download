@@ -290,6 +290,7 @@ class combined_thread(PauseableThread):
         sess = pixiv_api.make_session(acc.proxy_url)
         failed = []
         ok = True
+        account_ok = True
         download_ok = True
         try:
             if needs_query:
@@ -322,7 +323,7 @@ class combined_thread(PauseableThread):
                 # crash leaves a recoverable pending trail in the DB.
                 self._seed_pending_urls(pid, urls)
                 self.downloader._current_account = acc
-                _, failed, _ = self._run_with_network_retry(
+                account_ok, failed, _ = self._run_with_network_retry(
                     f"PID {pid} 下載",
                     lambda: self._download_pid_group_with_page_progress(pid, urls),
                 )
@@ -345,7 +346,7 @@ class combined_thread(PauseableThread):
                 self._clear_page_progress()
         finally:
             self.downloader._current_account = None
-            self._release_account(acc, ok=ok and download_ok)
+            self._release_account(acc, ok=ok and account_ok)
             with contextlib.suppress(Exception):
                 sess.close()
         # "Genuine success": query succeeded (or not needed) AND downloads
