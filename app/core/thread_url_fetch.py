@@ -330,6 +330,12 @@ class get_img_url_thread(PauseableThread):
             self._apply_cookie_requirement_entry(merged, pid_key, req)
 
     def _load_saved_cookie_requirement_map(self):
+        # Only reached from _migrate_url_meta_schema, which now early-returns
+        # when url_meta is empty (always the case in Steps 3/4 — meta is read
+        # on-demand from the DB). So the costly primary+history parse of the
+        # large pixiv_cookie_requirement.json files is skipped in the hot path;
+        # the gap-fill-from-history contract below is preserved for the rare
+        # case where in-memory url_meta is non-empty.
         merged = {}
         primary = self._cookie_requirement_primary_paths()
         history = self._cookie_requirement_history_paths(primary)
@@ -403,7 +409,12 @@ class get_img_url_thread(PauseableThread):
         return changed
 
     def _migrate_url_meta_schema(self):
-        if not isinstance(self.url_meta, dict):
+        if not isinstance(self.url_meta, dict) or not self.url_meta:
+            # Steps 3/4 load meta on-demand from the DB, so url_meta starts
+            # empty — there is nothing to migrate. Returning early avoids the
+            # (now history-skipped, but still non-trivial) cookie-requirement
+            # file parse when no in-memory meta exists. The dedicated
+            # _load_cookie_requirement_cache() still seeds the runtime map.
             return False
         try:
             saved_req_map = self._load_saved_cookie_requirement_map()

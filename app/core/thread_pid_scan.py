@@ -53,7 +53,10 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
         self._stats_collector = stats_collector
         self._event_log = event_log
         self._metadata_db = self._init_metadata_db()
-        self._mirror_exist_pid_to_db()
+        # No mirror-back: exist_pid is the DB's closed set passed in from
+        # ``_build_step2`` (``MetadataDB(path).closed_artwork_set()``), so
+        # re-importing it would only re-scan ~1.1M rows and invalidate the
+        # closed-set cache for the rest of this run.
         self._emit_metadata_db_stats(stage="Step2")
 
     def _init_metadata_db(self):

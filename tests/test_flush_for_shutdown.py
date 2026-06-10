@@ -104,7 +104,8 @@ def test_step2_flush_closes_db_and_keeps_data_visible(tmp_path):
     t = get_pixiv_author_imgID_Thread.__new__(get_pixiv_author_imgID_Thread)
     t.path = str(tmp_path)
     t._metadata_db = MetadataDB(str(tmp_path))
-    t._metadata_db.mark_downloaded("99")
+    # Canonical sentinel write — visible to v_closed_artworks / is_downloaded.
+    t._metadata_db.import_downloaded_set(["99"])
 
     t.flush_for_shutdown()
     # Re-opening sees the persisted data — proves the close checkpoint ran.

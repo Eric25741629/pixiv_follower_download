@@ -58,6 +58,13 @@ def normalize_pid(value):
     s = str(value).strip()
     if not s:
         return ""
+    # Fast path: a bare digit string (the overwhelmingly common case — every
+    # PID in the DB closed set is already normalized) needs no transforms.
+    # ``'_' split``, ``replace('p0')`` and ``re.search`` are all no-ops on
+    # pure digits, so this is exactly equivalent and ~5x cheaper. Matters
+    # because normalize_pid_set runs this over the ~1.1M-element closed set.
+    if s.isdigit():
+        return s
     if '_' in s:
         s = s.split('_', 1)[0]
     s = s.replace('p0', '')
@@ -263,40 +270,68 @@ def load_exist_pid_set(base_path):
     return out
 
 
-def scan_download_folder_for_pid_set(download_path, recursive=True):
+def _scan_download_folder(download_path, recursive=True):
+    """Single ``os.walk`` pass returning ``(pids, dir_mtimes, file_count)``.
+
+    ``dir_mtimes`` maps every visited directory to its ``st_mtime_ns``. It is
+    the cheap change signature a later run uses (via
+    :func:`_folder_dir_mtimes_match`) to skip the walk entirely: adding,
+    removing or renaming any file updates its parent directory's mtime, and
+    creating a sub-directory updates *its* parent's mtime, so re-stat'ing the
+    known directory list detects every change in O(#dirs) stat calls instead
+    of re-enumerating every file.
+    """
     found = set()
-    scanned_files = 0
+    dir_mtimes = {}
+    file_count = 0
     p = str(download_path or "").strip()
     if not p or (not os.path.isdir(p)):
-        return found, scanned_files
+        return found, dir_mtimes, file_count
     for root, _, files in os.walk(p):
+        try:
+            dir_mtimes[root] = os.stat(root).st_mtime_ns
+        except OSError:
+            pass
         for file_name in files:
-            scanned_files += 1
+            file_count += 1
             try:
                 found.update(_extract_pid_candidates_from_name(file_name))
             except Exception:
                 pass
         if not recursive:
             break
+    return found, dir_mtimes, file_count
+
+
+def scan_download_folder_for_pid_set(download_path, recursive=True):
+    """Backward-compatible wrapper: ``(pids, file_count)`` via one walk."""
+    found, _dir_mtimes, scanned_files = _scan_download_folder(
+        download_path, recursive=recursive,
+    )
     return found, scanned_files
+
+
+def _folder_dir_mtimes_match(cached_dir_mtimes):
+    """True iff every cached directory still exists with the same mtime_ns.
+
+    O(#dirs) ``os.stat`` calls, no file enumeration. A missing/changed
+    directory (file added/removed/renamed anywhere, or a sub-dir created)
+    fails the check and forces a full rescan. Empty/old-format cache → False.
+    """
+    if not isinstance(cached_dir_mtimes, dict) or not cached_dir_mtimes:
+        return False
+    for dir_path, mtime_ns in cached_dir_mtimes.items():
+        try:
+            if os.stat(dir_path).st_mtime_ns != int(mtime_ns):
+                return False
+        except (OSError, TypeError, ValueError):
+            return False
+    return True
 
 
 def _get_folder_file_count_cache_path(base_path):
     """取得檔案數量快取檔案的路徑"""
     return os.path.join(base_path, "folder_file_count_cache.json")
-
-
-def _count_files_in_folder(download_path, recursive=True):
-    """遞迴計算資料夾中的檔案數量"""
-    p = str(download_path or "").strip()
-    if not p or (not os.path.isdir(p)):
-        return 0
-    count = 0
-    for root, _, files in os.walk(p):
-        count += len(files)
-        if not recursive:
-            break
-    return count
 
 
 def _load_folder_file_count_cache(base_path):
@@ -378,27 +413,27 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
     merged = set(disk_set)
     merged.update(normalize_pid_set(current_exist_pid))
 
-    # 檢查檔案數量快取
+    # 目錄 mtime 簽章快取：未變動就完全略過 os.walk（只 stat 已知目錄）
     cache = _load_folder_file_count_cache(base_path)
-    current_file_count = _count_files_in_folder(download_path, recursive=recursive)
-
     download_path_norm = os.path.normpath(str(download_path or ""))
     cached_info = cache.get(download_path_norm, {})
-    cached_count = cached_info.get("file_count", -1)
-    cached_pids = set(cached_info.get("pids", []))
+    cached_dir_mtimes = cached_info.get("dir_mtimes", {})
+    prev_cached_pids = set(cached_info.get("pids", []))
 
-    # 如果檔案數量相同，使用快取的 PID 結果
-    used_cache = cached_count == current_file_count and current_file_count > 0
+    used_cache = _folder_dir_mtimes_match(cached_dir_mtimes)
+    new_pids = set()
     if used_cache:
-        scanned_pids = cached_pids
-        scanned_files = current_file_count
+        scanned_pids = prev_cached_pids
+        scanned_files = int(cached_info.get("file_count", 0) or 0)
     else:
-        # 檔案數量變化，重新掃描
-        scanned_pids, scanned_files = scan_download_folder_for_pid_set(
+        # 任一目錄 mtime 變了（或首次/舊格式快取）→ 重新掃描一趟
+        scanned_pids, dir_mtimes, scanned_files = _scan_download_folder(
             download_path, recursive=recursive,
         )
+        new_pids = scanned_pids - prev_cached_pids
         cache[download_path_norm] = {
-            "file_count": current_file_count,
+            "file_count": scanned_files,
+            "dir_mtimes": dir_mtimes,
             "pids": list(scanned_pids),
             "updated_at": datetime.datetime.now().isoformat(),
         }
@@ -412,10 +447,13 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
     if base_path and changed_vs_disk:
         json_path = os.path.join(base_path, "exist_pid.json")
         atomic_write_json(json_path, list(merged), backup=True)  # PHASE-A
-    # PHASE-A: shadow-write the scanned set (not merged — DB already has
-    # closed-artwork rows for every PID workers have downloaded; we only
-    # need to register externally-discovered ones).
-    _shadow_write_exist_pid_to_db(base_path, scanned_pids, event_log=event_log)
+    # PHASE-A: shadow-write only the *newly discovered* PIDs (the delta).
+    # On a cache hit nothing is new; previously-scanned PIDs were already
+    # mirrored on the run that discovered them. This avoids re-importing the
+    # whole folder set (200k+ rows) every run AND keeps the DB file signature
+    # stable so the closed-artwork-set cache survives across the step build.
+    if new_pids:
+        _shadow_write_exist_pid_to_db(base_path, new_pids, event_log=event_log)
 
     return {
         "merged_set": merged,

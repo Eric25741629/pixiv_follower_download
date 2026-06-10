@@ -252,7 +252,12 @@ class download_thread(PauseableThread):
             self.pid_max = 0
             return
         self.exist_pid = self._load_initial_exist_pid_set()
-        self._mirror_exist_pid_to_db()
+        # No mirror-back: exist_pid is read straight from the DB's closed set
+        # (``_load_initial_exist_pid_set`` → ``closed_artwork_set``), so
+        # re-importing it is a guaranteed no-op that would only re-scan ~1.1M
+        # rows, emit a giant event-log line, and invalidate the closed-set
+        # cache. Externally-dropped files are registered by
+        # ``_sync_exist_pid_from_download_folder`` before this thread builds.
         self._emit_metadata_db_stats(stage="Step4")
         self._warn_if_meta_empty_with_like_filter()
         self._read_all_url_file_into_state()
@@ -394,6 +399,7 @@ class download_thread(PauseableThread):
         perf = s.get("performance", {}) or {}
         jxl = s.get("jxl", {}) or {}
 
+        # filters (tighten-only for Step 4: the queue is already built)
         try:
             like = int(dl.get("like_num", 0) or 0)
         except (TypeError, ValueError):
@@ -409,6 +415,7 @@ class download_thread(PauseableThread):
         self.notime = bool(flt.get("notime", False))
         self.download_time = self._parse_live_download_time(dl.get("download_time"))
 
+        # output location (user opted in despite the split-output tradeoff)
         new_path = str(dl.get("path", "") or "").strip()
         if new_path:
             self.download_path = new_path
@@ -417,10 +424,12 @@ class download_thread(PauseableThread):
         self.no_R18_dir = bool(directory.get("no_R18_dir", False))
         self.ai_gen_dir = bool(directory.get("ai_gen_dir", False))
 
+        # filename
         self.filename_template = str(dl.get("filename_template", "") or "").strip()
         self.tag_strip_brackets = bool(dl.get("tag_strip_brackets", False))
         self.tag_strip_special_chars = bool(dl.get("tag_strip_special_chars", False))
 
+        # waits + no-scheduler cooldown fallback
         self.intra_pid_wait_min, self.intra_pid_wait_max = self._resolve_intra_pid_wait_range(
             perf.get("intra_pid_wait_min", 5), perf.get("intra_pid_wait_max", 15)
         )
@@ -429,6 +438,7 @@ class download_thread(PauseableThread):
         except (TypeError, ValueError):
             self._legacy_pid_cooldown_avg = 35
 
+        # jxl
         self.jxl_enable = bool(jxl.get("enable", False))
         try:
             self.jxl_effort = max(1, min(9, int(jxl.get("effort", 7))))
@@ -437,6 +447,7 @@ class download_thread(PauseableThread):
         self.jxl_delete_original = bool(jxl.get("delete_original", False))
         self.jxl_cjxl_path = self._resolve_cjxl_path(str(jxl.get("cjxl_path", "") or ""))
 
+        # re-evaluate cached per-PID filter decisions under the new filter
         try:
             self._pid_filter_decision.clear()
         except Exception:

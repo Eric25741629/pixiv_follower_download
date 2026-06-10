@@ -109,9 +109,10 @@ def test_empty_pid_is_noop(tmp_path):
 def test_mark_and_query_downloaded(tmp_path):
     db = MetadataDB(str(tmp_path))
     assert db.is_downloaded("1") is False
-    db.mark_downloaded("1", downloaded_at="2026-05-01T00:00:00")
+    # Canonical close: sentinel artwork row (no pages required).
+    db.import_downloaded_set(["1"])
     assert db.is_downloaded("1") is True
-    db.mark_downloaded("2")
+    db.import_downloaded_set(["2"])
     assert db.downloaded_count() == 2
     assert db.downloaded_set() == {"1", "2"}
     db.close()
