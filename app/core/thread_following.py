@@ -17,6 +17,8 @@ from app.core.pixiv_thread_base import (
     PauseableThread,
 )
 
+_pid_count_lock = threading.Lock()
+
 class get_following(PauseableThread):
     '''抓取使用者關注的畫師清單'''
     def __init__(self, q, userid, cookies, Agent, following_scope):
@@ -28,7 +30,7 @@ class get_following(PauseableThread):
         self._partial_following = []
         self._partial_lock = threading.Lock()
         self.following_scope = self._coerce_following_scope(following_scope)
-        # Legacy compatibility: old hide=True meant "public following only".
+        # Legacy compatibility: old code used hide=True to mean "public only".
         self.hide = self.following_scope == "public"
         self.max=0
 
@@ -83,10 +85,22 @@ class get_following(PauseableThread):
         if self._stop_event.is_set():
             return []
         global pid_num
-        pid_num=pid_num+100
+        with _pid_count_lock:
+            pid_num = pid_num + 100
         url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
-        res = requests.get(url.format(id), headers=headers, timeout=(10, 30))
-        resdicts = safe_json(res, 'body', 'users', default=[])
+        resdicts = []
+        for attempt in range(3):
+            try:
+                res = requests.get(url.format(id), headers=headers, timeout=(10, 30))
+                res.raise_for_status()
+                resdicts = safe_json(res, 'body', 'users', default=[])
+                break
+            except Exception as e:
+                if attempt < 2:
+                    print(output_err(e))
+                    time.sleep(2)
+                else:
+                    resdicts = []
         self._q.put(WorkerEvent("progress", (100, self.max)))
         i=[]
         try:
@@ -120,13 +134,24 @@ class get_following(PauseableThread):
                 + '&tag=&lang=zh_tw'
             )
             print(url.format(self.userid))
-            res = requests.get(url.format(self.userid), headers=headers, timeout=(10, 30))
-            if rest == "show":
-                print(res.text)
-            total_num = safe_json(res, 'body', 'total', default=0)
+            total_num = 0
+            for attempt in range(3):
+                try:
+                    res = requests.get(url.format(self.userid), headers=headers, timeout=(10, 30))
+                    res.raise_for_status()
+                    if rest == "show":
+                        print(res.text)
+                    total_num = safe_json(res, 'body', 'total', default=0)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        print(output_err(e))
+                        time.sleep(2)
+                    else:
+                        total_num = 0
             total_by_rest[rest] = total_num
             page_ranges[rest] = list(range(0, total_num+200, 100))
-        self.max=int(sum(total_by_rest.values()))
+        self.max = int(sum(total_by_rest.values()))
         self._q.put(WorkerEvent("output", f'total following: {self.max}'))
         results = []
         for rest in rest_values:

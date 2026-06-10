@@ -138,6 +138,7 @@ class PauseableThread(threading.Thread):
         self._pause_event.set()   # not paused by default
         self._stop_event = threading.Event()
         self._scheduler = scheduler  # AccountScheduler | None
+        self._cookie_usage_lock = threading.Lock()
 
     def pause(self):
         self._pause_event.clear()
@@ -188,12 +189,13 @@ class PauseableThread(threading.Thread):
             return label
         pid_key = normalize_pid(pid) or str(pid)
         try:
-            seen = self._cookie_usage_seen.setdefault(stage_key, set())
-            if pid_key in seen:
-                return label
-            seen.add(pid_key)
-            counts = self._cookie_usage_counts.setdefault(stage_key, {})
-            counts[label] = int(counts.get(label, 0)) + 1
+            with self._cookie_usage_lock:
+                seen = self._cookie_usage_seen.setdefault(stage_key, set())
+                if pid_key in seen:
+                    return label
+                seen.add(pid_key)
+                counts = self._cookie_usage_counts.setdefault(stage_key, {})
+                counts[label] = int(counts.get(label, 0)) + 1
         except Exception:
             pass
         return label
@@ -239,7 +241,16 @@ class PauseableThread(threading.Thread):
         then SQLite ``self._metadata_db`` lookup.  Returns ``{}`` when nothing
         is known about the PID."""
         pid_key = str(pid_key)
-        cached = self.url_meta.get(pid_key) if isinstance(getattr(self, "url_meta", None), dict) else None
+        lock = getattr(self, "_url_meta_lock", None)
+        url_meta = getattr(self, "url_meta", None)
+        if isinstance(url_meta, dict):
+            if lock is not None:
+                with lock:
+                    cached = url_meta.get(pid_key)
+            else:
+                cached = url_meta.get(pid_key)
+        else:
+            cached = None
         if isinstance(cached, dict) and cached:
             return cached
         db = getattr(self, "_metadata_db", None)

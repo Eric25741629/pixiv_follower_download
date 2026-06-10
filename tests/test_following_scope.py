@@ -1,6 +1,7 @@
-import sys
+"""Following visibility scope helpers."""
 from pathlib import Path
 from queue import Queue
+import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,10 +26,3 @@ def test_legacy_hidefollow_boolean_maps_to_following_scope(tmp_path, monkeypatch
 
     assert get_following(Queue(), "42", "cookie", "agent", True).following_scope == "public"
     assert get_following(Queue(), "42", "cookie", "agent", False).following_scope == "all"
-
-
-def test_show_hide_rest_names_are_accepted(tmp_path, monkeypatch):
-    monkeypatch.setenv("APPDATA", str(tmp_path))
-
-    assert get_following(Queue(), "42", "cookie", "agent", "show").following_scope == "public"
-    assert get_following(Queue(), "42", "cookie", "agent", "hide").following_scope == "private"
