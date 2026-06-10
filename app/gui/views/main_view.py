@@ -1,7 +1,6 @@
 from __future__ import annotations
 import asyncio
 import contextlib
-import os
 import queue
 import threading
 import time
@@ -11,6 +10,12 @@ from app.core.worker_event import WorkerEvent
 
 
 STEP_LABELS = ["步驟 1\n抓追蹤", "步驟 2\n抓 PID", "步驟 3\n抓 URL", "步驟 4\n下載"]
+_BOOKMARK_STEP_LABELS = ["步驟 1\n略過追隨", "步驟 2\n抓收藏 PID"]
+
+# When 邊查邊下 (download.combined_mode) is on, step 3 absorbs step 4: the
+# step-3 card is relabeled and the step-4 card is hidden (see
+# MainView.apply_combined_mode).
+_MERGED_STEP3_LABEL = "步驟 3+4\n邊查邊下"
 
 # Two palettes — light uses saturated 600-level bg + white text; dark uses
 # softer 400/800-level bg + dark text so colors don't look neon on black.
@@ -46,18 +51,20 @@ def _state_palette(page: ft.Page) -> dict[str, tuple[str, str]]:
 
 _MAX_LOG_LINES = 2000
 
-# Shared geometry for the two stacked progress bars (整體進度 / 本作分頁).
-# Both rows use the same leading label width, trailing count width and spacing
-# so the expand=True bars start and end at exactly the same x.
-_PROG_LEAD_W = 84
-_PROG_TRAIL_W = 210
-_PROG_BAR_HEIGHT = 12
+# Shared geometry for the two stacked progress bars (整體進度 / 本作分頁). Both
+# rows use the SAME leading-label width, trailing-count width and spacing so the
+# expand=True bars start and end at exactly the same x — otherwise they look
+# misaligned (the old layout indented the page row 24px and reserved a wildly
+# different trailing width on each row).
+_PROG_LEAD_W = 84      # leading label column ("整體進度" / "本作分頁")
+_PROG_TRAIL_W = 210    # trailing count column (fits "PID 1234567 分頁 12/15")
+_PROG_BAR_HEIGHT = 12  # thicker than the default ~4px hairline
 _PROG_BAR_RADIUS = 6
 _PROG_ROW_SPACING = 12
 
 
-
 def _settings_base_path() -> str:
+    import os
     path = os.getenv("APPDATA") + r"/pixiv_download/"
     os.makedirs(path, exist_ok=True)
     return path
@@ -76,6 +83,9 @@ class MainView:
         self._step_card_containers: list[ft.Container] = []
         self._step_card_texts: list[ft.Text] = []
         self._step_cards = [self._make_step_card(i) for i in range(4)]
+        # Whether the step 3+4 cards are merged (邊查邊下); applied in build()
+        # from settings and refreshed when the user returns to the 主頁 tab.
+        self._combined_mode = False
 
         self._btn_run_all = ft.FilledButton("▶ 一鍵執行", on_click=self._on_run_all)
         self._btn_pause = ft.OutlinedButton("⏸ 暫停", on_click=self._on_pause_toggle, disabled=True)
@@ -83,8 +93,15 @@ class MainView:
         self._is_paused = False
         self._cards_disabled = False
 
-        # Built by one shared helper so 整體進度 and 本作分頁 have identical
-        # geometry and the same visible-gated render lifecycle.
+        # ── 整體進度 / 本作分頁 bars ─────────────────────────────────────────
+        # Built by ONE shared helper so the two rows are IDENTICAL in both
+        # construction and update path (see _make_progress_row /
+        # _render_progress_row). Both start hidden and are revealed on their
+        # first real update. The reveal (visible False -> True) is load-bearing:
+        # it forces Flet to lay the row out with real content. An always-visible
+        # row first laid out with EMPTY children renders degenerate and later
+        # .value patches never reflow it — that was the 整體進度 freeze (本作分頁
+        # never froze precisely because it was visible-gated; now both are).
         self._progress_bar, self._progress_text, self._progress_row = (
             self._make_progress_row("整體進度", ft.Colors.BLUE_500)
         )
@@ -95,6 +112,7 @@ class MainView:
         self._page_progress_total = 0
         self._page_progress_pid = ""
 
+        # ── meta line (ETA + cooldown countdown), indented under the bars ────
         self._eta_text = ft.Text("", size=12, color=ft.Colors.BLUE_GREY_500)
         self._countdown_text = ft.Text(
             "", size=12, color=ft.Colors.ORANGE_600, weight=ft.FontWeight.BOLD,
@@ -123,33 +141,6 @@ class MainView:
             controls=[self._phase_ring, self._phase_label],
             spacing=6,
             visible=False,
-        )
-        self._following_scope = "all"
-        self._scope_label = ft.Text(
-            "追隨範圍",
-            size=12,
-            weight=ft.FontWeight.BOLD,
-            color=ft.Colors.BLUE_GREY_700,
-        )
-        self._btn_scope_public = ft.OutlinedButton(
-            "公開", on_click=lambda e: self._on_following_scope_change("public")
-        )
-        self._btn_scope_private = ft.OutlinedButton(
-            "非公開", on_click=lambda e: self._on_following_scope_change("private")
-        )
-        self._btn_scope_all = ft.OutlinedButton(
-            "全部", on_click=lambda e: self._on_following_scope_change("all")
-        )
-        self._following_scope_row = ft.Row(
-            controls=[
-                self._scope_label,
-                self._btn_scope_public,
-                self._btn_scope_private,
-                self._btn_scope_all,
-            ],
-            spacing=6,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            wrap=True,
         )
 
         # Modal overlay shown while a step is launching or stopping.
@@ -217,6 +208,80 @@ class MainView:
             visible=False,
         )
 
+        self._source_mode = "following"
+        self._following_scope = "all"
+        self._bookmark_scope = "all"
+        self._active_scope = "all"
+        self._mode_title = ft.Text("", size=13, weight=ft.FontWeight.BOLD)
+        self._mode_subtitle = ft.Text("", size=12, color=ft.Colors.BLUE_GREY_600)
+        self._scope_label = ft.Text(
+            "追隨範圍",
+            size=12,
+            weight=ft.FontWeight.BOLD,
+            color=ft.Colors.BLUE_GREY_700,
+        )
+        self._btn_source_following = ft.OutlinedButton(
+            "抓追隨", on_click=lambda e: self._on_source_mode_change("following")
+        )
+        self._btn_source_bookmarks = ft.OutlinedButton(
+            "抓收藏", on_click=lambda e: self._on_source_mode_change("bookmarks")
+        )
+        self._btn_scope_public = ft.OutlinedButton(
+            "公開", on_click=lambda e: self._on_scope_change("public")
+        )
+        self._btn_scope_private = ft.OutlinedButton(
+            "非公開", on_click=lambda e: self._on_scope_change("private")
+        )
+        self._btn_scope_all = ft.OutlinedButton(
+            "全部", on_click=lambda e: self._on_scope_change("all")
+        )
+        self._scope_row = ft.Row(
+            controls=[
+                self._scope_label,
+                self._btn_scope_public,
+                self._btn_scope_private,
+                self._btn_scope_all,
+            ],
+            spacing=6,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        # Backward-compatible alias for older tests / callers.
+        self._bookmark_scope_row = self._scope_row
+        self._source_mode_controls = ft.Row(
+            controls=[self._btn_source_following, self._btn_source_bookmarks],
+            spacing=6,
+            alignment=ft.MainAxisAlignment.CENTER,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        self._source_mode_slot = ft.Container(
+            content=self._source_mode_controls,
+            expand=1,
+            alignment=ft.Alignment(x=0, y=0),
+        )
+        self._scope_slot = ft.Container(
+            content=self._scope_row,
+            expand=2,
+            alignment=ft.Alignment(x=1, y=0),
+        )
+        self._mode_band = ft.Container(
+            content=ft.Row(
+                controls=[
+                    ft.Column(
+                        controls=[self._mode_title, self._mode_subtitle],
+                        spacing=2,
+                        expand=2,
+                    ),
+                    self._source_mode_slot,
+                    self._scope_slot,
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            border_radius=8,
+            padding=ft.Padding.symmetric(horizontal=14, vertical=10),
+            border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
+        )
+
     def _make_step_card(self, index: int) -> ft.Card:
         palette = _state_palette(self._page)
         bg, fg = palette["idle"]
@@ -277,6 +342,179 @@ class MainView:
             self._phase_label.update()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Combined mode (邊查邊下) — merge step 3+4 cards into one
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_combined_mode_setting() -> bool:
+        """Read download.combined_mode from settings (best-effort)."""
+        try:
+            import os
+            from app.core.settings_store import SettingsStore
+            base = os.getenv("APPDATA") + r"/pixiv_download/"
+            return bool(
+                SettingsStore(base).get_section("download").get("combined_mode", False)
+            )
+        except Exception:
+            return False
+
+    def apply_combined_mode(self, enabled: bool) -> None:
+        """Merge step 3+4 into a single card when *enabled*.
+
+        Step 3's card is relabeled 「步驟 3+4 邊查邊下」 and the step-4 card is
+        hidden (the Row reflows). When disabled both revert to the default
+        4-card layout. Step-state colors are untouched — combined mode still
+        runs as step 3 (card index 2), so progress / done coloring is correct,
+        and clicking the merged card still launches step 3 → the combined
+        thread via the store flag.
+        """
+        self._combined_mode = bool(enabled)
+        self._step_card_texts[2].value = (
+            _MERGED_STEP3_LABEL if enabled else STEP_LABELS[2]
+        )
+        self._step_cards[3].visible = not enabled
+        for ctrl in (self._step_card_texts[2], self._step_cards[3]):
+            try:
+                ctrl.update()
+            except Exception:
+                pass
+
+    def refresh_combined_mode(self) -> None:
+        """Re-read the setting and re-apply the merged / normal card layout.
+
+        Called when the user returns to the 主頁 tab so a toggle made in the
+        settings page is reflected without an app restart.
+        """
+        self.apply_combined_mode(self._read_combined_mode_setting())
+
+    @staticmethod
+    def _read_source_settings() -> tuple[str, str, str]:
+        """Read download.source_mode and source privacy scopes from settings."""
+        try:
+            from app.core.settings_store import SettingsStore
+            dl = SettingsStore(_settings_base_path()).get_section("download")
+            return (
+                str(dl.get("source_mode", "following") or "following"),
+                str(dl.get("following_scope", "all") or "all"),
+                str(dl.get("bookmark_scope", "all") or "all"),
+            )
+        except Exception:
+            return "following", "all", "all"
+
+    @staticmethod
+    def _source_palette(mode: str) -> dict[str, str]:
+        is_dark = False
+        # Kept static for tests and because mode band colors are decorative.
+        if mode == "bookmarks":
+            return {
+                "bg": ft.Colors.PINK_50,
+                "border": ft.Colors.PINK_200,
+                "accent": ft.Colors.PINK_700,
+            }
+        return {
+            "bg": ft.Colors.BLUE_50,
+            "border": ft.Colors.BLUE_200,
+            "accent": ft.Colors.BLUE_700,
+        }
+
+    def apply_source_mode(self, mode: str, scope: str = "all") -> None:
+        """Paint the main-page source-mode band and step labels."""
+        mode = "bookmarks" if str(mode) == "bookmarks" else "following"
+        scope = self._normalize_scope(scope)
+        self._source_mode = mode
+        self._active_scope = scope
+        palette = self._source_palette(mode)
+        self._mode_band.bgcolor = palette["bg"]
+        self._mode_band.border = ft.Border.all(1, palette["border"])
+        if mode == "bookmarks":
+            self._bookmark_scope = scope
+            self._mode_title.value = "目前模式：抓收藏"
+            self._mode_subtitle.value = "步驟 2 會掃描你按過愛心的作品 PID，後續抓 URL / 下載流程不變。"
+            self._scope_label.value = "收藏範圍"
+            self._scope_row.visible = True
+            self._step_card_texts[0].value = _BOOKMARK_STEP_LABELS[0]
+            self._step_card_texts[1].value = _BOOKMARK_STEP_LABELS[1]
+        else:
+            self._following_scope = scope
+            self._mode_title.value = "目前模式：抓追隨"
+            self._mode_subtitle.value = "維持原本流程：抓追蹤畫師，再掃描畫師作品 PID。"
+            self._scope_label.value = "追隨範圍"
+            self._scope_row.visible = True
+            self._step_card_texts[0].value = STEP_LABELS[0]
+            self._step_card_texts[1].value = STEP_LABELS[1]
+        self._btn_source_following = self._make_mode_button(
+            "抓追隨", mode == "following", lambda e: self._on_source_mode_change("following")
+        )
+        self._btn_source_bookmarks = self._make_mode_button(
+            "抓收藏", mode == "bookmarks", lambda e: self._on_source_mode_change("bookmarks")
+        )
+        self._btn_scope_public = self._make_mode_button(
+            "公開", scope == "public", lambda e: self._on_scope_change("public")
+        )
+        self._btn_scope_private = self._make_mode_button(
+            "非公開", scope == "private", lambda e: self._on_scope_change("private")
+        )
+        self._btn_scope_all = self._make_mode_button(
+            "全部", scope == "all", lambda e: self._on_scope_change("all")
+        )
+        self._source_mode_controls.controls = [
+            self._btn_source_following, self._btn_source_bookmarks,
+        ]
+        self._scope_row.controls = [
+            self._scope_label,
+            self._btn_scope_public,
+            self._btn_scope_private,
+            self._btn_scope_all,
+        ]
+        self._bookmark_scope_row = self._scope_row
+        self._safe_update(
+            self._mode_band, self._mode_title, self._mode_subtitle,
+            self._source_mode_controls, self._scope_row, self._scope_label,
+            self._step_card_texts[0], self._step_card_texts[1],
+        )
+
+    @staticmethod
+    def _make_mode_button(text: str, active: bool, on_click):
+        if active:
+            return ft.FilledButton(text, on_click=on_click)
+        return ft.OutlinedButton(text, on_click=on_click)
+
+    @staticmethod
+    def _normalize_scope(scope: str) -> str:
+        scope = str(scope or "all")
+        return scope if scope in {"public", "private", "all"} else "all"
+
+    def refresh_source_mode(self) -> None:
+        mode, following_scope, bookmark_scope = self._read_source_settings()
+        self._following_scope = self._normalize_scope(following_scope)
+        self._bookmark_scope = self._normalize_scope(bookmark_scope)
+        active_scope = self._bookmark_scope if mode == "bookmarks" else self._following_scope
+        self.apply_source_mode(mode, active_scope)
+
+    def _persist_source_settings(self, fields: dict) -> None:
+        with contextlib.suppress(Exception):
+            from app.core.settings_store import SettingsStore
+            SettingsStore(_settings_base_path()).update_fields("download", fields)
+
+    def _on_source_mode_change(self, mode: str) -> None:
+        self._persist_source_settings({"source_mode": mode})
+        mode = "bookmarks" if str(mode) == "bookmarks" else "following"
+        scope = self._bookmark_scope if mode == "bookmarks" else self._following_scope
+        self.apply_source_mode(mode, scope)
+
+    def _on_scope_change(self, scope: str) -> None:
+        scope = self._normalize_scope(scope)
+        key = "bookmark_scope" if self._source_mode == "bookmarks" else "following_scope"
+        self._persist_source_settings({key: scope})
+        self.apply_source_mode(self._source_mode, scope)
+
+    def _on_bookmark_scope_change(self, scope: str) -> None:
+        self._on_scope_change(scope)
+
+    def _on_following_scope_change(self, scope: str) -> None:
+        self._on_scope_change(scope)
 
     def append_log(self, html_line: str) -> None:
         from app.gui.log_format import html_to_spans
@@ -367,71 +605,26 @@ class MainView:
         self._enable_auto_scroll()
 
     @staticmethod
-    def _normalize_scope(scope: str) -> str:
-        scope = str(scope or "all")
-        return scope if scope in {"public", "private", "all"} else "all"
-
-    @staticmethod
-    def _make_scope_button(text: str, active: bool, on_click):
-        if active:
-            return ft.FilledButton(text, on_click=on_click)
-        return ft.OutlinedButton(text, on_click=on_click)
-
-    @staticmethod
-    def _read_following_scope_setting() -> str:
-        try:
-            from app.core.settings_store import SettingsStore
-            dl = SettingsStore(_settings_base_path()).get_section("download")
-            return str(dl.get("following_scope", "all") or "all")
-        except Exception:
-            return "all"
-
-    def apply_following_scope(self, scope: str) -> None:
-        scope = self._normalize_scope(scope)
-        self._following_scope = scope
-        self._btn_scope_public = self._make_scope_button(
-            "公開", scope == "public", lambda e: self._on_following_scope_change("public")
-        )
-        self._btn_scope_private = self._make_scope_button(
-            "非公開", scope == "private", lambda e: self._on_following_scope_change("private")
-        )
-        self._btn_scope_all = self._make_scope_button(
-            "全部", scope == "all", lambda e: self._on_following_scope_change("all")
-        )
-        self._following_scope_row.controls = [
-            self._scope_label,
-            self._btn_scope_public,
-            self._btn_scope_private,
-            self._btn_scope_all,
-        ]
-        with contextlib.suppress(Exception):
-            self._following_scope_row.update()
-
-    def refresh_following_scope(self) -> None:
-        self.apply_following_scope(self._read_following_scope_setting())
-
-    def _persist_following_scope(self, scope: str) -> None:
-        with contextlib.suppress(Exception):
-            from app.core.settings_store import SettingsStore
-            SettingsStore(_settings_base_path()).update_fields(
-                "download", {"following_scope": self._normalize_scope(scope)}
-            )
-
-    def _on_following_scope_change(self, scope: str) -> None:
-        scope = self._normalize_scope(scope)
-        self._persist_following_scope(scope)
-        self.apply_following_scope(scope)
-
-    @staticmethod
     def _safe_update(*controls) -> None:
-        """update() each control, swallowing detached-control errors."""
+        """update() each control, swallowing detached-control errors.
+
+        Detached controls (e.g. during build() before mount, or after a session
+        GC) raise from update(); we swallow that so painting restored state is
+        always safe.
+        """
         for c in controls:
             with contextlib.suppress(Exception):
                 c.update()
 
     @staticmethod
     def _make_progress_row(label: str, color: str):
-        """Build one labeled progress row: [label] [expand bar] [count text]."""
+        """Build one labeled progress row: [label] [expand bar] [count text].
+
+        Returns ``(bar, text, row)``. Used for BOTH 整體進度 and 本作分頁 so the
+        two bars are constructed identically (same geometry, same colors role).
+        The row starts hidden — it is revealed on its first real update by
+        :meth:`_render_progress_row`.
+        """
         bar = ft.ProgressBar(
             value=0,
             expand=True,
@@ -463,7 +656,16 @@ class MainView:
 
     def _render_progress_row(self, row, bar, text, value: int, total: int,
                              trailing: str) -> None:
-        """Shared render path for 整體進度 and 本作分頁."""
+        """The ONE update path shared by 整體進度 and 本作分頁.
+
+        Sets the bar fraction + trailing count, reveals (or hides) the row, then
+        flushes it. Toggling ``visible`` False -> True on first data is the
+        load-bearing fix: it forces Flet to (re)lay out the row with real
+        content. An always-visible row first laid out with empty children
+        renders degenerate and later ``.value`` patches never reflow it — the
+        整體進度 freeze. 本作分頁 always worked because it was visible-gated; now
+        both rows are, via this single method.
+        """
         if total > 0:
             bar.value = max(0.0, min(1.0, value / total))
             text.value = trailing
@@ -475,7 +677,12 @@ class MainView:
         self._safe_update(row)
 
     def _paint_progress(self, now: float | None = None) -> None:
-        """Render overall progress into the shared progress row."""
+        """Render overall progress into the bar + count via the shared path.
+
+        Safe to call from build() before the controls are attached: the
+        _safe_update inside _render_progress_row swallows the detached-control
+        error, leaving the values painted for the imminent mount.
+        """
         t = self._progress_total
         if t > 0:
             self._eta_text.value = self._format_eta(
@@ -508,6 +715,8 @@ class MainView:
                 self._progress_started_at = now
         self._progress_total = t
         self._paint_progress(now)
+        # _paint_progress already flushed the progress row; ETA lives on the
+        # separate meta row, so flush that too.
         self._safe_update(self._meta_row)
 
     def update_page_progress(self, delta: int, total: int, pid: str = "") -> None:
@@ -575,6 +784,7 @@ class MainView:
         except (TypeError, ValueError):
             r = 0
         self._countdown_text.value = f"倒數：{r} 秒" if r > 0 else ""
+        # Update the meta Row, not just the Text, so it reflows reliably.
         self._safe_update(self._meta_row)
 
     def set_phase(self, text: str) -> None:
@@ -718,7 +928,11 @@ class MainView:
             self._event_q.put(WorkerEvent("loading", (False, "")))
 
     def build(self) -> ft.Column:
-        self.refresh_following_scope()
+        self.refresh_source_mode()
+        # Reflect 邊查邊下 in the initial card layout (merged 3+4 / step-4 hidden).
+        self.apply_combined_mode(self._read_combined_mode_setting())
+        # Paint any progress restored from a post-GC reattach so the bar shows
+        # "116 / 320" immediately instead of waiting for the next worker event.
         self._paint_progress()
         top_row = ft.Row(
             controls=[
@@ -734,7 +948,7 @@ class MainView:
         )
         return ft.Column(
             controls=[
-                self._following_scope_row,
+                self._mode_band,
                 top_row,
                 self._progress_row,
                 self._page_progress_row,

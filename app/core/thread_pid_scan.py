@@ -32,10 +32,15 @@ _pid_count_lock = threading.Lock()
 
 class get_pixiv_author_imgID_Thread(PauseableThread):
     '''抓取畫師作品下所有圖片的 Pixiv ID'''
-    def __init__(self, q, Author_list, Agent, path, cookies, exist_pid, single_thread_mode=False, scheduler=None, stats_collector=None, *, event_log=None, author_order=False, force_rescan=False):
+    def __init__(self, q, Author_list, Agent, path, cookies, exist_pid, single_thread_mode=False, scheduler=None, stats_collector=None, *, event_log=None, author_order=False, force_rescan=False, source_mode="following", bookmark_scope="all", bookmark_user_id=""):
         super().__init__(q, scheduler=scheduler)
         self.author_order = bool(author_order)
         self.force_rescan = bool(force_rescan)
+        self.source_mode = "bookmarks" if str(source_mode) == "bookmarks" else "following"
+        self.bookmark_scope = str(bookmark_scope or "all")
+        if self.bookmark_scope not in {"public", "private", "all"}:
+            self.bookmark_scope = "all"
+        self.bookmark_user_id = str(bookmark_user_id or "").strip()
         self.Author_list = Author_list
         self.Agent = Agent
         self.path = path
@@ -380,6 +385,175 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
                         self._flush_step2_incremental(reason="loop")
         return results
 
+    @staticmethod
+    def _bookmark_rest_values(scope):
+        if scope == "public":
+            return ["show"]
+        if scope == "private":
+            return ["hide"]
+        return ["show", "hide"]
+
+    def _step2_fetch_bookmark_page(
+        self, user_id, cookie, Agent, rest, offset, limit=48, proxies=None,
+    ):
+        url = (
+            f"https://www.pixiv.net/ajax/user/{user_id}/illusts/bookmarks"
+            f"?tag=&offset={int(offset)}&limit={int(limit)}&rest={rest}&lang=zh_tw"
+        )
+        headers = {
+            "User-Agent": Agent,
+            "Cookie": cookie,
+            "referer": f"https://www.pixiv.net/users/{user_id}/bookmarks/artworks",
+        }
+        res = requests.get(url, headers=headers, proxies=proxies, timeout=(10, 30))
+        try:
+            payload = res.json()
+        except Exception:
+            payload = {}
+        body = payload.get("body", {}) if isinstance(payload, dict) else {}
+        if not isinstance(body, dict):
+            body = {}
+        works = body.get("works", [])
+        if not isinstance(works, list):
+            works = []
+        pids = []
+        uid_map = {}
+        for item in works:
+            if not isinstance(item, dict):
+                continue
+            raw_pid = item.get("id") or item.get("illustId") or item.get("illust_id")
+            pid = normalize_pid(raw_pid)
+            if not pid:
+                continue
+            pids.append(pid)
+            raw_uid = item.get("userId") or item.get("user_id")
+            if raw_uid not in (None, ""):
+                uid_map[pid] = str(raw_uid)
+        try:
+            total = int(body.get("total", len(pids)) or 0)
+        except (TypeError, ValueError):
+            total = len(pids)
+        return pids, total, uid_map
+
+    def _run_bookmarks_with_cookie(self, rest, offset, limit=48):
+        cookie = self._select_step2_cookie()
+        label_key = f"bookmarks:{rest}:{offset}"
+        self._record_step2_cookie_usage(label_key, cookie)
+        return self._step2_fetch_bookmark_page(
+            self.bookmark_user_id,
+            cookie,
+            self.Agent,
+            rest,
+            offset,
+            limit=limit,
+        )
+
+    def _run_bookmarks_with_acquired_cookie(self, rest, offset, limit=48):
+        acc = self._acquire_account()
+        if acc is None:
+            return None
+        label_key = f"bookmarks:{rest}:{offset}"
+        self._record_step2_cookie_usage(label_key, acc.cookie)
+        ok, result, _ = self._run_with_network_retry(
+            f"收藏 {rest} offset {offset}",
+            lambda: self._step2_fetch_bookmark_page(
+                self.bookmark_user_id,
+                acc.cookie,
+                self.Agent,
+                rest,
+                offset,
+                limit=limit,
+                proxies=acc.proxies,
+            ),
+        )
+        self._release_account(acc, ok=ok)
+        return result
+
+    def _append_bookmark_pids(self, pids, uid_map):
+        if not pids:
+            return []
+        kept = []
+        skipped = []
+        for raw_pid in pids:
+            pid = normalize_pid(raw_pid)
+            if not pid:
+                continue
+            if pid in self.exist_pid:
+                skipped.append(pid)
+                continue
+            kept.append(pid)
+        try:
+            with self._collected_pids_lock:
+                for pid in kept:
+                    if pid in self._seen_pids:
+                        continue
+                    uid = uid_map.get(pid)
+                    self._collected_pids.append((pid, None if uid in (None, "") else str(uid)))
+                    self._mark_pid_seen(pid)
+        except Exception as e:
+            self._emit_pid_write_error(e)
+        return kept
+
+    def _execute_bookmark_tasks(self):
+        limit = 48
+        rest_values = self._bookmark_rest_values(self.bookmark_scope)
+        results = []
+        discovered = 0
+        try:
+            scope_label = {
+                "public": "公開",
+                "private": "非公開",
+                "all": "全部",
+            }.get(self.bookmark_scope, "全部")
+            self._q.put(WorkerEvent(
+                "output",
+                f"<p><font color='blue'>收藏模式：抓取{scope_label}收藏作品 PID</font></p>",
+            ))
+        except Exception:
+            pass
+        for rest in rest_values:
+            offset = 0
+            total = None
+            while not self._stop_event.is_set():
+                self._pause_event.wait()
+                if self._stop_event.is_set():
+                    break
+                try:
+                    if self._scheduler is not None:
+                        page = self._run_bookmarks_with_acquired_cookie(rest, offset, limit=limit)
+                    else:
+                        page = self._run_bookmarks_with_cookie(rest, offset, limit=limit)
+                    if page is None:
+                        break
+                    pids, page_total, uid_map = page
+                    total = int(page_total or 0)
+                    kept = self._append_bookmark_pids(pids, uid_map)
+                    results.append(kept)
+                    discovered += len(pids)
+                    self._q.put(WorkerEvent("progress", (len(pids), max(total, offset + len(pids)))))
+                    if len(pids) < limit:
+                        break
+                    offset += limit
+                    if total and offset >= total:
+                        break
+                except Exception as e:
+                    try:
+                        self._q.put(WorkerEvent(
+                            "output",
+                            f"<p><font color='red'>收藏 {rest} offset {offset} 取得 PID 失敗：{e}</font></p>",
+                        ))
+                    except Exception:
+                        pass
+                    break
+        try:
+            self._q.put(WorkerEvent(
+                "output",
+                f"<p><font color='gray'>收藏 PID 掃描完成：讀取 {discovered} 筆</font></p>",
+            ))
+        except Exception:
+            pass
+        return results
+
     def _persist_author_progress(self, progress_file):
         """寫入 author_progress.json（concern 1）：silent-failure 一致保留。"""
         try:
@@ -577,9 +751,12 @@ class get_pixiv_author_imgID_Thread(PauseableThread):
             pid_num = 0
             pid_len = 0
         self._init_step2_run_state()
-        progress = self._load_author_progress()
-        work_list = self._filter_work_list(progress)
-        results = self._execute_artist_tasks(work_list)
+        if getattr(self, "source_mode", "following") == "bookmarks":
+            results = self._execute_bookmark_tasks()
+        else:
+            progress = self._load_author_progress()
+            work_list = self._filter_work_list(progress)
+            results = self._execute_artist_tasks(work_list)
         self._emit_step2_cookie_usage_summary()
         end = [i for item in results for i in item]
         end = [i for i in end if i not in self.exist_pid]

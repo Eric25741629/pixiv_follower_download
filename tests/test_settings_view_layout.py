@@ -48,3 +48,17 @@ def test_ai_directory_switch_label_makes_disable_behavior_clear(tmp_path, monkey
     view = SettingsView(_FakePage())
 
     assert "關閉後下載到一般路徑" in view._sw_ai_dir.label
+
+
+def test_settings_view_exposes_download_source_controls(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    from app.gui.views.settings_view import SettingsView
+
+    view = SettingsView(_FakePage())
+
+    assert view._dd_source_mode.value == "following"
+    assert view._dd_following_scope.value == "all"
+    assert view._dd_bookmark_scope.value == "all"
+    assert [opt.key for opt in view._dd_source_mode.options] == ["following", "bookmarks"]
+    assert [opt.key for opt in view._dd_following_scope.options] == ["public", "private", "all"]
+    assert [opt.key for opt in view._dd_bookmark_scope.options] == ["public", "private", "all"]

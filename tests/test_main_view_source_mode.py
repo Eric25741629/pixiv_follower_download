@@ -1,0 +1,106 @@
+"""MainView source-mode band: following vs bookmark collection."""
+import os
+import sys
+from queue import Queue
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import pytest
+
+
+class _FakePage:
+    pass
+
+
+@pytest.fixture
+def view(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    from app.gui.views.main_view import MainView
+
+    return MainView(_FakePage(), Queue())
+
+
+def test_refresh_source_mode_applies_bookmark_labels_and_scope(view, tmp_path):
+    from app.core.settings_store import SettingsStore
+
+    base = os.getenv("APPDATA") + r"/pixiv_download/"
+    SettingsStore(base).update_fields(
+        "download",
+        {"source_mode": "bookmarks", "bookmark_scope": "private"},
+    )
+
+    view.refresh_source_mode()
+
+    assert view._source_mode == "bookmarks"
+    assert view._active_scope == "private"
+    assert view._mode_title.value == "目前模式：抓收藏"
+    assert view._mode_band.bgcolor == view._source_palette("bookmarks")["bg"]
+    assert view._scope_row.visible is True
+    assert view._scope_label.value == "收藏範圍"
+    assert view._step_card_texts[0].value == "步驟 1\n略過追隨"
+    assert view._step_card_texts[1].value == "步驟 2\n抓收藏 PID"
+
+
+def test_apply_source_mode_restores_following_labels(view):
+    from app.gui.views.main_view import STEP_LABELS
+
+    view.apply_source_mode("bookmarks", "private")
+    view.apply_source_mode("following", "all")
+
+    assert view._source_mode == "following"
+    assert view._active_scope == "all"
+    assert view._mode_title.value == "目前模式：抓追隨"
+    assert view._scope_row.visible is True
+    assert view._scope_label.value == "追隨範圍"
+    assert view._step_card_texts[0].value == STEP_LABELS[0]
+    assert view._step_card_texts[1].value == STEP_LABELS[1]
+
+
+def test_source_mode_buttons_are_in_centered_slot(view):
+    import flet as ft
+
+    view.apply_source_mode("following", "all")
+
+    assert view._mode_band.content.controls[1] is view._source_mode_slot
+    assert view._source_mode_controls.alignment == ft.MainAxisAlignment.CENTER
+    assert view._source_mode_controls.controls == [
+        view._btn_source_following,
+        view._btn_source_bookmarks,
+    ]
+
+
+def test_source_mode_button_persists_bookmark_choice(view):
+    from app.core.settings_store import SettingsStore
+
+    view._on_source_mode_change("bookmarks")
+
+    base = os.getenv("APPDATA") + r"/pixiv_download/"
+    dl = SettingsStore(base).get_section("download")
+    assert dl["source_mode"] == "bookmarks"
+    assert view._source_mode == "bookmarks"
+
+
+def test_following_scope_button_persists_following_choice(view):
+    from app.core.settings_store import SettingsStore
+
+    view.apply_source_mode("following", "all")
+    view._on_scope_change("private")
+
+    base = os.getenv("APPDATA") + r"/pixiv_download/"
+    dl = SettingsStore(base).get_section("download")
+    assert dl["following_scope"] == "private"
+    assert dl["bookmark_scope"] == "all"
+    assert view._active_scope == "private"
+
+
+def test_bookmark_scope_button_still_persists_bookmark_choice(view):
+    from app.core.settings_store import SettingsStore
+
+    view.apply_source_mode("bookmarks", "all")
+    view._on_scope_change("public")
+
+    base = os.getenv("APPDATA") + r"/pixiv_download/"
+    dl = SettingsStore(base).get_section("download")
+    assert dl["bookmark_scope"] == "public"
+    assert dl["following_scope"] == "all"
+    assert view._active_scope == "public"

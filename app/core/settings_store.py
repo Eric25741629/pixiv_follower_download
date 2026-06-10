@@ -43,9 +43,16 @@ DEFAULTS = {
         # days, re-fetch its meta over the network instead of trusting the
         # cached like_count. 0 disables the feature.
         "rescrape_within_days": 365,
-        # Pixiv following privacy scope: "public" -> rest=show,
-        # "private" -> rest=hide, "all" -> both.
+        # Main workflow source. "following" keeps the legacy flow
+        # (following artists -> artist PIDs). "bookmarks" scans the current
+        # user's bookmarked artworks instead.
+        "source_mode": "following",
+        # Pixiv following privacy scope for source_mode="following":
+        # "public" -> rest=show, "private" -> rest=hide, "all" -> both.
         "following_scope": "all",
+        # Pixiv bookmark privacy scope for source_mode="bookmarks":
+        # "public" -> rest=show, "private" -> rest=hide, "all" -> both.
+        "bookmark_scope": "all",
     },
     "filter": {
         "pass_tag": False,

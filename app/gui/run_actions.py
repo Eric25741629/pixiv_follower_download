@@ -174,7 +174,11 @@ class RunController:
     def run_all(self) -> None:
         self._run_all_mode = True
         self._backup_db()
-        self._start_step(1)
+        try:
+            source_mode = _store().get_section("download").get("source_mode", "following")
+        except Exception:
+            source_mode = "following"
+        self._start_step(2 if source_mode == "bookmarks" else 1)
 
     def on_next(self, n: int) -> None:
         if n == -1 or not self._run_all_mode:
@@ -219,6 +223,9 @@ class RunController:
     }
     _NEXT_RUN_KEY_LABELS = {
         "download.combined_mode": "邊查邊下",
+        "download.source_mode": "作品來源",
+        "download.following_scope": "追隨範圍",
+        "download.bookmark_scope": "收藏範圍",
         "performance.single_thread_mode": "單執行緒",
         "download.author_order": "依作者順序下載",
         "download.force_full_rescan": "強制完整重掃",
@@ -560,6 +567,9 @@ class RunController:
         return valid_cookies
 
     def _build_step1(self, auth, agent, dl, flt):
+        if str(dl.get("source_mode", "following") or "following") == "bookmarks":
+            self._log("<p><font color='gray'>收藏模式略過步驟 1，直接抓收藏 PID</font></p>")
+            return None
         userid = str(auth.get("userid", "")).strip()
         if not userid:
             self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
@@ -576,11 +586,16 @@ class RunController:
         )
 
     def _build_step2(self, auth, agent, dl, perf, path):
-        authors = _load_author_list()
-        if not authors:
+        source_mode = str(dl.get("source_mode", "following") or "following")
+        authors = [] if source_mode == "bookmarks" else _load_author_list()
+        if source_mode != "bookmarks" and not authors:
             self._log(
                 "<p><font color='red'>找不到 following 清單，請先執行步驟 1</font></p>"
             )
+            return None
+        bookmark_user_id = str(auth.get("userid", "") or "").strip()
+        if source_mode == "bookmarks" and not bookmark_user_id:
+            self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
             return None
         valid_cookies = self._validate_cookies_for_step(auth, agent, 2)
         if not valid_cookies:
@@ -601,6 +616,9 @@ class RunController:
             event_log=self._event_log,
             author_order=bool(dl.get("author_order", False)),
             force_rescan=force_rescan,
+            source_mode=source_mode,
+            bookmark_scope=str(dl.get("bookmark_scope", "all") or "all"),
+            bookmark_user_id=bookmark_user_id,
         )
         # One-shot: consume the GUI flag so later Step 2 runs stop ignoring the
         # 30-day skip. (The CLI --force-rescan path sets self.force_rescan, which

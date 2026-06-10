@@ -463,7 +463,10 @@ def main(page: ft.Page) -> None:
 
     async def _reload_views_on_loop(idx: int) -> None:
         try:
-            if idx == 1:
+            if idx == 0:
+                main_view.refresh_source_mode()
+                main_view.refresh_combined_mode()
+            elif idx == 1:
                 settings_view.reload_cookie_count()
             elif idx == 2:
                 cookies_view.reload_from_settings()
@@ -489,7 +492,7 @@ def main(page: ft.Page) -> None:
             # These helpers update Flet controls, so they must run on the
             # event-loop page thread. Running them on a daemon thread can
             # enqueue patches from the wrong thread and trigger session GC.
-            if idx in (1, 2):
+            if idx in (0, 1, 2):
                 page.run_task(_reload_views_on_loop, idx)
         except Exception:
             _log.exception("on_nav_change failed")

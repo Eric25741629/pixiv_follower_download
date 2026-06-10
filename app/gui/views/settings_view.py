@@ -93,6 +93,20 @@ class SettingsView:
             value=bool(dl.get("combined_mode", False)),
             tooltip="開啟後，步驟 3 會逐一查詢 PID 並立即下載該 PID 的頁面（查詢與下載共用同一次帳號冷卻）；同時自動吸收上次未完成的下載",
         )
+        self._sw_force_rescan = ft.Switch(
+            label="強制重新掃描全部畫家（忽略30天，一次性）",
+            value=bool(dl.get("force_full_rescan", False)),
+            tooltip="開啟後，下次步驟2 會忽略「30天內已掃過」的跳過、重新掃描全部畫家，把每位作者的全部作品 user_id 補齊（供依作者分組）。執行步驟2 後會自動關閉。",
+        )
+        self._dd_source_mode = ft.Dropdown(
+            label="作品來源",
+            value=str(dl.get("source_mode", "following") or "following"),
+            options=[
+                ft.dropdown.Option("following", "抓追隨畫師"),
+                ft.dropdown.Option("bookmarks", "抓我的收藏"),
+            ],
+            width=220,
+        )
         self._dd_following_scope = ft.Dropdown(
             label="追隨範圍",
             value=str(dl.get("following_scope", "all") or "all"),
@@ -103,10 +117,15 @@ class SettingsView:
             ],
             width=220,
         )
-        self._sw_force_rescan = ft.Switch(
-            label="強制重新掃描全部畫家（忽略30天，一次性）",
-            value=bool(dl.get("force_full_rescan", False)),
-            tooltip="開啟後，下次步驟2 會忽略「30天內已掃過」的跳過、重新掃描全部畫家，把每位作者的全部作品 user_id 補齊（供依作者分組）。執行步驟2 後會自動關閉。",
+        self._dd_bookmark_scope = ft.Dropdown(
+            label="收藏範圍",
+            value=str(dl.get("bookmark_scope", "all") or "all"),
+            options=[
+                ft.dropdown.Option("public", "公開收藏"),
+                ft.dropdown.Option("private", "非公開收藏"),
+                ft.dropdown.Option("all", "全部收藏"),
+            ],
+            width=220,
         )
 
         sch = store.get_section("schedule")
@@ -484,7 +503,9 @@ class SettingsView:
             "tag_strip_special_chars": bool(self._sw_tag_strip_special_chars.value),
             "author_order": bool(self._sw_author_order.value),
             "combined_mode": bool(self._sw_combined_mode.value),
+            "source_mode": str(self._dd_source_mode.value or "following"),
             "following_scope": str(self._dd_following_scope.value or "all"),
+            "bookmark_scope": str(self._dd_bookmark_scope.value or "all"),
         })
         store.update_section("schedule", {
             "enabled": bool(self._sw_schedule_enabled.value),
@@ -643,7 +664,13 @@ class SettingsView:
                     ft.Row([self._tf_must_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_must_tag)]),
                 ]),
                 _tile("執行流程", [
-                    self._dd_following_scope,
+                    subhead("作品來源"),
+                    note("抓追隨會先抓畫師清單；抓我的收藏會在步驟 2 掃描你按過愛心的作品 PID。"),
+                    ft.Row(
+                        [self._dd_source_mode, self._dd_following_scope, self._dd_bookmark_scope],
+                        spacing=16,
+                        wrap=True,
+                    ),
                     self._sw_combined_mode,
                     self._sw_author_order,
                     self._sw_force_rescan,
