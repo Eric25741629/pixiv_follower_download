@@ -6,12 +6,7 @@ import time
 
 import bs4
 import requests
-import urllib3
 from bs4 import BeautifulSoup
-
-import tag_edit
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from app.core.proxy_utils import to_requests_proxies
 
@@ -26,7 +21,7 @@ def make_session(proxy_url: "str | None" = None) -> requests.Session:
     proxies = to_requests_proxies(proxy_url)
     if proxies:
         sess.proxies.update(proxies)
-    sess.verify = False
+    sess.verify = True
     return sess
 
 
@@ -114,8 +109,22 @@ def _tag_entry_to_str(entry):
     return None
 
 
+_USER_BUCKET_TAG = "users入り"
+
+
 def _extract_artwork_tags(body):
-    """抽取作品標籤清單，並在 aiType==2 時於最前面加上 'AI生成' 標籤。"""
+    """抽取作品標籤清單，並在 aiType==2 時於最前面加上 'AI生成' 標籤。
+
+    過濾掉 Pixiv 自動加上的書籤桶 marker tag（含 ``users入り`` 子字串，例如
+    ``5000users入り``）——這類字串不是使用者寫的 tag，是 Pixiv 依書籤數塞進去
+    的 metadata。
+
+    回傳前以保序方式 dedup：Pixiv 偶爾會在同一作品的 tag list 中重覆某個 tag
+    （例如 `_tag_entry_to_str` 對某些 entry 退而採用 `translation.en` 而與
+    另一筆字面 `name` 撞同字串），這裡用 ``dict.fromkeys`` 保留第一次出現的
+    順序，重覆者直接丟掉。AI 標籤已先 prepend，所以若 Pixiv tag 中也含
+    ``AI生成`` 字串會被去除。
+    """
     normalized_tags = []
 
     ai_label = _ai_type_label(body)
@@ -124,10 +133,10 @@ def _extract_artwork_tags(body):
 
     for entry in _normalize_raw_tags_field(body):
         tag_str = _tag_entry_to_str(entry)
-        if tag_str:
+        if tag_str and _USER_BUCKET_TAG not in tag_str:
             normalized_tags.append(tag_str)
 
-    return normalized_tags
+    return list(dict.fromkeys(normalized_tags))
 
 
 def _extract_artwork_pagecount(body, artwork_id):
@@ -143,6 +152,38 @@ def _extract_artwork_pagecount(body, artwork_id):
         return int(page_count or 1)
     except (TypeError, ValueError):
         return 1
+
+
+def _extract_artwork_upload_date(body):
+    """讀 body['uploadDate']（Pixiv 真正上傳時間，ISO 8601 含時區）。缺失或空字串時回 None。"""
+    val = body.get('uploadDate')
+    if not val:
+        return None
+    return str(val)
+
+
+def _extract_artwork_create_date(body):
+    """讀 body['createDate']（Pixiv 作品建立時間，ISO 8601 含時區）。缺失或空字串時回 None。"""
+    val = body.get('createDate')
+    if not val:
+        return None
+    return str(val)
+
+
+def _extract_artwork_user_id(body):
+    """讀 body['userId']（畫師 Pixiv ID 字串）。缺失或空字串時回 None。"""
+    val = body.get('userId')
+    if val in (None, ''):
+        return None
+    return str(val)
+
+
+def _extract_artwork_user_name(body):
+    """讀 body['userName']（畫師顯示名稱）。缺失或空字串時回 None。"""
+    val = body.get('userName')
+    if val in (None, ''):
+        return None
+    return str(val)
 
 
 def _extract_artwork_img_url(body):
@@ -227,8 +268,6 @@ def _normalize_artwork_id(raw_value):
 # 防止打印一些无用的日志
 #option.add_experimental_option("excludeSwitches", ['enable-automation', 'enable-logging'])
 #options = Options()
-if option is not None:
-    option.add_experimental_option("debuggerAddress", "127.0.0.1:9527")
 #https://www.pixiv.net/ajax/user/490219/profile/illustswork_category=illustManga&is_first_page=0&lang=zh_tw
 def _require_selenium():
     if not _SELENIUM_AVAILABLE:
@@ -239,17 +278,20 @@ def logging(address,password):
     _require_selenium()
     url = 'https://pixiv.net/'
     driver = webdriver.Chrome(options=option)
-    driver.get(url)
-    driver.find_element(By.XPATH,'//*[@id="wrapper"]/div[3]/div[2]/a[2]').click()
-    driver.find_element(By.XPATH,"//input[@autocomplete = 'username']").send_keys(address)
-    passwd=driver.find_element(By.XPATH,"//input[@autocomplete = 'current-password']")
-    passwd.send_keys(password)
-    passwd.send_keys(Keys.RETURN)
+    try:
+        driver.get(url)
+        driver.find_element(By.XPATH,'//*[@id="wrapper"]/div[3]/div[2]/a[2]').click()
+        driver.find_element(By.XPATH,"//input[@autocomplete = 'username']").send_keys(address)
+        passwd=driver.find_element(By.XPATH,"//input[@autocomplete = 'current-password']")
+        passwd.send_keys(password)
+        passwd.send_keys(Keys.RETURN)
+    finally:
+        driver.quit()
 
 #about_cookies
 def auto_get_cookie(address,password,mode=0):
     _require_selenium()
-    print(f"[pixiv_api] auto_get_cookie called with mode={mode}, address={address}")
+    print(f"[pixiv_api] auto_get_cookie called with mode={mode}")
     def facebook_login(driver,email,password):
         print("[pixiv_api] google_login: trying CSS selector button.btn-item.btn-gplus")
         try:
@@ -296,7 +338,7 @@ def auto_get_cookie(address,password,mode=0):
             print(f"[pixiv_api] google_login: failed to fill login form: {e}")
         try:
             driver.find_element(By.XPATH, '//*[@class="x1lliihq x6ikm8r x10wlt62 x1n2onr6 xlyipyv xuxw1ft x1j85h84"]').click()
-        except:
+        except Exception:
             pass
     def google_login(driver,email, password):
         print("[pixiv_api] google_login: trying CSS selector button.btn-item.btn-gplus")
@@ -339,43 +381,44 @@ def auto_get_cookie(address,password,mode=0):
             cookies+="="
             cookies+=str(cookie['value'])
             cookies+=";"
-        print(cookies)
         return cookies
     option = webdriver.ChromeOptions()
     option.add_experimental_option("excludeSwitches", ['enable-automation', 'enable-logging'])
     #option.add_argument("--headless")
     option.add_argument("--disable-backgrounding-occluded-windows")
     driver = webdriver.Chrome(options=option)
-    url = 'https://pixiv.net/'
-    driver.get(url)
-    print(f"[pixiv_api] selected login mode: {mode}")
-    if (mode == 0):
-        pixiv_login(driver, address, password)
-    elif (mode == 1):
-        # UI: mode 1 = Google
-        google_login(driver, address, password)
-    elif (mode == 2):
-        # UI: mode 2 = Facebook
-        facebook_login(driver, address, password)
-    sleep(2)
-    url = 'https://pixiv.net/'
-    driver.get(url)
-    sleep(5)
-    soup = bs4.BeautifulSoup(driver.page_source, 'lxml')
-    user_num=(str(soup.head).split('user_id')[1].split('_gaq.push')[0].split('"')[1])
-    url='https://www.pixiv.net/artworks/96509143'
-    driver.get(url)
-    sleep(5)    
-    agent=driver.execute_script("return navigator.userAgent")
-    cookies=get_cookies()
-    return str(user_num),str(cookies),str(agent)
+    try:
+        url = 'https://pixiv.net/'
+        driver.get(url)
+        print(f"[pixiv_api] selected login mode: {mode}")
+        if (mode == 0):
+            pixiv_login(driver, address, password)
+        elif (mode == 1):
+            # UI: mode 1 = Google
+            google_login(driver, address, password)
+        elif (mode == 2):
+            # UI: mode 2 = Facebook
+            facebook_login(driver, address, password)
+        sleep(2)
+        url = 'https://pixiv.net/'
+        driver.get(url)
+        sleep(5)
+        soup = bs4.BeautifulSoup(driver.page_source, 'lxml')
+        user_num=(str(soup.head).split('user_id')[1].split('_gaq.push')[0].split('"')[1])
+        url='https://www.pixiv.net/artworks/96509143'
+        driver.get(url)
+        sleep(5)
+        agent=driver.execute_script("return navigator.userAgent")
+        cookies=get_cookies()
+        return str(user_num),str(cookies),str(agent)
+    finally:
+        driver.quit()
 
 def Test_cookies(lists,agent):
     cookies=[]
     i=0
     for list1 in lists:
         try:
-            print(list1,agent)
             pid='96509143'
             headers = {
                 'User-Agent': agent,
@@ -405,25 +448,28 @@ def get_author_picture_ids(illust_ids,path,num,q,exist_pid):
             temp += 1
             print('\r' + '[線程%s]:[%s%s]%.2f%%' % (num,'█' * int(temp*20/total), ' ' * (20-int(temp*20/total)),float(temp/total*100)), end='')
             driver = webdriver.Chrome(options=option)
-            time.sleep(5)
-            url = ('https://pixiv.net/ajax/user/' + illust_id + '/profile/all?lang=zh')				#畫師id 輸入後可得到畫師所有的作品
-            driver.switch_to.window(driver.window_handles[num])
-            driver.get(url)
-            #time.sleep(1)
-            soup = BeautifulSoup(driver.page_source, 'html.parser')
-            res=soup.find('pre')
-            res=str(res)
-            res=res.replace('<pre style="word-wrap: break-word; white-space: pre-wrap;">','')	#清除後才能夠轉為json
-            res=res.replace('</pre>','')														#清除後才能夠轉為json
-            #print(res)
-            res=res.encode('UTF-8')
-            resdict = json.loads(res)['body']['illusts']		  								# 將json轉化為python的字典后提取元素
-            Pids=[key for key in resdict]                        #將元素放入陣列裡
-            for Pid in Pids:
-                if Pid in exist_pid:
-                    break
-                else :
-                    download_Pid.append(Pid)
+            try:
+                time.sleep(5)
+                url = ('https://pixiv.net/ajax/user/' + illust_id + '/profile/all?lang=zh')				#畫師id 輸入後可得到畫師所有的作品
+                driver.switch_to.window(driver.window_handles[num])
+                driver.get(url)
+                #time.sleep(1)
+                soup = BeautifulSoup(driver.page_source, 'html.parser')
+                res=soup.find('pre')
+                res=str(res)
+                res=res.replace('<pre style="word-wrap: break-word; white-space: pre-wrap;">','')	#清除後才能夠轉為json
+                res=res.replace('</pre>','')														#清除後才能夠轉為json
+                #print(res)
+                res=res.encode('UTF-8')
+                resdict = json.loads(res)['body']['illusts']		  								# 將json轉化為python的字典后提取元素
+                Pids=[key for key in resdict]                        #將元素放入陣列裡
+                for Pid in Pids:
+                    if Pid in exist_pid:
+                        break
+                    else :
+                        download_Pid.append(Pid)
+            finally:
+                driver.quit()
         except Exception as err:
             print(Pid+'獲取失敗',err)
             try:
@@ -542,7 +588,7 @@ def random_Agent():
 def Pixiv_Tag(url):                                                 #回傳標籤
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50',
-        'Cookie':'p_ab_id=5; p_ab_id_2=5; p_ab_d_id=1125130963; first_visit_datetime_pc=2021-02-23+02%3A32%3A11; yuid_b=OJRESQg; a_type=0; b_type=1; login_ever=yes; privacy_policy_notification=0; c_type=34; PHPSESSID=27915696_60l9nve4HS7Z2Y0bngGXRZQwV4W4DvJ0; privacy_policy_agreement=3; tag_view_ranking=0xsDLqCEW6~lH5YZxnbfC~Lt-oEicbBr~kGYw4gQ11Z~Ie2c51_4Sp~RTJMXD26Ak~eVxus64GZU~HLWLeyYOUF~qiO14cZMBI~RVRPe90CVr~oCR2Pbz1ly~qWFESUmfEs~kP7msdIeEU~OT4SuGenFI~FySY6ZVB78~tgP8r-gOe_~5RvyKm3yea~kqu7T68WD3~v3nOtgG77A~bopfpc8En6~mCYugqjYJX~JXmGXDx4tL~qcYo_5oqVP~jfnUZgnpFl~J_YijUi2Xg~F8u6sord4r~3gc3uGrU1V~MM6RXH_rlN~TcgCqYbydo~Hry6GxyqEm~_giyO1uU9O~zyKU3Q5L4C~dUhrZMpRPB~aKhT3n4RHZ~KN7uxuR89w~BU9SQkS-zU~5oPIfUbtd6~y8GNntYHsi~EGefOqA6KB~05tD6f663z~Hjx7wJwsUT~h9r9YX0n2U~R-EFi7fMtD~w8ffkPoJ_S~jEoxuA2PIS~TOd0tpUry5~hRUnVPuHhQ~JtHr1OyMVc~Bd2L9ZBE8q~C9_ZtBtMWU~_EOd7bsGyl~TaUYlgH_jM~LVSDGaCAdn~iFcW6hPGPU~d-u0duThlB~MsF32uM-vh~GNcgbuT3T-~XDEWeW9f9i~_bee-JX46i~q303ip6Ui5~tlXeaI4KBb~LMpjieSVIv~ZXFMxANDG_~nRp2ZLPLbj~uKsA-LcJvn~qBVGbZbpq5~G-44hwuIPi~xa5-CDAPro~0j_zFcQpTM~YX72Y3LbXY~Txs9grkeRc~4ZEPYJhfGu~zASPXsXKdt~DADQycFGB0~HBlflqJjBZ~Gcv5xjGZY3~5Rf_nE4tAW~9wN-K8_crj~D4hLr_YmAD~bbZFcn8nQh~T40wdiG5yy~wlJLIPQpdd~5v2pI9_gGE~X4sPgKUWBs~hebOixBpSV~qIDsnltE2o~cxmbAHgoTk~mv-jOivdpn~f8pnWEIf9Z~ngUJxbZ4-R~ay54Q_G6oX~ziiAzr_h04~JWOyXSsjO2~HY55MqmzzQ~EUwzYuPRbU~KOnmT1ndWG~QKeXYK2oSR~cbmDKjZf9z~4qWlGrZbSE~iVTmZJMGJj; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:69; __cf_bm=k.dJJM7WQ45APSabaxdmzFCWQnBtPJzcg00Hbj4GxqQ-1644941038-0-ASQvUxnLsV4Q6uD6v4xA5kiW4NqFrLJ6ldhirpyqbEkQhANLCj2WurCFAnUYKvPZ+OmOXbJkpdoEJvJ7Rjf8HRIMzEgsQeWEO2NSD0jfhK5a'
+        'Cookie':''
         ,'referer': 'https://www.pixiv.net/users/27915696/following',        
     }
     id=url.rsplit('/',1)[1]
@@ -566,15 +612,18 @@ _DEFAULT_LIKE_THRESHOLD = 300
 def _pixiv_info_with_retry(url, Agent, max_attempts=2):
     """Fetch Pixiv info with up to ``max_attempts`` retries.
 
-    Returns the (tag, like, pagecount, img_url) tuple, or ``None`` if every
-    attempt produced the empty/404 response shape.
+    Returns the ``(tag, like, pagecount, img_url)`` 4-tuple to keep the legacy
+    utility script (``get_download_url``) untouched.  ``Pixiv_info`` itself
+    returns an 8-element list including upload/create dates and user info;
+    this wrapper deliberately slices it down to the first 4 fields.
+    Returns ``None`` if every attempt produced the empty/404 response shape.
     """
     for _ in range(max_attempts):
         info = Pixiv_info(url, Agent=Agent)
         if info == [404]:
             return None
         try:
-            tag, like, pagecount, img_url = info
+            tag, like, pagecount, img_url, *_rest = info
         except Exception:
             continue
         if tag != [] or like != 404:
@@ -705,9 +754,15 @@ def Pixiv_info(url,
                 bookmark_count = 0
             page_count = _extract_artwork_pagecount(body, id)
             normalized_tags = _extract_artwork_tags(body)
-            resdicts = tag_edit.Tag(normalized_tags)
             img_url = _extract_artwork_img_url(body)
-            result = [list(resdicts), int(bookmark_count), int(page_count), str(img_url)]
+            upload_date = _extract_artwork_upload_date(body)
+            create_date = _extract_artwork_create_date(body)
+            user_id = _extract_artwork_user_id(body)
+            user_name = _extract_artwork_user_name(body)
+            result = [
+                list(normalized_tags), int(bookmark_count), int(page_count), str(img_url),
+                upload_date, create_date, user_id, user_name,
+            ]
             valid = bool(img_url) and str(img_url) != 'None'
             return result, valid
 
@@ -797,23 +852,6 @@ def userId(url,
         data = json.loads(o)
         userId = data['illust'].get(id)
         return userId['userId']
-    # except Exception as err:
-    #     print(err)
-    #     try:
-    #         obj = str(bs4.BeautifulSoup(res.text, 'lxml').find_all('meta')[26])
-    #         obj=obj.replace('<meta content=\'','')
-            
-    #         obj=obj.replace('id="meta-preload-data" name="preload-data"/>','') 
-    #         o=obj.rsplit('\'',1)[0] 
-            
-    #         o=o.encode('UTF-8')
-    #         bookmarkCount = str(json.loads(o)['illust'][str(id)]['bookmarkCount'])
-    #         resdicts =json.loads(o)['illust'][str(id)]['tags']['tags']
-    #         resdicts=tag_edit.Tag(resdicts)
-    #         return resdicts,int(bookmarkCount)
-    #     except:
-    #         print('error')
-    #         return [],[]
 def pixiv_following_count(id,cookie,Agent):
     url = ("https://www.pixiv.net/ajax/user/extra?lang=zh_tw") # 访问存有画师所有作品
     print(url)
@@ -842,70 +880,7 @@ def no_use_seleium_get_pid(author_pids,cookie,Agent,q,path,num,exist_pid):
             for key in resdicts:
                 if key not in exist_pid:
                     q.put(key)
-        except:
-            f = open((path+"authorPids_err"+str(num)+".txt"), "a+")
-            f.write(author_pids[i]+'\n')
-            f.close() 
-
-       
-if __name__ == '__main__':
-    for i in range(400):
-        print(i)
-        #49.0.2.242:8090
-        print(Pixiv_info('https://www.pixiv.net/artworks/103276448'))
-
-               
-    '''all_pixiv_ids = illusts('21971914'
-            ,'first_visit_datetime_pc=2021-10-28+00%3A33%3A54; yuid_b=IgaEcIM; p_ab_id=9; p_ab_id_2=2; p_ab_d_id=1655378609; c_type=34; privacy_policy_notification=0; a_type=0; b_type=1; privacy_policy_agreement=3; login_ever=yes; PHPSESSID=27915696_PjlaOdEHhwZxxwFR6QhmWdmUAguAJ05n; device_token=b0e8ae7f1085345fd97205929a8c801f; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:16; tag_view_ranking=0xsDLqCEW6~qWFESUmfEs~RTJMXD26Ak~lH5YZxnbfC~Bd2L9ZBE8q~kGYw4gQ11Z~Lt-oEicbBr~HLWLeyYOUF~xa5-CDAPro~Txs9grkeRc~jH0uD88V6F~5oPIfUbtd6~Avyrt8Dl6U~Ie2c51_4Sp~KN7uxuR89w~iFcW6hPGPU~LVSDGaCAdn~aKhT3n4RHZ~HY55MqmzzQ~QKeXYK2oSR~s1DI4r3R9d~-StjcwdYwv~_hSAdpN9rx~Zw76BPYnQY~LLyDB5xskQ~Je_lQPk0GY~At-5ulc3K-~MM6RXH_rlN~PKOnf9fn03~kWRbcAGDa9~_pwIgrV8TB~HBlflqJjBZ~rIovsiOt91~kqu7T68WD3~_EOd7bsGyl~ziiAzr_h04~wKl4cqK7Gl~YXsA4N8tVW~uGQeWvelyQ~EGefOqA6KB~yS_WrRrWFi~y0H0q1mN2T~bbZFcn8nQh~7eQw69bujS~hfCvniImMk~0M0zAeslDb~Ti1gvrVQFO~Hjx7wJwsUT~gpglyfLkWs~cbmDKjZf9z~t_MXrQdcbG~v3nOtgG77A~hRUnVPuHhQ~Cj_Gcw9KR1~txZ9z5ByU7~vdbd7LdFLQ~BtXd1-LPRH~q303ip6Ui5~faHcYIP1U0~jsuXqE_4cM~yPNaP3JSNF~4QveACRzn3~T40wdiG5yy~sqGkVxMuMR~y8GNntYHsi~TWrozby2UO~n39RQWfHku~w04oCbou_K~EWR7JDW6jH~qsesP1OhVb~O_HW-VFJqw~tzIoUMzCb7~q3eUobDMJW~qiO14cZMBI~zJ9HPr_eGC~py0hn8jqar~RokSaRBUGr~KavbyZsaB1~rgxOsa3XtV~phyAxUXrUB~o1uJiiK9Pb~3gc3uGrU1V~m3EJRa33xU~zIv0cf5VVk~JBqkgBEhOH~bhGHO52dlK~_Rh3LLrBkn~Sp679VBWVz~PNmj47oZlB~5ObVqT-Fku~svKogfYWcS~2bq8SNVWly~j7DYHEocqe~VP5Nfk8taA~mxDE3obNef~bkSTvfrPKL~Peat8vFmO1~pYlUxeIoeg~zASPXsXKdt~DADQycFGB0; __cf_bm=amkOyDjW98gUXXLbSGYlOQO2yEr_dO3dsGfCSusktuQ-1647280343-0-AdCW/o0Ks2IM0BaHV5g6N6BeBELcwf82kJgll/tiqKrCBt9+JZIka7Ipba1bqJqV+sjZK6c8unyuAxUFXKv0qmKT3NSzntjWOFBvjLeo0wCY'
-            ,'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 Safari/537.36 Edg/99.0.1150.36')
-    '''
-    '''cookie=['p_ab_id=5; p_ab_id_2=5; p_ab_d_id=1125130963; first_visit_datetime_pc=2021-02-23+02%3A32%3A11; yuid_b=OJRESQg; a_type=0; b_type=1; login_ever=yes; privacy_policy_notification=0; c_type=34; PHPSESSID=27915696_60l9nve4HS7Z2Y0bngGXRZQwV4W4DvJ0; privacy_policy_agreement=3; QSI_S_ZN_5hF4My7Ad6VNNAi=v:0:0; tag_view_ranking=0xsDLqCEW6~qWFESUmfEs~LVSDGaCAdn~QKeXYK2oSR~Txs9grkeRc~RTJMXD26Ak~kGYw4gQ11Z~lH5YZxnbfC~Lt-oEicbBr~_EOd7bsGyl~yS_WrRrWFi~G-44hwuIPi~LLyDB5xskQ~Ie2c51_4Sp~HLWLeyYOUF~DADQycFGB0~sqGkVxMuMR~jk9IzfjZ6n~uvBGOtCzqF~MM6RXH_rlN~aKhT3n4RHZ~HY55MqmzzQ~Ti1gvrVQFO~bXMh6mBhl8~RokSaRBUGr~aC55Umcfh1~zsm1ECW5Wb~5f1R8PG9ra~xa5-CDAPro~G_f4j5NH8i~v3nOtgG77A~0RGtdYkK6L~abNIEh2zTB~Bd2L9ZBE8q~0jyux9PxkH~QaiOjmwQnI~n39RQWfHku~vxqZQOR3t2~hk_QPyZfi8~Tg1PbOMGRv~qXzcci65nj~ZTBAtZUDtQ~1VgdMhBiax~dUhrZMpRPB~tgP8r-gOe_~YTKjYV1RQx~Je_lQPk0GY~m3EJRa33xU~iVTmZJMGJj~rMC0CLW0cf~mHukPa9Swj~GuK7T6aGv6~T6NhuB95ST~CLTDpOEHJL~gpglyfLkWs~NGpDowiVmM~MnGbHeuS94~mZurA-1CO-~Am8pyjYCcZ~Riqeg_qBGT~jfnUZgnpFl~BtXd1-LPRH~ujS7cIBGO-~zZZn32I7eS~CrFcrMFJzz~ZN5DR5ie1W~AZ1ov2QNRs~N7rBHi7ijr~QzKFCsGzn-~PBxKNk7VAD~zyKU3Q5L4C~vAwbTkrP0I~P5-w_IbJrm~Ltbk6w58aR~l2rugVKl6u~ajFGI2BXvo~R0DtApn-IB~W4_X_Af3yY~OUF2gvwPef~D4hLr_YmAD~QIa7PLv7ZL~EQ_o6ZyXFg~lf-Uj4GKzU~2FO_ideA5k~18j5-cWRq2~FPCeANM2Bm~TWrozby2UO~9Gbahmahac~2QTW_H5tVX~bplY14maDo~jjVAJCBCtW~B2kc8vAuXw~m3sqCXWo7m~k39B1CkQWC~muA8Dd9eL4~I-ST5EF_lI~wbvCWCYbkM~mVhi1hBMit~Hry6GxyqEm~i8u6Dgt7ao; __cf_bm=cqoyzD4i.qO0s1sUnjhOf9p5ytamrWA2qApQNhhiIKE-1656319872-0-AaXwpJas6wECDAH0caPNgFN5+Y5wjvrFlFzdxBuyzQz6oQGTN8qILCJhy4DeWPqBE9H8Msy1ymtWXbBqLJ6dRm160hdvQQHr56qP0p3ZdhTI',
-        'first_visit_datetime_pc=2022-02-22+01%3A16%3A54; p_ab_id=4; p_ab_id_2=7; p_ab_d_id=1650471887; __utma=235335808.1075363582.1645460214.1645460214.1645460214.1; __utmc=235335808; __utmz=235335808.1645460214.1.1.utmcsr=(direct)|utmccn=(direct)|utmcmd=(none); __cf_bm=0a88D.DNolnjql11bA2YlSX0AcrLNbOeH4e01.n9Bxo-1645460214-0-AZBMYe8wLu85sKJgxlsiLyTfyRirq9PImai1YQW6aqaElwzgwilYvqTg1yArIG9dhNAWfXUnstyJaUnA7KjsC4hCuS2VpDjkwIxqiWZjNpEfds/gw+Fti9Xi7WNGm60A275E+delw5z8UbPR+KvvWIsu+gzXXX+bNS+iKfwixI8fUjhytmLnoA2qeosMkwT2EA==; _fbp=fb.1.1645460216607.810010051; __utmt=1; yuid_b=ExaEQEI; _ga=GA1.2.1075363582.1645460214; _gid=GA1.2.1775348523.1645460337; _gat=1; PHPSESSID=78672220_Guho8rq4QaKdQmhrizUuq9XBanNhtU5S; device_token=9fed18d4053fdd2dd3c14b6a8b9487f6; privacy_policy_agreement=3; c_type=23; privacy_policy_notification=0; a_type=0; b_type=1; __utmv=235335808.|3=plan=normal=1^5=gender=male=1^6=user_id=78672220=1^11=lang=zh_tw=1; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:1; tag_view_ranking=qiO14cZMBI~RVRPe90CVr~oCR2Pbz1ly~Lt-oEicbBr~eVxus64GZU~uKsA-LcJvn; __utmb=235335808.4.10.1645460214'
-        ]'''
-        #Test_cookies(cookie)
-    '''url='https://www.pixiv.net/artworks/96429430'
-    tag=Pixiv_Tag(url) ''' 
-    '''q=Queue()'''
-    #print(Pixiv_info('https://www.pixiv.net/artworks/98019845'))  
-    '''start=time.time() 
-    Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.74 Safari/537.36 Edg/99.0.1150.55'
-    '''#print(illusts('27915696',cookie[0],'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.124 Safari/537.36 Edg/102.0.1245.41'))
-    #illusts('59115126',cookie[0],'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.124 Safari/537.36 Edg/102.0.1245.41')
-    #pixiv_following_count('27915696',cookie[0],'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.124 Safari/537.36 Edg/102.0.1245.41')
-    #path=r'D:/pixiv/'
-
-    '''print(thread_no_use_seleium_get_pid(cookie[0],Agent,path,'1','59115126'))
-    stop=time.time()
-    print(stop-start)'''
-    '''i,cookies=Test_cookies(['p_ab_id=5; p_ab_id_2=5; p_ab_d_id=1125130963; first_visit_datetime_pc=2021-02-23+02%3A32%3A11; yuid_b=OJRESQg; a_type=0; b_type=1; login_ever=yes; privacy_policy_notification=0; c_type=34; PHPSESSID=27915696_60l9nve4HS7Z2Y0bngGXRZQwV4W4DvJ0; privacy_policy_agreement=3; tag_view_ranking=0xsDLqCEW6~RTJMXD26Ak~lH5YZxnbfC~kGYw4gQ11Z~Ie2c51_4Sp~Lt-oEicbBr~HLWLeyYOUF~6lAZFEHdIG~tgP8r-gOe_~v3nOtgG77A~q303ip6Ui5~SnoEe7upUJ~VbPCYJXdEP~4QveACRzn3~hRUnVPuHhQ~fkptjjF31f~liM64qjhwQ~LcFnY5KMB3~R8jL-NaEv1~5oPIfUbtd6~HY55MqmzzQ~EZQqoW9r8g~rIovsiOt91~xZMlo13i1B~jXyAkKG_r6~fwLb-f-Cyw~1KCppYVBZi~xS1IEbYkDC~D2Z9yqNh4C~q3eUobDMJW~LLyDB5xskQ~qWFESUmfEs~PwDMGzD6xn~UCT8y2nU0w~Txs9grkeRc~9aCtrIRNdF~8zydy1kf22~zvcWye7PPU~QkN-eEgwBf~BRoQO5EgS6~DlBi_h7Pbj~Syl9NQhE_u~H0KKRBjKCB~oLKtJ-caOt~jH0uD88V6F~Yw6zHqltKg~ltbsxp8yio~bX7kls1wXg~LVSDGaCAdn~qkC-JF_MXY~yJr9CrS0uL~JXmGXDx4tL~8qzNKXwVP9~P9jONkE5Ux~aMSPvw-ONW~49mOVaB3jw~77cKnr2WaY~y9_ytVF_KY~lLoGT15boh~CO8L4b7n_7~dUhrZMpRPB~reR7DUAWuG~sHj972WME6~1VgdMhBiax~jFLb4HjoWf~bXMh6mBhl8~3Q3HW-78l_~_EOd7bsGyl~ziiAzr_h04~9Gbahmahac~6vriIwKZAv~u3EAZmzDcl~2R7RYffVfj~SapL8yQw4Y~Ed_W9RQRe_~QaiOjmwQnI~o8a--Qa5of~cHpSJQiKeZ~KexWqtgzW1~wLSj8MDOo8~mLrrjwTHBm~WVrsHleeCL~OUsYoX1-GT~_vCZ2RLsY2~_3oeEue7S7~FrNQVCB8yi~YHRjLHL-7q~4sdiKNzOsj~hMzrji99a1~PrND0ipqBX~Uw_mm-h1Wo~FgYArp6riX~MM6RXH_rlN~EsPictrypp~MA6EUZYaNt~ZEYMFD786k~RcahSSzeRf~ePN3h1AXKX~R97S29V8Qw~YXsA4N8tVW; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:19; __cf_bm=0m8DlJrBTwZ.UkA95H91jwWjQYvzJ9v53XH1_hDO.tg-1648960602-0-AeDEXETjg7BWesTTPlyV2jRCeYr/S60VaHO7W/8JyG0+ycRcVcHsn2T3uBQjbBzkpXVgf7VMxxf53z8IeftahY/hNQEmRpLmUBzLfObJxdCO']
-    )'''
-    '''with open((r"R:/picture_ids0.txt")) as file:     #讀取寫入的文檔
-            lines = [line.rstrip() for line in file]
-    URL=get_download_url(lines,r'D:/pyedge/','p_ab_id=5; p_ab_id_2=5; p_ab_d_id=1125130963; first_visit_datetime_pc=2021-02-23+02%3A32%3A11; yuid_b=OJRESQg; a_type=0; b_type=1; login_ever=yes; privacy_policy_notification=0; c_type=34; PHPSESSID=27915696_60l9nve4HS7Z2Y0bngGXRZQwV4W4DvJ0; privacy_policy_agreement=3; tag_view_ranking=0xsDLqCEW6~RTJMXD26Ak~lH5YZxnbfC~kGYw4gQ11Z~Ie2c51_4Sp~Lt-oEicbBr~HLWLeyYOUF~6lAZFEHdIG~tgP8r-gOe_~v3nOtgG77A~q303ip6Ui5~SnoEe7upUJ~VbPCYJXdEP~4QveACRzn3~hRUnVPuHhQ~fkptjjF31f~liM64qjhwQ~LcFnY5KMB3~R8jL-NaEv1~5oPIfUbtd6~HY55MqmzzQ~EZQqoW9r8g~rIovsiOt91~xZMlo13i1B~jXyAkKG_r6~fwLb-f-Cyw~1KCppYVBZi~xS1IEbYkDC~D2Z9yqNh4C~q3eUobDMJW~LLyDB5xskQ~qWFESUmfEs~PwDMGzD6xn~UCT8y2nU0w~Txs9grkeRc~9aCtrIRNdF~8zydy1kf22~zvcWye7PPU~QkN-eEgwBf~BRoQO5EgS6~DlBi_h7Pbj~Syl9NQhE_u~H0KKRBjKCB~oLKtJ-caOt~jH0uD88V6F~Yw6zHqltKg~ltbsxp8yio~bX7kls1wXg~LVSDGaCAdn~qkC-JF_MXY~yJr9CrS0uL~JXmGXDx4tL~8qzNKXwVP9~P9jONkE5Ux~aMSPvw-ONW~49mOVaB3jw~77cKnr2WaY~y9_ytVF_KY~lLoGT15boh~CO8L4b7n_7~dUhrZMpRPB~reR7DUAWuG~sHj972WME6~1VgdMhBiax~jFLb4HjoWf~bXMh6mBhl8~3Q3HW-78l_~_EOd7bsGyl~ziiAzr_h04~9Gbahmahac~6vriIwKZAv~u3EAZmzDcl~2R7RYffVfj~SapL8yQw4Y~Ed_W9RQRe_~QaiOjmwQnI~o8a--Qa5of~cHpSJQiKeZ~KexWqtgzW1~wLSj8MDOo8~mLrrjwTHBm~WVrsHleeCL~OUsYoX1-GT~_vCZ2RLsY2~_3oeEue7S7~FrNQVCB8yi~YHRjLHL-7q~4sdiKNzOsj~hMzrji99a1~PrND0ipqBX~Uw_mm-h1Wo~FgYArp6riX~MM6RXH_rlN~EsPictrypp~MA6EUZYaNt~ZEYMFD786k~RcahSSzeRf~ePN3h1AXKX~R97S29V8Qw~YXsA4N8tVW; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:19; __cf_bm=0m8DlJrBTwZ.UkA95H91jwWjQYvzJ9v53XH1_hDO.tg-1648960602-0-AeDEXETjg7BWesTTPlyV2jRCeYr/S60VaHO7W/8JyG0+ycRcVcHsn2T3uBQjbBzkpXVgf7VMxxf53z8IeftahY/hNQEmRpLmUBzLfObJxdCO'
-    ,'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.74 Safari/537.36 Edg/99.0.1150.55',1,q)
-    x=q.get()
-    print(x)'''
-
-    '''if 'R-18G'and ('死姦'or '脫腸' or'斬首'or '屍姦'or 'necrophilia'or'割脖'or '砍頭') in tag:
-                    print('跳過'+url+tag) 
-                                                         #回傳標籤
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50',
-        'Cookie':'p_ab_id=5; p_ab_id_2=5; p_ab_d_id=1125130963; first_visit_datetime_pc=2021-02-23+02%3A32%3A11; yuid_b=OJRESQg; a_type=0; b_type=1; login_ever=yes; privacy_policy_notification=0; c_type=34; PHPSESSID=27915696_60l9nve4HS7Z2Y0bngGXRZQwV4W4DvJ0; privacy_policy_agreement=3; tag_view_ranking=0xsDLqCEW6~lH5YZxnbfC~Lt-oEicbBr~kGYw4gQ11Z~Ie2c51_4Sp~RTJMXD26Ak~eVxus64GZU~HLWLeyYOUF~qiO14cZMBI~RVRPe90CVr~oCR2Pbz1ly~qWFESUmfEs~kP7msdIeEU~OT4SuGenFI~FySY6ZVB78~tgP8r-gOe_~5RvyKm3yea~kqu7T68WD3~v3nOtgG77A~bopfpc8En6~mCYugqjYJX~JXmGXDx4tL~qcYo_5oqVP~jfnUZgnpFl~J_YijUi2Xg~F8u6sord4r~3gc3uGrU1V~MM6RXH_rlN~TcgCqYbydo~Hry6GxyqEm~_giyO1uU9O~zyKU3Q5L4C~dUhrZMpRPB~aKhT3n4RHZ~KN7uxuR89w~BU9SQkS-zU~5oPIfUbtd6~y8GNntYHsi~EGefOqA6KB~05tD6f663z~Hjx7wJwsUT~h9r9YX0n2U~R-EFi7fMtD~w8ffkPoJ_S~jEoxuA2PIS~TOd0tpUry5~hRUnVPuHhQ~JtHr1OyMVc~Bd2L9ZBE8q~C9_ZtBtMWU~_EOd7bsGyl~TaUYlgH_jM~LVSDGaCAdn~iFcW6hPGPU~d-u0duThlB~MsF32uM-vh~GNcgbuT3T-~XDEWeW9f9i~_bee-JX46i~q303ip6Ui5~tlXeaI4KBb~LMpjieSVIv~ZXFMxANDG_~nRp2ZLPLbj~uKsA-LcJvn~qBVGbZbpq5~G-44hwuIPi~xa5-CDAPro~0j_zFcQpTM~YX72Y3LbXY~Txs9grkeRc~4ZEPYJhfGu~zASPXsXKdt~DADQycFGB0~HBlflqJjBZ~Gcv5xjGZY3~5Rf_nE4tAW~9wN-K8_crj~D4hLr_YmAD~bbZFcn8nQh~T40wdiG5yy~wlJLIPQpdd~5v2pI9_gGE~X4sPgKUWBs~hebOixBpSV~qIDsnltE2o~cxmbAHgoTk~mv-jOivdpn~f8pnWEIf9Z~ngUJxbZ4-R~ay54Q_G6oX~ziiAzr_h04~JWOyXSsjO2~HY55MqmzzQ~EUwzYuPRbU~KOnmT1ndWG~QKeXYK2oSR~cbmDKjZf9z~4qWlGrZbSE~iVTmZJMGJj; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:69; __cf_bm=k.dJJM7WQ45APSabaxdmzFCWQnBtPJzcg00Hbj4GxqQ-1644941038-0-ASQvUxnLsV4Q6uD6v4xA5kiW4NqFrLJ6ldhirpyqbEkQhANLCj2WurCFAnUYKvPZ+OmOXbJkpdoEJvJ7Rjf8HRIMzEgsQeWEO2NSD0jfhK5a'
-        ,        
-    }'''
-    '''
-    Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50'
-    cookie='first_visit_datetime_pc=2022-02-22+01%3A16%3A54; p_ab_id=4; p_ab_id_2=7; p_ab_d_id=1650471887; __utma=235335808.1075363582.1645460214.1645460214.1645460214.1; __utmc=235335808; __utmz=235335808.1645460214.1.1.utmcsr=(direct)|utmccn=(direct)|utmcmd=(none); __cf_bm=0a88D.DNolnjql11bA2YlSX0AcrLNbOeH4e01.n9Bxo-1645460214-0-AZBMYe8wLu85sKJgxlsiLyTfyRirq9PImai1YQW6aqaElwzgwilYvqTg1yArIG9dhNAWfXUnstyJaUnA7KjsC4hCuS2VpDjkwIxqiWZjNpEfds/gw+Fti9Xi7WNGm60A275E+delw5z8UbPR+KvvWIsu+gzXXX+bNS+iKfwixI8fUjhytmLnoA2qeosMkwT2EA==; _fbp=fb.1.1645460216607.810010051; __utmt=1; yuid_b=ExaEQEI; _ga=GA1.2.1075363582.1645460214; _gid=GA1.2.1775348523.1645460337; _gat=1; PHPSESSID=78672220_Guho8rq4QaKdQmhrizUuq9XBanNhtU5S; device_token=9fed18d4053fdd2dd3c14b6a8b9487f6; privacy_policy_agreement=3; c_type=23; privacy_policy_notification=0; a_type=0; b_type=1; __utmv=235335808.|3=plan=normal=1^5=gender=male=1^6=user_id=78672220=1^11=lang=zh_tw=1; QSI_S_ZN_5hF4My7Ad6VNNAi=r:10:1; tag_view_ranking=qiO14cZMBI~RVRPe90CVr~oCR2Pbz1ly~Lt-oEicbBr~eVxus64GZU~uKsA-LcJvn; __utmb=235335808.4.10.1645460214'
-    author_pids=['21971914','16976384']      
-    q1=Queue()
-    path=r'D:\圖片\下載\測試/'
-    num=0
-    no_use_seleium_get_pid(author_pids,cookie,Agent,q1,path,num)
-    text=q1.get()
-    print(len(text))'''
-    
-    #print(resdicts)
-    #resdicts = str(json.loads(o)['illust'][str(id)]['tags']['tags'])
-                                                                      
+        except Exception:
+            with open((path+"authorPids_err"+str(num)+".txt"), "a+") as f:
+                f.write(author_pids[i]+'\n')
 

@@ -65,7 +65,7 @@ def test_finalize_downloads_zero_items_ignored(tmp_path):
     assert isinstance(remaining, list)
 
 
-# ── _refresh_and_write_exist_pid ─────────────────────────────────────────────
+# ── _sync_exist_pid_to_db ────────────────────────────────────────────────────
 
 def _stub_with_download_dir(tmp_path):
     t = _stub(tmp_path)
@@ -73,43 +73,30 @@ def _stub_with_download_dir(tmp_path):
     return t
 
 
-def test_refresh_exist_pid_from_json(tmp_path):
+def test_sync_exist_pid_writes_to_db(tmp_path):
+    from app.core.metadata_db import MetadataDB
     t = _stub_with_download_dir(tmp_path)
-    pids = ["111", "222", "333"]
-    (tmp_path / "exist_pid.json").write_text(
-        json.dumps(pids), encoding="utf-8"
-    )
-    t._refresh_and_write_exist_pid()
-    assert "111" in t.exist_pid
-    assert "222" in t.exist_pid
+    t.exist_pid = {"11100001", "22200001"}
+    t._metadata_db = MetadataDB(str(tmp_path))
+    t._sync_exist_pid_to_db()
+    assert t._metadata_db.is_downloaded("11100001") is True
+    assert t._metadata_db.is_downloaded("22200001") is True
 
 
-def test_refresh_exist_pid_fallback_to_legacy_json(tmp_path):
+def test_sync_exist_pid_no_db_does_not_raise(tmp_path):
     t = _stub_with_download_dir(tmp_path)
-    pids = ["444", "555"]
-    (tmp_path / "exist.json").write_text(
-        json.dumps(pids), encoding="utf-8"
-    )
-    t._refresh_and_write_exist_pid()
-    assert "444" in t.exist_pid
-
-
-def test_refresh_exist_pid_empty_dir(tmp_path):
-    t = _stub_with_download_dir(tmp_path)
-    t._refresh_and_write_exist_pid()
-    # No crash, exist_pid is a set (possibly empty)
+    t.exist_pid = {"11100001"}
+    t._metadata_db = None
+    t._sync_exist_pid_to_db()  # must not raise
     assert isinstance(t.exist_pid, set)
 
 
-def test_refresh_exist_pid_writes_back_json(tmp_path):
+def test_sync_exist_pid_empty_set_is_noop(tmp_path):
     t = _stub_with_download_dir(tmp_path)
-    pids = ["111", "222"]
-    (tmp_path / "exist_pid.json").write_text(json.dumps(pids), encoding="utf-8")
-    t._refresh_and_write_exist_pid()
-    # Written back
-    written = json.loads((tmp_path / "exist_pid.json").read_text(encoding="utf-8"))
-    assert "111" in written
-    assert "222" in written
+    t.exist_pid = set()
+    t._metadata_db = None
+    t._sync_exist_pid_to_db()
+    assert isinstance(t.exist_pid, set)
 
 
 # ── _group_urls_by_pid ────────────────────────────────────────────────────────

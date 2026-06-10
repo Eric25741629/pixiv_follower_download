@@ -916,17 +916,27 @@ def to_int_lenient(value, default=None):
 
 
 def normalize_filter_tags(tags):
-    """Lowercase + dedupe a tag-filter list.  Returns ``[]`` for non-list
-    input.  Best-effort routes through ``tag_edit.Tag`` for alias expansion
-    when available."""
+    """Lowercase + strip + dedupe a tag-filter list.  Returns ``[]`` for
+    non-list input.  Operates on the raw tag string with no alias / translation
+    rewriting, so the user-configured filter strings are compared verbatim
+    against Pixiv's source tags.
+
+    .. warning::
+        Historical behavior routed filter tags through ``tag_edit.Tag()``
+        which applied ~300 Japanese→Chinese translation rules. That module
+        was removed because the silent rewriting (a) broke filter matching
+        when users typed the Japanese form, and (b) permanently mutated the
+        cached tag strings in ``artworks.tags`` and ``all_url_meta.json``.
+
+        **Migration note for callers:** if a user's ban_tag / must_tag list
+        was tuned against the *translated* string (e.g. ``Hololive`` instead
+        of ``ホロライブ``), those entries silently stop matching after the
+        switch to verbatim comparison. The user must re-enter the filter
+        tags using Pixiv's original strings.
+    """
     out = []
     if not isinstance(tags, list):
         return out
-    try:
-        import tag_edit
-        tags = tag_edit.Tag(tags)
-    except Exception:
-        pass
     for t in tags:
         s = str(t).strip()
         if s:
