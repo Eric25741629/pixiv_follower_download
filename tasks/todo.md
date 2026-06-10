@@ -5,6 +5,62 @@ status: in_progress
 spec: docs/superpowers/specs/2026-06-07-combined-author-order-design.md
 ---
 
+## [2026-06-10] 跳到最新重構(意圖驅動狀態機)+ log 跨行框選複製
+
+spec: docs/superpowers/specs/2026-06-10-log-follow-rearchitecture-design.md
+
+- [ ] 先寫測試 tests/test_log_panel_follow_state.py(紅):滾輪上→關跟隨;END 貼底→開;END 離底→關;END 離底但 _scroll_pending→不變;膠囊→開+捲動;append 裁切 span 區段正確;膠囊可見性恆= not following
+- [ ] 新增 app/gui/log_panel.py:LogPanel(單一 selectable Text + ListView 容器 + GestureDetector 滾輪 + 膠囊 + 狀態機)
+- [ ] main_view.py:刪除舊 log 欄位/方法(_log_lines、_auto_scroll_enabled、_last_scroll_pixels、_last_max_scroll_extent、_on_log_scroll、像素差魔術數字),append_log 轉呼叫 LogPanel;build() 換用 panel 控件,移除無效 SelectionArea
+- [ ] 轉綠 + 全測試套件 + ruff 改動檔零新增違規
+- [ ] 實機 python main.py 驗證:滾輪上滾出膠囊、滾回底自動恢復、膠囊點擊跳底、跨行框選 Ctrl+C、GestureDetector 不擋滾動
+- [ ] codex skill 對抗式 code review
+
+Review:
+
+## [2026-06-09] 整體進度條在 combined「進入下一個 PID」時消失(真根因修復)
+
+問題(使用者第三/四次回報,視窗全程開著):整體進度+ETA 只在「PID 完成、下一個 PID 還沒進 p0」時短暫出現,一進入下一個 PID 的 p0 就消失;本作分頁+log 全程正常。
+
+真根因(前三輪都抓錯):combined 重用 fetcher 的 `get_download_url` → `_step3_finish_pid` → `_step3_advance_progress`,每個 PID 送 `progress(1, fetcher.pid_max)`;combined 從不呼叫 fetcher.run()/`_load_and_filter_pid_list`,所以 `fetcher.pid_max` 永遠 = 0(class 預設)→ 送 `progress(1, 0)` → `update_progress` total<=0 → 整體進度被清空。combined 自己 run() 迴圈送的 `progress(1, len(order))`(total 正確)只在 PID 完成時閃一下。downloader 的 progress 早被 `_CombinedPageProgressQueue` 攔成 page_progress,fetcher 的沒攔。
+
+修法:
+- [x] `thread_combined.py`:新增 `_DropOverallProgressQueue`(丟 type=="progress"、其餘照過),`_process_one_pid` 查詢期間 swap `self.fetcher._q`(try/finally 還原)→ combined.run() 成為整體進度唯一發送者。
+- [x] `main_view.py`:把兩條進度列統一成 `_make_progress_row`(同構,皆 visible=False 起始)+ `_render_progress_row`(visible-gated reveal/hide),消除「兩條 bar 用不同方式建立」的缺陷(使用者明確點名)。
+- [x] 測試:`tests/test_combined_overall_progress_kept.py`(wrapper 丟 progress + 查詢期間不污染整體進度)、`tests/test_main_view_progress_render.py`(+4:兩條同構、reveal-on-update、total<=0 隱藏、reattach 還原)。
+- [x] 全測試 836 passed;ruff 對改動檔零「新增」違規(main_view 既有 13 SIM105 不在本次範圍)。
+- [x] 已交 codex 交叉驗證(對抗式 review)。
+- [x] lessons.md:修正前一輪「Row reflow」誤判,新增「追事件來源/重用 run()-thread 的未初始化計數器」教訓。
+
+## [2026-06-09] 進度條修復(邊查邊下 3+4)
+
+問題(使用者回報):
+- 整體進度的「總量 / 現在第幾張」與「預計剩餘」在執行中不顯示,按下「結束」後才整批出現(116/XXX)。
+- 進度條太細不好看;兩條進度條沒對齊。
+
+根因:
+- `update_progress` / `update_countdown` 只更新子控制(`_progress_text` 等),從不更新外層 Row;`progress_row` 只是 `build()` 區域變數。含 expand ProgressBar 的 Row 中,子控制 `.value` patch 不會讓文字重排 → 文字停在空白,直到按 stop 觸發 loading dialog 的整頁 `page.update()` 才整頁重排(故「自己出現」)。對照 `_page_progress_row` 有呼叫 `row.update()` 所以一直正常。
+- 兩條 row 的 lead 縮排(0 vs 24)與 trailing 文字寬度(456 vs 188)不同 → bar 起訖點不一致,沒對齊。
+- ProgressBar 用預設高度(~4px 細線)。
+
+修法(只動 GUI 層 `app/gui/views/main_view.py`):
+- [x] 先寫測試 tests/test_main_view_progress_render.py(紅 6/7)
+- [x] 將 `progress_row` 升為 `self._progress_row`,新增 `self._meta_row`(ETA+倒數);`_safe_update` 改更新外層 Row
+- [x] 兩條 bar 共用 LEAD(84)/TRAIL(210)/spacing(12) 常數 → 對齊;`bar_height=12`+圓角6+配色
+- [x] `build()` 重繪一次 `_paint_progress()`(reattach 後立即顯示)
+- [x] 轉綠 + 全測試(828 passed)+ ruff(新碼零 SIM105,既有 17→13)
+
+Review:
+- 根因是 Row 未被 `.update()`(只更新子控制),與「granularity / 第一個 PID 慢」無關 — 使用者糾正後才定位正確。
+- 只動 `main_view.py`(GUI 層),未改 combined 進度語意(per-PID),不影響既有測試。
+- 已記入 tasks/lessons.md。
+
+## [2026-06-09] 第二輪回報(同一進度條)
+- [x] PID/數字太靠右看不到 → 尾欄文字改靠左對齊,緊貼進度條(`TextAlign.LEFT`)
+- [x] 「整體進度看不到總進度、按中止才出現」→ 提醒使用者**重啟 app**(Flet 不熱載入);row.update 修正在邏輯上已足(對照 page 進度後續更新也靠 row.update 即時刷新)
+- [x] **中止 mid-PID 不續傳(功能 bug)**:`_download_pid_group` 中止後 `failed=[]`,combined 誤判全成功 → 標記完成+關閉+移出 pending。修法:`_process_one_pid` 下載後加 `elif self._stop_event.is_set(): download_ok=False`,保留 pending 列與 pictures_id.txt → 下次續傳。測試 tests/test_combined_stop_resume.py(2)。
+- [x] 全測試 830 passed;ruff 無新增違規。
+
 ## 根因
 - combined mode (`thread_combined.py`) 從不呼叫 `downloader.run()`，所以步驟4 的 `compute_author_order` 整段被跳過 → author_order 是死參數，下載順序 = pictures_id.txt 亂序。
 - 步驟2 多執行緒 + append-only 累加 → pictures_id.txt 本來就不依作者分組。
@@ -86,3 +142,35 @@ spec: docs/superpowers/specs/2026-06-07-combined-author-order-design.md
 - [ ] CLI `run --step 2 --force-rescan`（headless 設 controller.force_rescan）
 - [ ] 測試 + 全綠 + ruff
 - [ ] commit 全部（author-order + user_id backfill + force-rescan；不加 Claude co-author）
+
+---
+
+## 追加3：步驟 2/3/4 初始化加速（2026-06-07）
+
+**動機**：使用者回報步驟 2/3/4 啟動前初始化耗時很久。實測真實資料（DB 1.26M 列、下載夾 204,536 檔）找出熱點。
+
+**根因（實測）**
+- `closed_artwork_set()`（`v_closed_artworks` 三路 UNION 丟 1.1M 列進 TEMP B-TREE 去重）= **22.9s**，每次 Run All 被呼叫 5-6 次（`_build_step2/3`、`_build_combined`、folder-sync 的 `_augment_exist_pid_from_db`、`download_thread._load_initial_exist_pid_set`、`emit_db_stats` 的 `downloaded_count`）。
+- 下載夾每次 `os.walk` 兩趟（count + scan）= **~24s**。
+- `mirror_exist_pid_set` 把剛從 DB 讀出的 1.095M closed set 又 INSERT 回去 + 寫巨大 event log 行。
+- 步驟3 `_migrate_url_meta_schema` 在 url_meta 為空時仍解析 11×82MB cookie_requirement（primary + 10 history）= **~10s**。
+
+**改動（全部 root-cause、零行為回歸）**
+- `app/core/metadata_db.py`：`closed_artwork_set` 改 Python 集合組合 `(sentinels−pending)|complete|revoked`（結果逐一驗證與舊 view 一致）+ process 全域快取（key=DB 檔 `size+mtime_ns`，含 -wal，寫入自動失效）；`downloaded_count`→`len(closed_artwork_set())`；新增 `_db_file_signature`、`_compute_closed_artwork_set`。
+- `app/core/pixiv_thread_utils.py`：`normalize_pid` 純數字快速路徑；新增 `_scan_download_folder`（單趟 walk 回傳 pids+dir_mtimes+count）+ `_folder_dir_mtimes_match`；`sync_exist_pid_with_download_folder` 改目錄 mtime 簽章快取（命中免 walk）+ 只 shadow-write 新增差集；移除死碼 `_count_files_in_folder`。
+- `app/core/thread_download.py`、`thread_pid_scan.py`：移除多餘 `_mirror_exist_pid_to_db()`（set 本就來自 DB）。
+- `app/core/thread_url_fetch.py`：`_migrate_url_meta_schema` 在 `url_meta` 空時提前 return（保留 history gap-fill 契約）。
+
+**實測前後**
+
+| 項目 | 前 | 後（首次） | 後（快取命中） |
+|------|----|-----------|---------------|
+| `closed_artwork_set()` | 22.9s | 7.4s（一致 1,095,215） | ~50ms |
+| `downloaded_count()` | 22.9s | — | ~85ms |
+| 下載夾掃描 | ~24s | 10.5s（單趟） | 0.29ms |
+| cookie_requirement 歷史解析 | ~10s | 0 | — |
+| mirror 回灌 1.095M | 數秒 | 已移除 | — |
+
+單步 init 推估 ~115s → 首次 ~18s → 暖快取 ~1-2s（6-60x）。
+
+**驗證**：新增 17 測試（`test_closed_set_cache.py`、`test_folder_mtime_cache.py`、`test_normalize_pid_fastpath.py`）；全套件 **796 passed**；既有 `test_artwork_page_schema.py`（closed_artwork_set 正確性網）全綠 + 真實 DB count 相符；CLAUDE.md 已更新。
