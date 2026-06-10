@@ -339,6 +339,15 @@ class combined_thread(PauseableThread):
                     download_ok = False
                 elif failed:
                     download_ok = False
+                elif self._stop_event.is_set():
+                    # Stopped mid-PID. _download_pid_group only reports
+                    # *attempted* failures, so the pages that were never
+                    # reached are absent from `failed` (it is []) — which must
+                    # NOT be read as "all pages done". Mark the PID incomplete
+                    # so its seeded pending rows + pictures_id.txt entry survive
+                    # and the next run resumes the remaining pages instead of
+                    # skipping the whole PID as already downloaded.
+                    download_ok = False
                 else:
                     self._mark_urls_done(urls)
                     self.downloader._maybe_flush_exist_pid(pid)
