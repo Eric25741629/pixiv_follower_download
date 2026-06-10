@@ -1,5 +1,4 @@
 from __future__ import annotations
-import asyncio
 import contextlib
 import queue
 import threading
@@ -7,6 +6,7 @@ import time
 import flet as ft
 
 from app.core.worker_event import WorkerEvent
+from app.gui.log_panel import LogPanel
 
 
 STEP_LABELS = ["步驟 1\n抓追蹤", "步驟 2\n抓 PID", "步驟 3\n抓 URL", "步驟 4\n下載"]
@@ -48,8 +48,6 @@ def _is_dark_mode(page: ft.Page) -> bool:
 def _state_palette(page: ft.Page) -> dict[str, tuple[str, str]]:
     return _STATE_COLORS_DARK if _is_dark_mode(page) else _STATE_COLORS_LIGHT
 
-
-_MAX_LOG_LINES = 2000
 
 # Shared geometry for the two stacked progress bars (整體進度 / 本作分頁). Both
 # rows use the SAME leading-label width, trailing-count width and spacing so the
@@ -161,52 +159,9 @@ class MainView:
         self._loading_open = False
         self._loading_lock = threading.Lock()
 
-        self._log_lines: list[ft.Text] = []
-        self._auto_scroll_enabled = True
-        self._scroll_pending = False
-        self._last_scroll_pixels: float | None = None
-        self._last_max_scroll_extent: float | None = None
-        # auto_scroll stays False forever — we manually call scroll_to(offset=-1)
-        # via _schedule_scroll_to_bottom().  Toggling auto_scroll at runtime
-        # rebuilds Flutter's ScrollController and breaks mouse-wheel scrolling
-        # mid-session.  build_controls_on_demand=False is required for
-        # scroll_to to work on a ListView (the Flet docstring explicitly says
-        # scroll_to is ineffective when items are built lazily).
-        self._log_list = ft.ListView(
-            controls=self._log_lines,
-            expand=True,
-            spacing=1,
-            auto_scroll=False,
-            build_controls_on_demand=False,
-            on_scroll=self._on_log_scroll,
-            scroll_interval=200,
-        )
-        # The pill overlay used to be an expand=True Container with alignment,
-        # but that wrapped a transparent Container over the full Stack area —
-        # Flet's Container always supports on_hover so Flutter wraps it in a
-        # MouseRegion that absorbs pointer events (including mouse wheel and
-        # click), blocking the ListView underneath AND the inner pill.
-        # Solution: use a Row positioned only along the bottom strip via
-        # Stack positioning (left/right/bottom).  Row doesn't paint nor hit
-        # test its empty space, so wheel events above the strip reach the
-        # ListView, and clicks on either side of the pill pass through too.
-        self._pill_overlay = ft.Row(
-            [
-                ft.Container(
-                    content=ft.Text("↓ 跳到最新", size=11, color=ft.Colors.WHITE),
-                    bgcolor=ft.Colors.with_opacity(0.75, ft.Colors.BLUE_GREY_700),
-                    border_radius=20,
-                    padding=ft.Padding.symmetric(horizontal=16, vertical=7),
-                    on_click=self._on_scroll_to_bottom,
-                    ink=True,
-                ),
-            ],
-            alignment=ft.MainAxisAlignment.CENTER,
-            left=0,
-            right=0,
-            bottom=15,
-            visible=False,
-        )
+        # Log 面板（單一 selectable Text + 意圖驅動跟隨狀態機 + 膠囊）
+        # 全部封裝在 LogPanel（app/gui/log_panel.py）。
+        self._log_panel = LogPanel()
 
         self._source_mode = "following"
         self._following_scope = "all"
@@ -517,92 +472,7 @@ class MainView:
         self._on_scope_change(scope)
 
     def append_log(self, html_line: str) -> None:
-        from app.gui.log_format import html_to_spans
-        spans = html_to_spans(html_line)
-        if not spans:
-            return
-        self._log_lines.append(ft.Text(spans=spans, size=12))
-        if len(self._log_lines) > _MAX_LOG_LINES:
-            self._log_lines.pop(0)
-        # Only schedule a scroll_to when the ListView is still attached to a
-        # live page tree. After a nav-rail switch the MainView is detached
-        # (its subtree was replaced inside content_area); calling scroll_to
-        # then sends an _invoke_method round-trip to a widget the client no
-        # longer renders, which piles awaited tasks on the event loop and
-        # makes the rapid-tab-switch session-GC scenario worse. Re-attach
-        # happens transparently on the next log line after the user returns
-        # to MainView.
-        # If the last known scroll position was at/near the bottom, treat
-        # new lines as wanting to follow — appending shifts max_scroll_extent
-        # so the user can be at the visual bottom while extent_after silently
-        # grows, leaving the pill stuck even though they're already there.
-        if (not self._auto_scroll_enabled
-                and self._last_scroll_pixels is not None
-                and self._last_max_scroll_extent is not None
-                and self._last_max_scroll_extent - self._last_scroll_pixels <= 30):
-            self._auto_scroll_enabled = True
-            self._pill_overlay.visible = False
-        if self._auto_scroll_enabled and getattr(self._log_list, "page", None) is not None:
-            self._schedule_scroll_to_bottom()
-
-    def _schedule_scroll_to_bottom(self) -> None:
-        """Coalesce scroll requests within one event-loop tick — many
-        log lines can land in the same dispatcher poll, but we only need
-        one scroll_to per render."""
-        if self._scroll_pending:
-            return
-        self._scroll_pending = True
-        try:
-            asyncio.create_task(self._do_scroll_to_bottom())
-        except RuntimeError:
-            # No running loop (called outside event loop) — drop quietly.
-            self._scroll_pending = False
-
-    async def _do_scroll_to_bottom(self) -> None:
-        try:
-            await self._log_list.scroll_to(offset=-1, duration=0)
-        except Exception:
-            pass
-        finally:
-            self._scroll_pending = False
-
-    def _on_log_scroll(self, e: ft.OnScrollEvent) -> None:
-        # Don't trust ScrollType.USER + direction for wheel events — Flutter's
-        # pointerScroll path does not always fire UserScrollNotification, and
-        # when it does the direction enum value is unreliable across platforms.
-        # Use UPDATE events with pixel-delta tracking instead.
-        if e.event_type != ft.ScrollType.UPDATE:
-            return
-        prev = self._last_scroll_pixels
-        self._last_scroll_pixels = e.pixels
-        self._last_max_scroll_extent = e.max_scroll_extent
-        if self._auto_scroll_enabled:
-            # User scrolled up if pixels decreased by >10px AND we're now
-            # more than 30px from the bottom.  The pixel-delta filter rules
-            # out the spurious decreases caused by pop(0) when the log hits
-            # _MAX_LOG_LINES (those shift content up but stay near bottom).
-            if prev is not None and e.pixels < prev - 10 and e.extent_after > 30:
-                self._auto_scroll_enabled = False
-                self._pill_overlay.visible = True
-        else:
-            # Re-enable when the user is near the bottom. The previous
-            # ≤20 threshold was tight enough that scroll_interval=200
-            # throttling could leave the final event at extent_after≈25,
-            # stranding the pill visible at the visual bottom. A scroll-down
-            # nudge that lands ≤80px from the edge also counts as intent.
-            scrolling_down = prev is not None and e.pixels > prev
-            if e.extent_after <= 50 or (scrolling_down and e.extent_after <= 80):
-                self._enable_auto_scroll()
-
-    def _enable_auto_scroll(self) -> None:
-        self._auto_scroll_enabled = True
-        self._pill_overlay.visible = False
-        # Actively jump to bottom — setting a flag alone won't move the
-        # viewport until the next log line arrives.
-        self._schedule_scroll_to_bottom()
-
-    def _on_scroll_to_bottom(self, e: ft.ControlEvent) -> None:
-        self._enable_auto_scroll()
+        self._log_panel.append_log(html_line)
 
     @staticmethod
     def _safe_update(*controls) -> None:
@@ -956,22 +826,7 @@ class MainView:
                 self._phase_row,
                 ft.Divider(),
                 ft.Text("即時 Log", size=12, weight=ft.FontWeight.BOLD),
-                ft.Stack(
-                    controls=[
-                        ft.SelectionArea(
-                            content=ft.Container(
-                                content=self._log_list,
-                                expand=True,
-                                border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
-                                border_radius=4,
-                                padding=4,
-                            ),
-                        ),
-                        self._pill_overlay,
-                    ],
-                    expand=True,
-                    fit=ft.StackFit.EXPAND,
-                ),
+                self._log_panel.control,
             ],
             expand=True,
             spacing=12,
