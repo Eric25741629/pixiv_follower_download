@@ -255,22 +255,16 @@ class StatsView:
         for container in getattr(self, "_card_containers", []) or []:
             container.bgcolor = theme.panel_bg if theme.blur_enabled else theme.panel_bg_opaque
             container.border = ft.border.all(1, theme.panel_border)
-            try:
+            with contextlib.suppress(Exception):
                 container.update()
-            except Exception:
-                pass
         for label in getattr(self, "_card_labels", []) or []:
             label.color = theme.text_secondary
-            try:
+            with contextlib.suppress(Exception):
                 label.update()
-            except Exception:
-                pass
         for i, value in enumerate(self._card_values):
             value.color = value_colors[i % len(value_colors)]
-            try:
+            with contextlib.suppress(Exception):
                 value.update()
-            except Exception:
-                pass
         # Re-render the chart so bar colors and any inline text picks up
         # the new palette without waiting for the next 1 s tick.
         self._refresh_now()

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import atexit
 import os
 import queue
@@ -739,6 +740,26 @@ def main(page: ft.Page) -> None:
     # page.run_thread() patches end up on an asyncio.Queue from the wrong
     # thread and only flush when the user pokes the UI (drag, click).
     page.run_task(disp.run)
+
+    # ── aurora orb drift ────────────────────────────────────────────────────
+    # 7s round-trip: flip each orb's anchor offsets ±20px; animate_position on
+    # the orbs (set in glass.aurora_background) smooths the transition. Runs on
+    # the asyncio event loop via page.run_task — never a bare thread.
+    async def _drift_orbs() -> None:
+        toward = False
+        while True:
+            await asyncio.sleep(7)
+            toward = not toward
+            d = 20 if toward else 0
+            _orb1.top, _orb1.right = -140 + d, -100 - d
+            _orb2.bottom, _orb2.left = -110 + d, -80 - d
+            try:
+                _orb1.update()
+                _orb2.update()
+            except Exception:
+                break  # page/session gone — stop drifting
+
+    page.run_task(_drift_orbs)
 
     # ── shutdown handling ───────────────────────────────────────────────────
     # Without this, closing the window leaves the dispatcher polling and any
