@@ -33,8 +33,11 @@ def test_refresh_source_mode_applies_bookmark_labels_and_scope(view, tmp_path):
 
     assert view._source_mode == "bookmarks"
     assert view._active_scope == "private"
-    assert view._mode_title.value == "目前模式：抓收藏"
-    assert view._mode_band.bgcolor == view._source_palette("bookmarks")["bg"]
+    # 抓收藏 pill 為 active（accent_fill 底）；抓追隨為非 active。
+    from app.gui.glass import current_theme
+    theme = current_theme(view._page)
+    assert view._btn_source_bookmarks.bgcolor == theme.accent_fill
+    assert view._btn_source_following.bgcolor != theme.accent_fill
     assert view._scope_row.visible is True
     assert view._scope_label.value == "收藏範圍"
     assert view._step_card_texts[0].value == "步驟 1\n略過追隨"
@@ -49,20 +52,21 @@ def test_apply_source_mode_restores_following_labels(view):
 
     assert view._source_mode == "following"
     assert view._active_scope == "all"
-    assert view._mode_title.value == "目前模式：抓追隨"
+    from app.gui.glass import current_theme
+    theme = current_theme(view._page)
+    assert view._btn_source_following.bgcolor == theme.accent_fill
     assert view._scope_row.visible is True
     assert view._scope_label.value == "追隨範圍"
     assert view._step_card_texts[0].value == STEP_LABELS[0]
     assert view._step_card_texts[1].value == STEP_LABELS[1]
 
 
-def test_source_mode_buttons_are_in_centered_slot(view):
-    import flet as ft
-
+def test_source_mode_buttons_live_in_wrapping_mode_row(view):
     view.apply_source_mode("following", "all")
 
-    assert view._mode_band.content.controls[1] is view._source_mode_slot
-    assert view._source_mode_controls.alignment == ft.MainAxisAlignment.CENTER
+    # 模式列 = [來源群組, 範圍群組]，wrap=True 讓縮窗時整組換行不重疊。
+    assert view._mode_row.wrap is True
+    assert view._mode_row.controls == [view._source_group, view._scope_row]
     assert view._source_mode_controls.controls == [
         view._btn_source_following,
         view._btn_source_bookmarks,

@@ -418,7 +418,8 @@ def main(page: ft.Page) -> None:
                 main_view._countdown_text.value = f"倒數：{cd} 秒"
             if bool(_PERSISTENT_UI_STATE.get("is_paused", False)):
                 main_view._is_paused = True
-                main_view._btn_pause.content = "▶ 繼續"
+                # glass_pill 的 content 是 ft.Text — 改字走 .value。
+                main_view._btn_pause.content.value = "▶ 繼續"
         except Exception:
             _log.exception("failed to restore persisted UI state")
         main_view.set_running(True)

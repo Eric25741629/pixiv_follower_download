@@ -254,7 +254,7 @@ class StatsView:
         value_colors = _accent_cycle(self._page)
         for container in getattr(self, "_card_containers", []) or []:
             container.bgcolor = theme.panel_bg if theme.blur_enabled else theme.panel_bg_opaque
-            container.border = ft.border.all(1, theme.panel_border)
+            container.border = ft.Border.all(1, theme.panel_border)
             with contextlib.suppress(Exception):
                 container.update()
         for label in getattr(self, "_card_labels", []) or []:

@@ -137,7 +137,7 @@ def glass_panel(
         padding=padding,
         bgcolor=theme.panel_bg if blur else theme.panel_bg_opaque,
         blur=blur,
-        border=ft.border.all(1, theme.panel_border),
+        border=ft.Border.all(1, theme.panel_border),
         border_radius=radius if radius is not None else theme.radius,
         shadow=ft.BoxShadow(
             blur_radius=24, spread_radius=0,
@@ -151,6 +151,16 @@ def glass_panel(
     )
 
 
+def style_pill(pill: ft.Container, theme: GlassTheme, *, primary: bool = False) -> None:
+    """就地重染一顆 glass_pill（主題切換時用，不重建控件）。"""
+    fg = "#FFFFFF" if (primary and theme.name == "dark") else (
+        theme.text_primary if primary else theme.text_secondary)
+    pill.bgcolor = theme.accent_fill if primary else "#12FFFFFF"
+    pill.border = ft.Border.all(1, theme.panel_border)
+    if isinstance(pill.content, ft.Text):
+        pill.content.color = fg
+
+
 def glass_pill(
     text: str,
     theme: GlassTheme,
@@ -161,14 +171,10 @@ def glass_pill(
     disabled: bool = False,
 ) -> ft.Container:
     """膠囊按鈕。primary=True 用 accent_fill 底；否則低透明白底。"""
-    fg = "#FFFFFF" if (primary and theme.name == "dark") else (
-        theme.text_primary if primary else theme.text_secondary)
-    return ft.Container(
-        content=ft.Text(text, size=13, color=fg, weight=ft.FontWeight.W_600,
+    pill = ft.Container(
+        content=ft.Text(text, size=13, weight=ft.FontWeight.W_600,
                         text_align=ft.TextAlign.CENTER),
         padding=ft.Padding(14, 8, 14, 8),
-        bgcolor=theme.accent_fill if primary else "#12FFFFFF",
-        border=ft.border.all(1, theme.panel_border),
         border_radius=999,
         on_click=on_click,
         ink=on_click is not None,
@@ -176,6 +182,8 @@ def glass_pill(
         disabled=disabled,
         animate=ft.Animation(150, ft.AnimationCurve.EASE_OUT),
     )
+    style_pill(pill, theme, primary=primary)
+    return pill
 
 
 def state_colors(theme: GlassTheme) -> dict[str, tuple[str, str]]:

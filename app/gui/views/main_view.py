@@ -12,6 +12,7 @@ from app.gui.glass import (
     glass_panel,
     glass_pill,
     state_colors,
+    style_pill,
 )
 from app.gui.log_panel import LogPanel
 
@@ -23,6 +24,12 @@ _BOOKMARK_STEP_LABELS = ["步驟 1\n略過追隨", "步驟 2\n抓收藏 PID"]
 # step-3 card is relabeled and the step-4 card is hidden (see
 # MainView.apply_combined_mode).
 _MERGED_STEP3_LABEL = "步驟 3+4\n邊查邊下"
+
+# 模式說明（舊 _mode_subtitle 文案）改為來源 pill 的 tooltip。
+_SOURCE_TOOLTIPS = {
+    "following": "維持原本流程：抓追蹤畫師，再掃描畫師作品 PID。",
+    "bookmarks": "步驟 2 會掃描你按過愛心的作品 PID，後續抓 URL / 下載流程不變。",
+}
 
 
 def _state_palette(page: ft.Page) -> dict[str, tuple[str, str]]:
@@ -66,20 +73,17 @@ class MainView:
         # from settings and refreshed when the user returns to the 主頁 tab.
         self._combined_mode = False
 
-        # 控制鈕維持原 Button 類別（flet_app 會以字串指派 _btn_pause.content，
-        # Container 版 glass_pill 的 content 只收 Control），改以 ButtonStyle
-        # 取得玻璃膠囊外觀 — 行為/事件不變。
-        self._btn_run_all = ft.FilledButton(
-            "▶ 一鍵執行", on_click=self._on_run_all,
-            style=self._glass_button_style(primary=True),
+        # 控制鈕＝glass_pill 膠囊（與模式列同語彙）。標籤改字一律走
+        # pill.content.value（內部 ft.Text），不再對 content 指派字串；
+        # 啟用/停用走 _set_pill_enabled（disabled + 半透明）。
+        self._btn_run_all = self._make_action_pill(
+            "▶ 一鍵執行", primary=True, on_click=self._on_run_all,
         )
-        self._btn_pause = ft.OutlinedButton(
-            "⏸ 暫停", on_click=self._on_pause_toggle, disabled=True,
-            style=self._glass_button_style(primary=False),
+        self._btn_pause = self._make_action_pill(
+            "⏸ 暫停", on_click=self._on_pause_toggle, enabled=False,
         )
-        self._btn_stop = ft.OutlinedButton(
-            "⏹ 停止", on_click=self._on_stop, disabled=True,
-            style=self._glass_button_style(primary=False),
+        self._btn_stop = self._make_action_pill(
+            "⏹ 停止", on_click=self._on_stop, enabled=False,
         )
         self._is_paused = False
         self._cards_disabled = False
@@ -93,11 +97,13 @@ class MainView:
         # row first laid out with EMPTY children renders degenerate and later
         # .value patches never reflow it — that was the 整體進度 freeze (本作分頁
         # never froze precisely because it was visible-gated; now both are).
+        # 雙色：整體進度=accent、本作分頁=info — 兩條必須一眼可區分
+        # （邊查邊下同時跑 PID 進度與單 PID 多頁進度）。
         self._progress_bar, self._progress_text, self._progress_row = (
-            self._make_progress_row("整體進度")
+            self._make_progress_row("整體進度", current_theme(page).accent)
         )
         self._page_progress_bar, self._page_progress_text, self._page_progress_row = (
-            self._make_progress_row("本作分頁")
+            self._make_progress_row("本作分頁", current_theme(page).info)
         )
         self._page_progress_value = 0
         self._page_progress_total = 0
@@ -170,16 +176,17 @@ class MainView:
         # 全部封裝在 LogPanel（app/gui/log_panel.py）。
         self._log_panel = LogPanel()
 
+        # ── 模式列：單一可換行膠囊列（取代舊的粉/藍實色帶） ──────────────────
+        # 「來源」[抓追隨][抓收藏]・「範圍」[公開][非公開][全部]
+        # 兩個群組各自 tight，外層 Row wrap=True：視窗縮小時整組換行，
+        # 不會像舊 expand-slot 版那樣文字壓到按鈕。模式說明改為 pill tooltip。
         self._source_mode = "following"
         self._following_scope = "all"
         self._bookmark_scope = "all"
         self._active_scope = "all"
-        self._mode_title = ft.Text(
-            "", size=13, weight=ft.FontWeight.BOLD,
-            color=current_theme(page).text_primary,
-        )
-        self._mode_subtitle = ft.Text(
-            "", size=12, color=current_theme(page).text_secondary
+        self._source_label = ft.Text(
+            "來源", size=12, weight=ft.FontWeight.BOLD,
+            color=current_theme(page).text_muted,
         )
         self._scope_label = ft.Text(
             "追隨範圍",
@@ -188,10 +195,12 @@ class MainView:
             color=current_theme(page).text_secondary,
         )
         self._btn_source_following = self._make_mode_button(
-            "抓追隨", False, lambda e: self._on_source_mode_change("following")
+            "抓追隨", False, lambda e: self._on_source_mode_change("following"),
+            tooltip=_SOURCE_TOOLTIPS["following"],
         )
         self._btn_source_bookmarks = self._make_mode_button(
-            "抓收藏", False, lambda e: self._on_source_mode_change("bookmarks")
+            "抓收藏", False, lambda e: self._on_source_mode_change("bookmarks"),
+            tooltip=_SOURCE_TOOLTIPS["bookmarks"],
         )
         self._btn_scope_public = self._make_mode_button(
             "公開", False, lambda e: self._on_scope_change("public")
@@ -217,54 +226,41 @@ class MainView:
         self._source_mode_controls = ft.Row(
             controls=[self._btn_source_following, self._btn_source_bookmarks],
             spacing=6,
-            alignment=ft.MainAxisAlignment.CENTER,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
-        self._source_mode_slot = ft.Container(
-            content=self._source_mode_controls,
-            expand=1,
-            alignment=ft.Alignment(x=0, y=0),
+        self._source_group = ft.Row(
+            controls=[self._source_label, self._source_mode_controls],
+            spacing=8,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
-        self._scope_slot = ft.Container(
-            content=self._scope_row,
-            expand=2,
-            alignment=ft.Alignment(x=1, y=0),
-        )
-        self._mode_band = ft.Container(
-            content=ft.Row(
-                controls=[
-                    ft.Column(
-                        controls=[self._mode_title, self._mode_subtitle],
-                        spacing=2,
-                        expand=2,
-                    ),
-                    self._source_mode_slot,
-                    self._scope_slot,
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            ),
-            border_radius=8,
-            padding=ft.Padding.symmetric(horizontal=14, vertical=10),
-            border=ft.Border.all(1, current_theme(page).panel_border),
+        self._mode_row = ft.Row(
+            controls=[self._source_group, self._scope_row],
+            spacing=24,
+            run_spacing=8,
+            wrap=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
-    def _glass_button_style(self, *, primary: bool) -> ft.ButtonStyle:
-        """Pill-shaped glass ButtonStyle matching glass_pill colors.
+    def _make_action_pill(
+        self, label: str, *, primary: bool = False, on_click=None,
+        enabled: bool = True,
+    ) -> ft.Container:
+        """glass_pill for the run/pause/stop controls.
 
-        Used for the run/pause/stop buttons, which must stay real Buttons
-        (their ``content`` is assigned plain strings by flet_app's restore
-        path; a glass_pill Container only accepts Control content).
+        The pill's ``content`` is an ``ft.Text``; change its label via
+        ``pill.content.value`` (never assign a string to ``content``).
         """
-        t = current_theme(self._page)
-        fg = "#FFFFFF" if (primary and t.name == "dark") else (
-            t.text_primary if primary else t.text_secondary)
-        return ft.ButtonStyle(
-            color=fg,
-            bgcolor=t.accent_fill if primary else "#12FFFFFF",
-            side=ft.BorderSide(1, t.panel_border),
-            shape=ft.RoundedRectangleBorder(radius=999),
+        pill = glass_pill(
+            label, current_theme(self._page), primary=primary, on_click=on_click,
         )
+        self._set_pill_enabled(pill, enabled)
+        return pill
+
+    @staticmethod
+    def _set_pill_enabled(pill: ft.Container, enabled: bool) -> None:
+        """Toggle a glass pill's clickability + the dimmed disabled look."""
+        pill.disabled = not enabled
+        pill.opacity = 1.0 if enabled else 0.45
 
     def _make_step_card(self, index: int) -> ft.Container:
         theme = current_theme(self._page)
@@ -307,12 +303,28 @@ class MainView:
         ``current_theme(page)`` rather than auto-themed Flet components.
         Best-effort: swallows ``update()`` errors on detached controls.
         """
+        theme = current_theme(self._page)
         palette = _state_palette(self._page)
         for i, state in enumerate(self._step_states):
             bg, fg = palette.get(state, palette["idle"])
             self._step_card_containers[i].bgcolor = bg
             self._step_card_texts[i].color = fg
-        self._phase_label.color = current_theme(self._page).info
+        self._phase_label.color = theme.info
+        # 進度條雙色 + 控制鈕/模式列膠囊就地重染。
+        self._progress_bar.color = theme.accent
+        self._page_progress_bar.color = theme.info
+        style_pill(self._btn_run_all, theme, primary=True)
+        style_pill(self._btn_pause, theme)
+        style_pill(self._btn_stop, theme)
+        self._source_label.color = theme.text_muted
+        self._scope_label.color = theme.text_secondary
+        # 模式 pills 由 apply_source_mode 以新 theme 重建。
+        self.refresh_source_mode()
+        self._safe_update(
+            self._progress_row, self._page_progress_row,
+            self._btn_run_all, self._btn_pause, self._btn_stop,
+            self._source_label,
+        )
         for c in self._step_card_containers:
             try:
                 c.update()
@@ -388,52 +400,33 @@ class MainView:
         except Exception:
             return "following", "all", "all"
 
-    @staticmethod
-    def _source_palette(mode: str) -> dict[str, str]:
-        is_dark = False
-        # Kept static for tests and because mode band colors are decorative.
-        if mode == "bookmarks":
-            return {
-                "bg": ft.Colors.PINK_50,
-                "border": ft.Colors.PINK_200,
-                "accent": ft.Colors.PINK_700,
-            }
-        return {
-            "bg": ft.Colors.BLUE_50,
-            "border": ft.Colors.BLUE_200,
-            "accent": ft.Colors.BLUE_700,
-        }
-
     def apply_source_mode(self, mode: str, scope: str = "all") -> None:
-        """Paint the main-page source-mode band and step labels."""
+        """Paint the main-page source-mode pills and step labels."""
         mode = "bookmarks" if str(mode) == "bookmarks" else "following"
         scope = self._normalize_scope(scope)
         self._source_mode = mode
         self._active_scope = scope
-        palette = self._source_palette(mode)
-        self._mode_band.bgcolor = palette["bg"]
-        self._mode_band.border = ft.Border.all(1, palette["border"])
         if mode == "bookmarks":
             self._bookmark_scope = scope
-            self._mode_title.value = "目前模式：抓收藏"
-            self._mode_subtitle.value = "步驟 2 會掃描你按過愛心的作品 PID，後續抓 URL / 下載流程不變。"
             self._scope_label.value = "收藏範圍"
             self._scope_row.visible = True
             self._step_card_texts[0].value = _BOOKMARK_STEP_LABELS[0]
             self._step_card_texts[1].value = _BOOKMARK_STEP_LABELS[1]
         else:
             self._following_scope = scope
-            self._mode_title.value = "目前模式：抓追隨"
-            self._mode_subtitle.value = "維持原本流程：抓追蹤畫師，再掃描畫師作品 PID。"
             self._scope_label.value = "追隨範圍"
             self._scope_row.visible = True
             self._step_card_texts[0].value = STEP_LABELS[0]
             self._step_card_texts[1].value = STEP_LABELS[1]
         self._btn_source_following = self._make_mode_button(
-            "抓追隨", mode == "following", lambda e: self._on_source_mode_change("following")
+            "抓追隨", mode == "following",
+            lambda e: self._on_source_mode_change("following"),
+            tooltip=_SOURCE_TOOLTIPS["following"],
         )
         self._btn_source_bookmarks = self._make_mode_button(
-            "抓收藏", mode == "bookmarks", lambda e: self._on_source_mode_change("bookmarks")
+            "抓收藏", mode == "bookmarks",
+            lambda e: self._on_source_mode_change("bookmarks"),
+            tooltip=_SOURCE_TOOLTIPS["bookmarks"],
         )
         self._btn_scope_public = self._make_mode_button(
             "公開", scope == "public", lambda e: self._on_scope_change("public")
@@ -455,15 +448,19 @@ class MainView:
         ]
         self._bookmark_scope_row = self._scope_row
         self._safe_update(
-            self._mode_band, self._mode_title, self._mode_subtitle,
+            self._mode_row,
             self._source_mode_controls, self._scope_row, self._scope_label,
             self._step_card_texts[0], self._step_card_texts[1],
         )
 
-    def _make_mode_button(self, text: str, active: bool, on_click):
-        return glass_pill(
+    def _make_mode_button(self, text: str, active: bool, on_click,
+                          tooltip: str | None = None):
+        pill = glass_pill(
             text, current_theme(self._page), primary=active, on_click=on_click
         )
+        if tooltip:
+            pill.tooltip = tooltip
+        return pill
 
     @staticmethod
     def _normalize_scope(scope: str) -> str:
@@ -515,11 +512,12 @@ class MainView:
             with contextlib.suppress(Exception):
                 c.update()
 
-    def _make_progress_row(self, label: str):
+    def _make_progress_row(self, label: str, color: str):
         """Build one labeled progress row: [label] [expand bar] [count text].
 
         Returns ``(bar, text, row)``. Used for BOTH 整體進度 and 本作分頁 so the
-        two bars are constructed identically (same geometry, same colors role).
+        two bars are constructed identically (same geometry); ``color`` differs
+        per row (accent vs info) so the two bars are visually distinct.
         The row starts hidden — it is revealed on its first real update by
         :meth:`_render_progress_row`.
         """
@@ -529,7 +527,7 @@ class MainView:
             expand=True,
             bar_height=_PROG_BAR_HEIGHT,
             border_radius=_PROG_BAR_RADIUS,
-            color=theme.accent,
+            color=color,
             bgcolor="#1FFFFFFF",
         )
         text = ft.Text(
@@ -718,20 +716,17 @@ class MainView:
             pass
 
     def set_running(self, is_running: bool) -> None:
-        self._btn_pause.disabled = not is_running
-        self._btn_stop.disabled = not is_running
-        self._btn_run_all.disabled = is_running
+        self._set_pill_enabled(self._btn_pause, is_running)
+        self._set_pill_enabled(self._btn_stop, is_running)
+        self._set_pill_enabled(self._btn_run_all, not is_running)
         self._cards_disabled = is_running
         # Reset pause toggle to "暫停" whenever the worker stops or a fresh
         # run starts, otherwise the button could keep saying "繼續" with no
         # active worker to resume.
+        self._is_paused = False
+        self._btn_pause.content.value = "⏸ 暫停"
         if not is_running:
-            self._is_paused = False
-            self._btn_pause.content = "⏸ 暫停"
             self.set_phase("")
-        else:
-            self._is_paused = False
-            self._btn_pause.content = "⏸ 暫停"
 
     def _on_run_all(self, e: ft.ControlEvent) -> None:
         if self._run_controller is None:
@@ -776,7 +771,7 @@ class MainView:
                 except Exception:
                     pass
             self._is_paused = False
-            self._btn_pause.content = "⏸ 暫停"
+            self._btn_pause.content.value = "⏸ 暫停"
         else:
             if hasattr(t, "pause"):
                 try:
@@ -784,7 +779,7 @@ class MainView:
                 except Exception:
                     pass
             self._is_paused = True
-            self._btn_pause.content = "▶ 繼續"
+            self._btn_pause.content.value = "▶ 繼續"
         try:
             self._btn_pause.update()
         except Exception:
@@ -805,7 +800,7 @@ class MainView:
         # show modal spinner until the worker finishes its finalize/cleanup
         # (writing pending PIDs, all_url snapshots, etc.).
         try:
-            self._btn_stop.disabled = True
+            self._set_pill_enabled(self._btn_stop, False)
             self._btn_stop.update()
         except Exception:
             pass
@@ -849,7 +844,7 @@ class MainView:
         control_area = glass_panel(
             ft.Column(
                 controls=[
-                    self._mode_band,
+                    self._mode_row,
                     top_row,
                     self._progress_row,
                     self._page_progress_row,
