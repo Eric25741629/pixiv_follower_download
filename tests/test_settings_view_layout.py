@@ -17,7 +17,10 @@ class _FakePage:
 def _tile_titles(column):
     titles = []
     for control in getattr(column, "controls", []):
-        title = getattr(control, "title", None)
+        # Liquid-glass migration: each ExpansionTile is wrapped in a glass
+        # Container — unwrap one level of .content before reading .title.
+        tile = getattr(control, "content", None) or control
+        title = getattr(tile, "title", None)
         value = getattr(title, "value", None)
         if value:
             titles.append(value)

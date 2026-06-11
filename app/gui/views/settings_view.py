@@ -4,6 +4,7 @@ import os
 import threading
 import flet as ft
 from app.core.settings_store import SettingsStore
+from app.gui.glass import current_theme, glass_dialog, glass_panel, glass_snackbar
 import contextlib
 
 
@@ -195,7 +196,7 @@ class SettingsView:
         self._label_cooldown_hint = ft.Text(
             self._cooldown_hint(cooldown_avg),
             size=11,
-            color=ft.Colors.RED_600 if cooldown_avg < 30 else ft.Colors.GREY_600,
+            color=self._cooldown_hint_color(cooldown_avg),
         )
         self._sw_single_thread = ft.Switch(label="單執行緒 PID 模式", value=bool(perf.get("single_thread_mode", False)))
 
@@ -239,12 +240,33 @@ class SettingsView:
         self._btn_detect_ua = ft.OutlinedButton(
             "重新偵測 Chrome", on_click=self._on_detect_chrome,
         )
-        self._label_ua_status = ft.Text("", size=11, color=ft.Colors.GREY_600)
+        self._label_ua_status = ft.Text("", size=11, color=current_theme(page).text_secondary)
 
         # Flipping any Switch persists that one field immediately (主動紀錄),
         # so a toggle sticks without the user having to click 「儲存設定」.
         # Text fields / sliders still rely on the explicit save button.
         self._wire_switch_autosave()
+
+        # Liquid-glass input theming (visuals only — handlers untouched).
+        self._apply_input_theme()
+
+    # ------------------------------------------------------------------
+    # Liquid-glass theming helpers
+    # ------------------------------------------------------------------
+
+    def _apply_input_theme(self) -> None:
+        """Apply glass theme tokens to every input control on this view."""
+        theme = current_theme(self._page)
+        for ctl in vars(self).values():
+            if isinstance(ctl, (ft.TextField, ft.Dropdown)):
+                ctl.border_color = theme.panel_border
+                ctl.focused_border_color = theme.accent
+            elif isinstance(ctl, (ft.Slider, ft.Switch)):
+                ctl.active_color = theme.accent
+
+    def _cooldown_hint_color(self, avg: int) -> str:
+        theme = current_theme(self._page)
+        return theme.warning if avg < 30 else theme.text_secondary
 
     # ------------------------------------------------------------------
     # Auto-save (per-switch)
@@ -374,7 +396,7 @@ class SettingsView:
         self._n_cookies = max(1, len(auth.get("cookies_pool", []) or []))
         avg = self._safe_int_cooldown()
         self._label_cooldown_hint.value = self._cooldown_hint(avg)
-        self._label_cooldown_hint.color = ft.Colors.RED_600 if avg < 30 else ft.Colors.GREY_600
+        self._label_cooldown_hint.color = self._cooldown_hint_color(avg)
         with contextlib.suppress(Exception):
             self._label_cooldown_hint.update()
 
@@ -385,7 +407,7 @@ class SettingsView:
             return
         self._tf_cooldown.value = str(val)
         self._label_cooldown_hint.value = self._cooldown_hint(val)
-        self._label_cooldown_hint.color = ft.Colors.RED_600 if val < 30 else ft.Colors.GREY_600
+        self._label_cooldown_hint.color = self._cooldown_hint_color(val)
         try:
             self._tf_cooldown.update()
             self._label_cooldown_hint.update()
@@ -400,7 +422,7 @@ class SettingsView:
         self._tf_cooldown.value = str(val)            # snap displayed text to clamped value
         self._sl_cooldown.value = float(val)
         self._label_cooldown_hint.value = self._cooldown_hint(val)
-        self._label_cooldown_hint.color = ft.Colors.RED_600 if val < 30 else ft.Colors.GREY_600
+        self._label_cooldown_hint.color = self._cooldown_hint_color(val)
         try:
             self._tf_cooldown.update()                # flush the TextField update
             self._sl_cooldown.update()
@@ -436,6 +458,7 @@ class SettingsView:
 
     def _on_test_proxies(self, e: ft.ControlEvent) -> None:
         from app.core.proxy_utils import parse_proxy_list, test_proxy
+        theme = current_theme(self._page)
         lines = parse_proxy_list(self._tf_proxy_pool.value or "")
         self._proxy_test_results.controls = [ft.Text("測試中...", size=11)]
         with contextlib.suppress(Exception):
@@ -444,12 +467,12 @@ class SettingsView:
         def _run():
             results = []
             if not lines:
-                results = [ft.Text("（無有效 proxy）", size=11, color=ft.Colors.GREY_600)]
+                results = [ft.Text("（無有效 proxy）", size=11, color=theme.text_secondary)]
             else:
                 for url in lines:
                     ok, msg = test_proxy(url, timeout=10)
                     icon = "v" if ok else "x"
-                    color = ft.Colors.GREEN_600 if ok else ft.Colors.RED_600
+                    color = theme.success if ok else theme.error
                     results.append(ft.Text(f"{icon} {url} — {msg}", size=11, color=color))
             self._proxy_test_results.controls = results
             with contextlib.suppress(Exception):
@@ -459,15 +482,16 @@ class SettingsView:
 
     def _on_detect_chrome(self, e: ft.ControlEvent) -> None:
         from app.core.chrome_detect import detect_chrome_ua
+        theme = current_theme(self._page)
         ua = detect_chrome_ua()
         if ua:
             self._tf_agent.value = ua
             version = ua.split("Chrome/")[1].split(" ")[0] if "Chrome/" in ua else ua
             self._label_ua_status.value = f"已從登錄檔偵測到 Chrome {version}，UA 已更新"
-            self._label_ua_status.color = ft.Colors.GREEN_600
+            self._label_ua_status.color = theme.success
         else:
             self._label_ua_status.value = "找不到 Chrome 安裝（已檢查登錄檔與 AppData），請手動填寫 UA"
-            self._label_ua_status.color = ft.Colors.RED_600
+            self._label_ua_status.color = theme.error
         try:
             self._tf_agent.update()
             self._label_ua_status.update()
@@ -550,7 +574,13 @@ class SettingsView:
             with contextlib.suppress(Exception):
                 self._on_saved()
 
+    def _saved_snackbar(self) -> ft.SnackBar:
+        snack = glass_snackbar(current_theme(self._page), "設定已儲存")
+        snack.duration = 1500
+        return snack
+
     def _save_and_notify(self, e) -> None:
+        theme = current_theme(self._page)
         avg_val = self._safe_int_cooldown()
         if avg_val < 30:
             def _confirm(ev):
@@ -558,17 +588,19 @@ class SettingsView:
                     self._page.pop_dialog()
                 self.save()
                 with contextlib.suppress(Exception):
-                    self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
+                    self._page.show_dialog(self._saved_snackbar())
 
             def _cancel(ev):
                 with contextlib.suppress(Exception):
                     self._page.pop_dialog()
 
             try:
-                self._page.show_dialog(ft.AlertDialog(
-                    title=ft.Text("冷卻時間偏短"),
-                    content=ft.Text(
-                        f"平均冷卻 {avg_val} 秒低於建議值 30 秒，\n可能被 Pixiv 風控偵測。確定要套用？"
+                self._page.show_dialog(glass_dialog(
+                    theme,
+                    "冷卻時間偏短",
+                    ft.Text(
+                        f"平均冷卻 {avg_val} 秒低於建議值 30 秒，\n可能被 Pixiv 風控偵測。確定要套用？",
+                        color=theme.text_secondary,
                     ),
                     actions=[
                         ft.TextButton("取消", on_click=_cancel),
@@ -581,29 +613,40 @@ class SettingsView:
             return
         self.save()
         with contextlib.suppress(Exception):
-            self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
+            self._page.show_dialog(self._saved_snackbar())
 
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
 
     def build(self) -> ft.Column:
-        def _tile(title: str, controls: list) -> ft.ExpansionTile:
-            return ft.ExpansionTile(
-                title=ft.Text(title),
+        theme = current_theme(self._page)
+
+        def _tile(title: str, controls: list) -> ft.Container:
+            tile = ft.ExpansionTile(
+                title=ft.Text(title, color=theme.text_primary),
                 controls=[ft.Container(
                     content=ft.Column(controls, spacing=8),
                     padding=ft.Padding.only(left=16, top=10, bottom=12),
                 )],
+                bgcolor="#00000000",
+                collapsed_bgcolor="#00000000",
+                text_color=theme.text_primary,
+                collapsed_text_color=theme.text_primary,
+                icon_color=theme.accent,
+                collapsed_icon_color=theme.text_secondary,
+                shape=ft.RoundedRectangleBorder(radius=theme.radius),
+                collapsed_shape=ft.RoundedRectangleBorder(radius=theme.radius),
             )
+            return glass_panel(tile, theme, padding=ft.Padding(4, 4, 4, 4))
 
         save_btn = ft.FilledButton("儲存設定", icon=ft.Icons.SAVE, on_click=self._save_and_notify)
-        note = lambda text: ft.Text(text, size=11, color=ft.Colors.GREY_700)
-        subhead = lambda text: ft.Text(text, size=12, weight=ft.FontWeight.BOLD)
+        note = lambda text: ft.Text(text, size=11, color=theme.text_secondary)
+        subhead = lambda text: ft.Text(text, size=12, weight=ft.FontWeight.BOLD, color=theme.text_primary)
 
         return ft.Column(
             controls=[
-                ft.Text("設定", size=20, weight=ft.FontWeight.BOLD),
+                ft.Text("設定", size=20, weight=ft.FontWeight.BOLD, color=theme.text_primary),
                 _tile("帳號與連線", [
                     subhead("Pixiv 帳號"),
                     self._tf_account,
@@ -651,7 +694,7 @@ class SettingsView:
                         on_click=self._pick_jxl_exe,
                     )]),
                     self._sw_jxl_delete,
-                    ft.Row([ft.Text("Effort（1-9）"), self._sl_jxl_effort]),
+                    ft.Row([ft.Text("Effort（1-9）", color=theme.text_primary), self._sl_jxl_effort]),
                 ]),
                 _tile("作品篩選", [
                     ft.Row([self._sw_hidefollow, self._sw_nogif], wrap=True),
@@ -680,13 +723,13 @@ class SettingsView:
                     ft.Row([self._tf_cooldown, self._label_cooldown_hint], spacing=12),
                     self._sl_cooldown,
                     ft.Row(
-                        [ft.Text("同 PID 頁間等待（秒）", size=13),
-                         self._tf_intra_min, ft.Text("~"), self._tf_intra_max],
+                        [ft.Text("同 PID 頁間等待（秒）", size=13, color=theme.text_primary),
+                         self._tf_intra_min, ft.Text("~", color=theme.text_secondary), self._tf_intra_max],
                         spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     ft.Row(
-                        [ft.Text("免 Cookie 請求等待（秒）", size=13),
-                         self._tf_nocookie_min, ft.Text("~"), self._tf_nocookie_max],
+                        [ft.Text("免 Cookie 請求等待（秒）", size=13, color=theme.text_primary),
+                         self._tf_nocookie_min, ft.Text("~", color=theme.text_secondary), self._tf_nocookie_max],
                         spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     self._sw_single_thread,
@@ -699,6 +742,6 @@ class SettingsView:
                 ft.Container(content=save_btn, padding=ft.Padding.only(top=8)),
             ],
             scroll=ft.ScrollMode.AUTO,
-            spacing=0,
+            spacing=theme.gap,
             expand=True,
         )
