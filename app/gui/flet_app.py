@@ -12,7 +12,7 @@ import flet as ft
 
 from app.core.app_logging import init_logging, get_logger
 from app.gui.dispatcher import EventDispatcher
-from app.gui.glass import aurora_background, current_theme, glass_nav
+from app.gui.glass import FONT_FAMILY, aurora_background, current_theme, glass_nav
 from app.gui.run_actions import RunController
 from app.gui.views.main_view import MainView
 from app.gui.views.settings_view import SettingsView
@@ -275,7 +275,8 @@ def main(page: ft.Page) -> None:
     )
     page.title = "Pixiv 下載器"
     page.theme_mode = _load_theme_mode()
-    page.theme = ft.Theme(color_scheme_seed="#0096FA")
+    page.theme = ft.Theme(color_scheme_seed="#0096FA", font_family=FONT_FAMILY)
+    page.dark_theme = ft.Theme(color_scheme_seed="#0096FA", font_family=FONT_FAMILY)
     theme = current_theme(page)
     page.window.width = 1100
     page.window.height = 750

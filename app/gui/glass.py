@@ -11,6 +11,10 @@ import flet as ft
 
 GITHUB_URL = "https://github.com/Eric25741629/pixiv_follower_download"
 
+# 全域字型：繁中 UI 在 Windows 上用微軟正黑體 UI，比 Flutter 預設的 CJK
+# fallback 粗實清晰。由 flet_app 接到 page.theme(font_family=FONT_FAMILY)。
+FONT_FAMILY = "Microsoft JhengHei UI"
+
 
 @dataclass(frozen=True)
 class GlassTheme:
@@ -160,7 +164,8 @@ def glass_pill(
     fg = "#FFFFFF" if (primary and theme.name == "dark") else (
         theme.text_primary if primary else theme.text_secondary)
     return ft.Container(
-        content=ft.Text(text, size=13, color=fg, text_align=ft.TextAlign.CENTER),
+        content=ft.Text(text, size=13, color=fg, weight=ft.FontWeight.W_600,
+                        text_align=ft.TextAlign.CENTER),
         padding=ft.Padding(14, 8, 14, 8),
         bgcolor=theme.accent_fill if primary else "#12FFFFFF",
         border=ft.border.all(1, theme.panel_border),
@@ -265,7 +270,8 @@ def glass_nav(
 def glass_dialog(theme: GlassTheme, title: str, content: ft.Control,
                  actions: list[ft.Control] | None = None) -> ft.AlertDialog:
     return ft.AlertDialog(
-        title=ft.Text(title, color=theme.text_primary, size=16),
+        title=ft.Text(title, color=theme.text_primary, size=16,
+                      weight=ft.FontWeight.W_600),
         content=content,
         actions=actions or [],
         bgcolor=theme.panel_bg_opaque,   # 對話框疊在 barrier 上，blur 意義不大且耗效能 → 用不透明
