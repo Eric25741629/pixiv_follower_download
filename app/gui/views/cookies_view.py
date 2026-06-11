@@ -7,6 +7,7 @@ from app.core.app_logging import get_logger
 from app.core.settings_store import SettingsStore
 from app.core.pixiv_thread_utils import normalize_cookie_entries
 from app.core.worker_event import WorkerEvent
+from app.gui.glass import current_theme, glass_dialog, glass_panel, glass_pill
 
 _log = get_logger("pixiv.cookies_view")
 
@@ -15,12 +16,16 @@ DEFAULT_AGENT = (
     "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
 )
 
-_STATUS_COLORS = {
-    "有效":   ft.Colors.GREEN_600,
-    "失效":   ft.Colors.RED_600,
-    "測試中": ft.Colors.BLUE_400,
-    "未知":   ft.Colors.GREY_600,
-}
+
+def _status_colors(page: ft.Page) -> dict[str, str]:
+    """Map cookie validity states to theme semantic tokens."""
+    t = current_theme(page)
+    return {
+        "有效":   t.success,
+        "失效":   t.error,
+        "測試中": t.info,
+        "未知":   t.text_muted,
+    }
 
 
 def _format_tested_at(value) -> str:
@@ -58,28 +63,29 @@ class CookiesView:
         self._testing: bool = False
         self._load_entries()
 
-        self._count_text = ft.Text("", color=ft.Colors.GREY_600)
+        theme = current_theme(page)
+        self._count_text = ft.Text("", color=theme.text_secondary)
         self._select_all_cb = ft.Checkbox(
             label="全選", value=False, on_change=self._on_toggle_all,
         )
-        self._btn_test_selected = ft.FilledButton(
-            "測試選取", icon=ft.Icons.PLAY_ARROW,
+        self._btn_test_selected = glass_pill(
+            "測試選取", theme, primary=True,
             on_click=self._on_test_selected,
         )
-        self._btn_test_all = ft.OutlinedButton(
-            "測試全部", icon=ft.Icons.PLAYLIST_PLAY,
+        self._btn_test_all = glass_pill(
+            "測試全部", theme,
             on_click=self._on_test_all,
         )
-        self._btn_enable_selected = ft.OutlinedButton(
-            "啟用選取", icon=ft.Icons.TOGGLE_ON,
+        self._btn_enable_selected = glass_pill(
+            "啟用選取", theme,
             on_click=lambda e: self._set_enabled_for_selected(True),
         )
-        self._btn_disable_selected = ft.OutlinedButton(
-            "禁用選取", icon=ft.Icons.TOGGLE_OFF,
+        self._btn_disable_selected = glass_pill(
+            "禁用選取", theme,
             on_click=lambda e: self._set_enabled_for_selected(False),
         )
-        self._btn_auto_pair = ft.OutlinedButton(
-            "自動配對", icon=ft.Icons.AUTO_FIX_HIGH,
+        self._btn_auto_pair = glass_pill(
+            "自動配對", theme,
             on_click=self._on_auto_pair,
         )
         # Replaced DataTable with a ListView of compact custom rows.
@@ -138,24 +144,25 @@ class CookiesView:
         )
 
     def _build_status_badge(self, status, status_color):
-        """Compact pill showing the cookie validity state."""
+        """Compact pill showing the cookie validity state (semantic color on 35% alpha fill)."""
         return ft.Container(
-            content=ft.Text(status, color=ft.Colors.WHITE, size=10, weight=ft.FontWeight.BOLD),
-            bgcolor=status_color,
+            content=ft.Text(status, color=status_color, size=10, weight=ft.FontWeight.BOLD),
+            bgcolor="#59" + status_color[1:],
             padding=ft.Padding.symmetric(horizontal=8, vertical=2),
             border_radius=10,
         )
 
     def _build_cookie_row(self, idx, entry):
         """Build one compact card row that reflows with the page width."""
+        theme = current_theme(self._page)
         alias = entry.get("alias", "") or f"Cookie {idx+1}"
         cookie = entry.get("cookie", "")
         status = entry.get("status", "未知")
         preview_short = (cookie[:24] + "...") if len(cookie) > 24 else cookie
-        status_color = _STATUS_COLORS.get(status, ft.Colors.GREY_600)
+        status_color = _status_colors(self._page).get(status, theme.text_muted)
         tested_text = _format_tested_at(entry.get("last_tested_at"))
         enabled = entry.get("enabled") is not False
-        alias_color = None if enabled else ft.Colors.GREY_500
+        alias_color = theme.text_primary if enabled else theme.text_muted
 
         # Left cluster: checkbox + per-row enable switch (always visible).
         controls_left = ft.Row(
@@ -192,7 +199,7 @@ class CookiesView:
             width=44,
         )
         tested_cell = ft.Container(
-            content=ft.Text(f"檢查：{tested_text}", size=11, color=ft.Colors.GREY_600,
+            content=ft.Text(f"檢查：{tested_text}", size=11, color=theme.text_secondary,
                             overflow=ft.TextOverflow.ELLIPSIS, max_lines=1, no_wrap=True),
             width=130,
         )
@@ -202,7 +209,7 @@ class CookiesView:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         info_preview = ft.Text(
-            preview_short, size=10, color=ft.Colors.GREY_500,
+            preview_short, size=10, color=theme.text_muted,
             font_family="monospace", tooltip=cookie,
             overflow=ft.TextOverflow.ELLIPSIS, no_wrap=True,
         )
@@ -227,7 +234,7 @@ class CookiesView:
                 ),
                 ft.IconButton(
                     icon=ft.Icons.DELETE, tooltip="刪除",
-                    icon_color=ft.Colors.RED_400,
+                    icon_color=theme.error,
                     on_click=lambda e, i=idx: self._remove_entry(i),
                 ),
             ],
@@ -236,16 +243,16 @@ class CookiesView:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
-        return ft.Container(
-            content=ft.Row(
+        return glass_panel(
+            ft.Row(
                 controls=[controls_left, controls_middle, controls_right],
                 spacing=10,
                 wrap=True,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
-            padding=ft.Padding.symmetric(horizontal=10, vertical=6),
-            border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
-            border_radius=6,
+            theme,
+            padding=12,
+            radius=theme.radius_sm,
         )
 
     def _refresh_table_header_state(self):
@@ -375,9 +382,10 @@ class CookiesView:
         def cancel_dialog(e: ft.ControlEvent) -> None:
             self._page.pop_dialog()
 
-        dialog = ft.AlertDialog(
-            title=ft.Text("編輯 Cookie" if idx is not None else "新增 Cookie"),
-            content=ft.Column([tf_alias, tf_cookie], tight=True, spacing=12),
+        dialog = glass_dialog(
+            current_theme(self._page),
+            "編輯 Cookie" if idx is not None else "新增 Cookie",
+            ft.Column([tf_alias, tf_cookie], tight=True, spacing=12),
             actions=[
                 ft.TextButton("取消", on_click=cancel_dialog),
                 ft.FilledButton("儲存", on_click=save_dialog),
@@ -511,8 +519,8 @@ class CookiesView:
         header = ft.Row([
             ft.Text("Cookies", size=20, weight=ft.FontWeight.BOLD),
             self._count_text,
-            ft.FilledButton("+ 新增", icon=ft.Icons.ADD,
-                            on_click=lambda e: self._open_edit_dialog(None)),
+            glass_pill("+ 新增", current_theme(self._page), primary=True,
+                       on_click=lambda e: self._open_edit_dialog(None)),
             self._select_all_cb,
             self._btn_test_selected,
             self._btn_test_all,
