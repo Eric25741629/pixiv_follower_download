@@ -11,6 +11,7 @@ import flet as ft
 
 from app.core.app_logging import init_logging, get_logger
 from app.gui.dispatcher import EventDispatcher
+from app.gui.glass import aurora_background, current_theme, glass_nav
 from app.gui.run_actions import RunController
 from app.gui.views.main_view import MainView
 from app.gui.views.settings_view import SettingsView
@@ -274,6 +275,7 @@ def main(page: ft.Page) -> None:
     page.title = "Pixiv 下載器"
     page.theme_mode = _load_theme_mode()
     page.theme = ft.Theme(color_scheme_seed="#0096FA")
+    theme = current_theme(page)
     page.window.width = 1100
     page.window.height = 750
     page.padding = 0
@@ -473,12 +475,11 @@ def main(page: ft.Page) -> None:
         except Exception:
             _log.exception("nav async reload failed for idx=%s", idx)
 
-    def on_nav_change(e: ft.ControlEvent) -> None:
+    def on_nav_change(idx: int) -> None:
         # Exceptions here must not bubble into Flet's event loop — Flet may
         # respond to an unhandled error by resetting the session, which
         # silently kills any running download. Log and swallow instead.
         try:
-            idx = e.control.selected_index
             now = time.monotonic()
             with _nav_lock:
                 if idx == _nav_state["idx"] and (now - _nav_state["ts"]) < 0.15:
@@ -502,33 +503,31 @@ def main(page: ft.Page) -> None:
     # removing/re-adding the statistics controls.
     stats_view.start_auto_refresh()
 
-    nav_rail = ft.NavigationRail(
-        selected_index=0,
-        label_type=ft.NavigationRailLabelType.ALL,
-        on_change=on_nav_change,
-        destinations=[
-            ft.NavigationRailDestination(
-                icon=ft.Icons.HOME_OUTLINED,
-                selected_icon=ft.Icons.HOME,
-                label="主頁",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.SETTINGS_OUTLINED,
-                selected_icon=ft.Icons.SETTINGS,
-                label="設定",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.COOKIE_OUTLINED,
-                selected_icon=ft.Icons.COOKIE,
-                label="Cookie",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.BAR_CHART_OUTLINED,
-                selected_icon=ft.Icons.BAR_CHART,
-                label="統計",
-            ),
-        ],
-    )
+    # ── floating glass nav (replaces ft.NavigationRail) ──────────────────
+    _nav_items = [
+        (ft.Icons.HOME_OUTLINED, "主頁"),
+        (ft.Icons.SETTINGS_OUTLINED, "設定"),
+        (ft.Icons.COOKIE_OUTLINED, "Cookie"),
+        (ft.Icons.BAR_CHART_OUTLINED, "統計"),
+    ]
+    _nav_selected = [0]
+    nav_holder = ft.Container()
+
+    def _rebuild_nav() -> None:
+        nav_holder.content = glass_nav(
+            _nav_items, _nav_selected[0], _on_glass_nav, current_theme(page)
+        )
+        # `.page` raises RuntimeError when detached (Flet 0.84); `.parent`
+        # is None until the control is mounted, so guard on that instead.
+        if nav_holder.parent is not None:
+            nav_holder.update()
+
+    def _on_glass_nav(idx: int) -> None:
+        _nav_selected[0] = idx
+        on_nav_change(idx)  # existing debounce + _activate_view logic, unchanged
+        _rebuild_nav()
+
+    _rebuild_nav()
 
     def handle_output(data: str) -> None:
         # Buffer log lines so a session-GC'd successor main() can replay
@@ -655,6 +654,28 @@ def main(page: ft.Page) -> None:
         "pause_state":   handle_pause_state,
     })
 
+    # ── aurora background + floating layout ──────────────────────────────
+    root = ft.Row(
+        controls=[
+            ft.Container(nav_holder, padding=ft.Padding(16, 16, 0, 16)),
+            ft.Container(content_area, expand=True, padding=16),
+        ],
+        expand=True,
+        spacing=0,
+    )
+    aurora = aurora_background(theme, root)
+    # aurora.content is ft.Stack([orb1, orb2, root]); keep orb handles so the
+    # theme toggle can recolor them in place without rebuilding the tree.
+    _orb1, _orb2 = aurora.content.controls[0], aurora.content.controls[1]
+
+    _appbar_title = ft.Text("Pixiv 下載器", color=theme.text_primary)
+    _theme_button = ft.IconButton(
+        icon=ft.Icons.LIGHT_MODE,
+        icon_color=theme.text_primary,
+        tooltip="切換深淺色",
+        on_click=lambda e: toggle_theme(e),
+    )
+
     def toggle_theme(e: ft.ControlEvent) -> None:
         page.theme_mode = (
             ft.ThemeMode.DARK
@@ -662,6 +683,18 @@ def main(page: ft.Page) -> None:
             else ft.ThemeMode.LIGHT
         )
         _save_theme_mode(page.theme_mode)
+        # Recompute the glass theme and repaint theme-bound chrome in place.
+        new_theme = current_theme(page)
+        aurora.gradient = ft.LinearGradient(
+            begin=ft.Alignment(-0.6, -1), end=ft.Alignment(0.6, 1),
+            colors=list(new_theme.bg_gradient), stops=[0.0, 0.5, 1.0],
+        )
+        _orb1.gradient = ft.RadialGradient(colors=[new_theme.orb1_color, "#00000000"])
+        _orb2.gradient = ft.RadialGradient(colors=[new_theme.orb2_color, "#00000000"])
+        _appbar_title.color = new_theme.text_primary
+        _theme_button.icon_color = new_theme.text_primary
+        page.appbar.color = new_theme.text_primary
+        _rebuild_nav()
         for view in (main_view, stats_view):
             try:
                 view.refresh_theme()
@@ -670,24 +703,14 @@ def main(page: ft.Page) -> None:
         page.update()
 
     page.appbar = ft.AppBar(
-        title=ft.Text("Pixiv 下載器"),
+        title=_appbar_title,
         center_title=False,
-        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
-        actions=[
-            ft.IconButton(
-                icon=ft.Icons.LIGHT_MODE,
-                tooltip="切換深淺色",
-                on_click=toggle_theme,
-            ),
-        ],
+        bgcolor="#00000000",
+        color=theme.text_primary,
+        actions=[_theme_button],
     )
 
-    page.add(
-        ft.Row(
-            controls=[nav_rail, ft.VerticalDivider(width=1), content_area],
-            expand=True,
-        )
-    )
+    page.add(aurora)
 
     # platform_brightness becomes reliable only after page.add(), so re-apply
     # step-card / stats colors once the page is mounted — covers the SYSTEM
