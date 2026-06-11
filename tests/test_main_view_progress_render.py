@@ -97,11 +97,23 @@ def test_bars_are_thicker_than_default(view):
 
 # ── build wires the new rows into the column ──────────────────────────────────
 
+def _iter_tree(ctrl):
+    """Walk a Flet control tree (controls list + content child)."""
+    yield ctrl
+    for child in getattr(ctrl, "controls", None) or []:
+        yield from _iter_tree(child)
+    content = getattr(ctrl, "content", None)
+    if content is not None:
+        yield from _iter_tree(content)
+
+
 def test_build_includes_progress_and_meta_rows(view):
-    col = view.build()
-    assert view._progress_row in col.controls
-    assert view._page_progress_row in col.controls
-    assert view._meta_row in col.controls
+    # The rows now live inside a glass_panel wrapper; assert they are wired
+    # somewhere into the built tree rather than as direct column children.
+    tree = list(_iter_tree(view.build()))
+    assert view._progress_row in tree
+    assert view._page_progress_row in tree
+    assert view._meta_row in tree
 
 
 # ── the freeze fix: BOTH rows are visible-gated & built identically ───────────

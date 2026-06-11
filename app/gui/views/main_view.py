@@ -6,6 +6,13 @@ import time
 import flet as ft
 
 from app.core.worker_event import WorkerEvent
+from app.gui.glass import (
+    current_theme,
+    glass_dialog,
+    glass_panel,
+    glass_pill,
+    state_colors,
+)
 from app.gui.log_panel import LogPanel
 
 
@@ -17,36 +24,10 @@ _BOOKMARK_STEP_LABELS = ["步驟 1\n略過追隨", "步驟 2\n抓收藏 PID"]
 # MainView.apply_combined_mode).
 _MERGED_STEP3_LABEL = "步驟 3+4\n邊查邊下"
 
-# Two palettes — light uses saturated 600-level bg + white text; dark uses
-# softer 400/800-level bg + dark text so colors don't look neon on black.
-_STATE_COLORS_LIGHT: dict[str, tuple[str, str]] = {
-    "idle":    (ft.Colors.GREY_300,  ft.Colors.BLACK),
-    "running": (ft.Colors.BLUE_600,  ft.Colors.WHITE),
-    "done":    (ft.Colors.GREEN_700, ft.Colors.WHITE),
-    "error":   (ft.Colors.RED_600,   ft.Colors.WHITE),
-}
-_STATE_COLORS_DARK: dict[str, tuple[str, str]] = {
-    "idle":    (ft.Colors.GREY_800,         ft.Colors.GREY_300),
-    "running": (ft.Colors.BLUE_400,         ft.Colors.BLACK),
-    "done":    (ft.Colors.TEAL_400,         ft.Colors.BLACK),
-    "error":   (ft.Colors.DEEP_ORANGE_400,  ft.Colors.BLACK),
-}
-
-
-def _is_dark_mode(page: ft.Page) -> bool:
-    mode = getattr(page, "theme_mode", None)
-    if mode == ft.ThemeMode.DARK:
-        return True
-    if mode == ft.ThemeMode.LIGHT:
-        return False
-    try:
-        return page.platform_brightness == ft.Brightness.DARK
-    except Exception:
-        return False
-
 
 def _state_palette(page: ft.Page) -> dict[str, tuple[str, str]]:
-    return _STATE_COLORS_DARK if _is_dark_mode(page) else _STATE_COLORS_LIGHT
+    """Step-card state colors from the glass design system (call sites unchanged)."""
+    return state_colors(current_theme(page))
 
 
 # Shared geometry for the two stacked progress bars (整體進度 / 本作分頁). Both
@@ -85,9 +66,21 @@ class MainView:
         # from settings and refreshed when the user returns to the 主頁 tab.
         self._combined_mode = False
 
-        self._btn_run_all = ft.FilledButton("▶ 一鍵執行", on_click=self._on_run_all)
-        self._btn_pause = ft.OutlinedButton("⏸ 暫停", on_click=self._on_pause_toggle, disabled=True)
-        self._btn_stop = ft.OutlinedButton("⏹ 停止", on_click=self._on_stop, disabled=True)
+        # 控制鈕維持原 Button 類別（flet_app 會以字串指派 _btn_pause.content，
+        # Container 版 glass_pill 的 content 只收 Control），改以 ButtonStyle
+        # 取得玻璃膠囊外觀 — 行為/事件不變。
+        self._btn_run_all = ft.FilledButton(
+            "▶ 一鍵執行", on_click=self._on_run_all,
+            style=self._glass_button_style(primary=True),
+        )
+        self._btn_pause = ft.OutlinedButton(
+            "⏸ 暫停", on_click=self._on_pause_toggle, disabled=True,
+            style=self._glass_button_style(primary=False),
+        )
+        self._btn_stop = ft.OutlinedButton(
+            "⏹ 停止", on_click=self._on_stop, disabled=True,
+            style=self._glass_button_style(primary=False),
+        )
         self._is_paused = False
         self._cards_disabled = False
 
@@ -101,19 +94,22 @@ class MainView:
         # .value patches never reflow it — that was the 整體進度 freeze (本作分頁
         # never froze precisely because it was visible-gated; now both are).
         self._progress_bar, self._progress_text, self._progress_row = (
-            self._make_progress_row("整體進度", ft.Colors.BLUE_500)
+            self._make_progress_row("整體進度")
         )
         self._page_progress_bar, self._page_progress_text, self._page_progress_row = (
-            self._make_progress_row("本作分頁", ft.Colors.TEAL_500)
+            self._make_progress_row("本作分頁")
         )
         self._page_progress_value = 0
         self._page_progress_total = 0
         self._page_progress_pid = ""
 
         # ── meta line (ETA + cooldown countdown), indented under the bars ────
-        self._eta_text = ft.Text("", size=12, color=ft.Colors.BLUE_GREY_500)
+        self._eta_text = ft.Text(
+            "", size=12, color=current_theme(page).text_secondary
+        )
         self._countdown_text = ft.Text(
-            "", size=12, color=ft.Colors.ORANGE_600, weight=ft.FontWeight.BOLD,
+            "", size=12, color=current_theme(page).warning,
+            weight=ft.FontWeight.BOLD,
         )
         self._meta_row = ft.Row(
             controls=[
@@ -132,7 +128,7 @@ class MainView:
         self._phase_label = ft.Text(
             "",
             size=11,
-            color=ft.Colors.BLUE_300 if _is_dark_mode(page) else ft.Colors.BLUE_700,
+            color=current_theme(page).info,
             expand=True,
         )
         self._phase_row = ft.Row(
@@ -142,20 +138,31 @@ class MainView:
         )
 
         # Modal overlay shown while a step is launching or stopping.
-        self._loading_msg = ft.Text("正在啟動...", size=15, weight=ft.FontWeight.BOLD)
-        self._loading_dialog = ft.AlertDialog(
-            modal=True,
-            content=ft.Column(
+        self._loading_msg = ft.Text(
+            "正在啟動...", size=15, weight=ft.FontWeight.BOLD,
+            color=current_theme(page).text_primary,
+        )
+        self._loading_dialog = glass_dialog(
+            current_theme(page),
+            "",
+            ft.Column(
                 controls=[
-                    ft.ProgressRing(width=56, height=56, stroke_width=4),
+                    ft.ProgressRing(
+                        width=56, height=56, stroke_width=4,
+                        color=current_theme(page).accent,
+                    ),
                     self._loading_msg,
-                    ft.Text("請勿關閉視窗", size=12, color=ft.Colors.GREY_600),
+                    ft.Text(
+                        "請勿關閉視窗", size=12,
+                        color=current_theme(page).text_secondary,
+                    ),
                 ],
                 tight=True,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 spacing=14,
             ),
         )
+        self._loading_dialog.modal = True
         self._loading_open = False
         self._loading_lock = threading.Lock()
 
@@ -167,28 +174,33 @@ class MainView:
         self._following_scope = "all"
         self._bookmark_scope = "all"
         self._active_scope = "all"
-        self._mode_title = ft.Text("", size=13, weight=ft.FontWeight.BOLD)
-        self._mode_subtitle = ft.Text("", size=12, color=ft.Colors.BLUE_GREY_600)
+        self._mode_title = ft.Text(
+            "", size=13, weight=ft.FontWeight.BOLD,
+            color=current_theme(page).text_primary,
+        )
+        self._mode_subtitle = ft.Text(
+            "", size=12, color=current_theme(page).text_secondary
+        )
         self._scope_label = ft.Text(
             "追隨範圍",
             size=12,
             weight=ft.FontWeight.BOLD,
-            color=ft.Colors.BLUE_GREY_700,
+            color=current_theme(page).text_secondary,
         )
-        self._btn_source_following = ft.OutlinedButton(
-            "抓追隨", on_click=lambda e: self._on_source_mode_change("following")
+        self._btn_source_following = self._make_mode_button(
+            "抓追隨", False, lambda e: self._on_source_mode_change("following")
         )
-        self._btn_source_bookmarks = ft.OutlinedButton(
-            "抓收藏", on_click=lambda e: self._on_source_mode_change("bookmarks")
+        self._btn_source_bookmarks = self._make_mode_button(
+            "抓收藏", False, lambda e: self._on_source_mode_change("bookmarks")
         )
-        self._btn_scope_public = ft.OutlinedButton(
-            "公開", on_click=lambda e: self._on_scope_change("public")
+        self._btn_scope_public = self._make_mode_button(
+            "公開", False, lambda e: self._on_scope_change("public")
         )
-        self._btn_scope_private = ft.OutlinedButton(
-            "非公開", on_click=lambda e: self._on_scope_change("private")
+        self._btn_scope_private = self._make_mode_button(
+            "非公開", False, lambda e: self._on_scope_change("private")
         )
-        self._btn_scope_all = ft.OutlinedButton(
-            "全部", on_click=lambda e: self._on_scope_change("all")
+        self._btn_scope_all = self._make_mode_button(
+            "全部", False, lambda e: self._on_scope_change("all")
         )
         self._scope_row = ft.Row(
             controls=[
@@ -234,10 +246,28 @@ class MainView:
             ),
             border_radius=8,
             padding=ft.Padding.symmetric(horizontal=14, vertical=10),
-            border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
+            border=ft.Border.all(1, current_theme(page).panel_border),
         )
 
-    def _make_step_card(self, index: int) -> ft.Card:
+    def _glass_button_style(self, *, primary: bool) -> ft.ButtonStyle:
+        """Pill-shaped glass ButtonStyle matching glass_pill colors.
+
+        Used for the run/pause/stop buttons, which must stay real Buttons
+        (their ``content`` is assigned plain strings by flet_app's restore
+        path; a glass_pill Container only accepts Control content).
+        """
+        t = current_theme(self._page)
+        fg = "#FFFFFF" if (primary and t.name == "dark") else (
+            t.text_primary if primary else t.text_secondary)
+        return ft.ButtonStyle(
+            color=fg,
+            bgcolor=t.accent_fill if primary else "#12FFFFFF",
+            side=ft.BorderSide(1, t.panel_border),
+            shape=ft.RoundedRectangleBorder(radius=999),
+        )
+
+    def _make_step_card(self, index: int) -> ft.Container:
+        theme = current_theme(self._page)
         palette = _state_palette(self._page)
         bg, fg = palette["idle"]
         text = ft.Text(
@@ -250,15 +280,17 @@ class MainView:
             content=text,
             padding=12,
             bgcolor=bg,
-            border_radius=8,
+            border_radius=theme.radius_sm,
+            border=ft.Border.all(1, theme.panel_border),
             width=110,
             alignment=ft.Alignment(x=0, y=0),
             ink=True,
+            animate=ft.Animation(150, ft.AnimationCurve.EASE_OUT),
             on_click=lambda e, n=index + 1: self._on_run_step(n),
         )
         self._step_card_containers.append(container)
         self._step_card_texts.append(text)
-        return ft.Card(content=container)
+        return container
 
     def set_step_state(self, index: int, state: str) -> None:
         """Update step card color. state: 'idle'|'running'|'done'|'error'"""
@@ -272,7 +304,7 @@ class MainView:
         """Re-apply theme-dependent colors after a light/dark toggle.
 
         Step cards, phase label — anything that picks colors from
-        ``_is_dark_mode(page)`` rather than auto-themed Flet components.
+        ``current_theme(page)`` rather than auto-themed Flet components.
         Best-effort: swallows ``update()`` errors on detached controls.
         """
         palette = _state_palette(self._page)
@@ -280,9 +312,7 @@ class MainView:
             bg, fg = palette.get(state, palette["idle"])
             self._step_card_containers[i].bgcolor = bg
             self._step_card_texts[i].color = fg
-        self._phase_label.color = (
-            ft.Colors.BLUE_300 if _is_dark_mode(self._page) else ft.Colors.BLUE_700
-        )
+        self._phase_label.color = current_theme(self._page).info
         for c in self._step_card_containers:
             try:
                 c.update()
@@ -430,11 +460,10 @@ class MainView:
             self._step_card_texts[0], self._step_card_texts[1],
         )
 
-    @staticmethod
-    def _make_mode_button(text: str, active: bool, on_click):
-        if active:
-            return ft.FilledButton(text, on_click=on_click)
-        return ft.OutlinedButton(text, on_click=on_click)
+    def _make_mode_button(self, text: str, active: bool, on_click):
+        return glass_pill(
+            text, current_theme(self._page), primary=active, on_click=on_click
+        )
 
     @staticmethod
     def _normalize_scope(scope: str) -> str:
@@ -486,8 +515,7 @@ class MainView:
             with contextlib.suppress(Exception):
                 c.update()
 
-    @staticmethod
-    def _make_progress_row(label: str, color: str):
+    def _make_progress_row(self, label: str):
         """Build one labeled progress row: [label] [expand bar] [count text].
 
         Returns ``(bar, text, row)``. Used for BOTH 整體進度 and 本作分頁 so the
@@ -495,25 +523,26 @@ class MainView:
         The row starts hidden — it is revealed on its first real update by
         :meth:`_render_progress_row`.
         """
+        theme = current_theme(self._page)
         bar = ft.ProgressBar(
             value=0,
             expand=True,
             bar_height=_PROG_BAR_HEIGHT,
             border_radius=_PROG_BAR_RADIUS,
-            color=color,
-            bgcolor=ft.Colors.with_opacity(0.18, color),
+            color=theme.accent,
+            bgcolor="#1FFFFFFF",
         )
         text = ft.Text(
             "",
             size=13,
-            color=ft.Colors.BLUE_GREY_700,
+            color=theme.text_primary,
             weight=ft.FontWeight.W_600,
             width=_PROG_TRAIL_W,
             text_align=ft.TextAlign.LEFT,
         )
         row = ft.Row(
             controls=[
-                ft.Text(label, size=12, color=ft.Colors.BLUE_GREY_500,
+                ft.Text(label, size=12, color=theme.text_secondary,
                         width=_PROG_LEAD_W),
                 bar,
                 text,
@@ -804,6 +833,7 @@ class MainView:
         # Paint any progress restored from a post-GC reattach so the bar shows
         # "116 / 320" immediately instead of waiting for the next worker event.
         self._paint_progress()
+        theme = current_theme(self._page)
         top_row = ft.Row(
             controls=[
                 self._btn_run_all,
@@ -816,18 +846,37 @@ class MainView:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             wrap=True,
         )
-        return ft.Column(
-            controls=[
-                self._mode_band,
-                top_row,
-                self._progress_row,
-                self._page_progress_row,
-                self._meta_row,
-                self._phase_row,
-                ft.Divider(),
-                ft.Text("即時 Log", size=12, weight=ft.FontWeight.BOLD),
-                self._log_panel.control,
-            ],
+        control_area = glass_panel(
+            ft.Column(
+                controls=[
+                    self._mode_band,
+                    top_row,
+                    self._progress_row,
+                    self._page_progress_row,
+                    self._meta_row,
+                    self._phase_row,
+                ],
+                spacing=12,
+            ),
+            theme,
+        )
+        log_area = glass_panel(
+            ft.Column(
+                controls=[
+                    ft.Text(
+                        "即時 Log", size=12, weight=ft.FontWeight.BOLD,
+                        color=theme.text_primary,
+                    ),
+                    self._log_panel.control,
+                ],
+                expand=True,
+                spacing=8,
+            ),
+            theme,
             expand=True,
-            spacing=12,
+        )
+        return ft.Column(
+            controls=[control_area, log_area],
+            expand=True,
+            spacing=theme.gap,
         )

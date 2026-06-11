@@ -71,12 +71,12 @@ class LogPanel:
         )
         # GestureDetector 只掛 on_scroll（Listener.onPointerSignal），
         # 不消費事件 — ListView 滾動與文字框選不受影響。
+        # 外層不再畫邊框/底色 — 視覺由 main_view 的 glass_panel 包裹提供，
+        # 這裡只保留捲動/選取所需的容器結構。
         self._gesture = ft.GestureDetector(
             content=ft.Container(
                 content=self._list,
                 expand=True,
-                border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
-                border_radius=4,
                 padding=4,
             ),
             on_scroll=self._on_wheel,
