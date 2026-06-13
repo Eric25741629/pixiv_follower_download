@@ -215,6 +215,7 @@ class download_thread(PauseableThread):
         overrides = self._apply_legacy_constructor_args(legacy_args, legacy_kwargs)
         self.ai_gen_dir = overrides.get("ai_gen_dir", self.ai_gen_dir)
         self.author_order = bool(overrides.get("author_order", False))
+        self.set_file_mtime = bool(overrides.get("set_file_mtime", True))
         self._init_jxl_config(
             overrides.get("jxl_enable", jxl_enable),
             overrides.get("jxl_cjxl_path", jxl_cjxl_path),
@@ -283,9 +284,16 @@ class download_thread(PauseableThread):
         (self.cookie_entries, self.cookie_pool,
          self._cookie_alias_map, self.cookies) = init_cookie_fields(cookies)
         self._pid_cookie_selection = {}
-        self._current_account = None  # set by _execute_downloads when scheduler is active
+        self._current_account_local = threading.local()
         self.agent = agent
-        self.download_time = download_time
+        self.download_time = (download_time if isinstance(download_time, datetime.datetime)
+                              else datetime.datetime(1970, 1, 1))
+        # Last download_time value this worker knows the settings file holds
+        # (either loaded from it or emitted via "timechanged" for the GUI to
+        # persist). _apply_live_settings_if_changed only re-applies the
+        # setting when the stored raw differs from this — i.e. a real user
+        # edit — instead of rewinding the advancing counter on every save.
+        self._download_time_setting_raw = self.download_time.strftime('%Y-%m-%d %H:%M:%S')
         self.no_R18G_dir = no_R18G_dir
         self.no_R18_dir = no_R18_dir
         self.single_thread_mode = single_thread_mode
@@ -413,7 +421,15 @@ class download_thread(PauseableThread):
         self.nogif = bool(flt.get("nogif", False))
         self.notag = bool(flt.get("notag", False))
         self.notime = bool(flt.get("notime", False))
-        self.download_time = self._parse_live_download_time(dl.get("download_time"))
+        # Only re-apply download_time on a genuine user edit. The stored
+        # value also changes when the GUI persists our own "timechanged"
+        # emits — re-applying those would rewind the advancing counter and
+        # stamp duplicate timetags.
+        raw_dt = str(dl.get("download_time") or "").strip()
+        if raw_dt != getattr(self, "_download_time_setting_raw", None):
+            with self.timelock:
+                self.download_time = self._parse_live_download_time(raw_dt)
+            self._download_time_setting_raw = raw_dt
 
         # output location (user opted in despite the split-output tradeoff)
         new_path = str(dl.get("path", "") or "").strip()
@@ -426,6 +442,7 @@ class download_thread(PauseableThread):
 
         # filename
         self.filename_template = str(dl.get("filename_template", "") or "").strip()
+        self.set_file_mtime = bool(dl.get("set_file_mtime", True))
         self.tag_strip_brackets = bool(dl.get("tag_strip_brackets", False))
         self.tag_strip_special_chars = bool(dl.get("tag_strip_special_chars", False))
 
@@ -1067,6 +1084,7 @@ class download_thread(PauseableThread):
         ("tag_strip_brackets", bool),
         ("tag_strip_special_chars", bool),
         ("author_order", bool),
+        ("set_file_mtime", bool),
     ]
 
     @staticmethod
@@ -1955,7 +1973,7 @@ class download_thread(PauseableThread):
         self._apply_live_settings_if_changed()
         failed = []
         # Build session with the bound proxy when an account is currently held.
-        acc = getattr(self, '_current_account', None)
+        acc = self._current_download_account()
         if acc is not None:
             from app.core import pixiv_api as _pixiv_api
             sess = _pixiv_api.make_session(acc.proxy_url)
@@ -2052,6 +2070,23 @@ class download_thread(PauseableThread):
         with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("phase", text))
 
+    def _emit_timechanged(self) -> None:
+        """Push the advanced download_time so the GUI persists it.
+
+        Emitted at every PID completion (not just end-of-run): a crash, a
+        user stop, or combined mode (which never runs Step 4's finalize)
+        must not lose the advanced counter — that's how thousands of files
+        ended up sharing one timetag prefix.
+        """
+        with self.timelock:
+            value = self.download_time.strftime('%Y-%m-%d %H:%M:%S')
+        # Remember what we emitted: the GUI writes it back to settings, and
+        # _apply_live_settings_if_changed must not mistake that write-back
+        # for a user edit (re-applying it would rewind the live counter).
+        self._download_time_setting_raw = value
+        with contextlib.suppress(Exception):
+            self._q.put(WorkerEvent("timechanged", value))
+
     def _emit_step4_header(self):
         self._q.put(WorkerEvent("output", "<p><font color='red'>下載階段開始...</font></p>"))
         self._q.put(WorkerEvent("output", f"<p><font color='red'>Pending URL: {len(self.allurl)}</font></p>"))
@@ -2106,21 +2141,60 @@ class download_thread(PauseableThread):
             f"<p><font color='green'>同PID等待: {self.intra_pid_wait_min}~"
             f"{self.intra_pid_wait_max} 秒；PID間: {inter_pid_desc}</font></p>"))
 
+    def _current_download_account(self):
+        """The account bound to the calling worker thread (or None).
+
+        Thread-local: pool mode runs 4 concurrent PID workers, each with its
+        own account; combined mode sets/clears it on the combined thread via
+        the same interface.
+        """
+        return getattr(self._current_account_local, "account", None)
+
+    def _set_current_download_account(self, account):
+        self._current_account_local.account = account
+
+    def _clear_current_download_account(self):
+        with contextlib.suppress(AttributeError):
+            del self._current_account_local.account
+
     def _download_pid_with_scheduler(self, pid, urls):
-        """Acquire an account, run download under retry, release. Returns (result, stop)."""
+        """Acquire an account, run download under retry, release. Returns (result, stop).
+
+        Release semantics:
+        - retry exhausted on the network triple -> release(ok=False), the
+          scheduler disables the cookie/proxy for the run;
+        - user stop (before/during the retry waits) or a non-network
+          exception (disk/decode error — not the account's fault) ->
+          release_neutral(), the cookie is neither disabled nor credited
+          with a success (no last_tested_at refresh);
+        - clean run -> release(ok=True).
+        """
         acc = self._acquire_account()
         if acc is None:
             return [], True  # stop signal or all disabled
         pid_key = normalize_pid(pid) or str(pid)
         self._pid_cookie_selection[pid_key] = acc.cookie  # sticky cookie for this PID
-        self._current_account = acc
-        ok, result, _ = self._run_with_network_retry(
-            f"PID {pid}",
-            lambda: self._download_pid_group(pid, urls),
-        )
-        self._current_account = None
-        self._release_account(acc, ok=ok)
-        return (result if isinstance(result, list) else []), False
+        ok = False
+        neutral = False
+        try:
+            self._set_current_download_account(acc)
+            self._emit_phase(f"正在下載：PID {pid}")
+            ok, result, _ = self._run_with_network_retry(
+                f"PID {pid}",
+                lambda: self._download_pid_group(pid, urls),
+            )
+            return (result if isinstance(result, list) else []), False
+        except Exception:
+            neutral = True
+            raise
+        finally:
+            self._clear_current_download_account()
+            if not ok and self._stop_event.is_set():
+                neutral = True
+            if neutral and self._scheduler is not None:
+                self._scheduler.release_neutral(acc)
+            else:
+                self._release_account(acc, ok=ok)
 
     def _execute_downloads_single(self, pid_order, pid_groups):
         """Single-thread per-PID-group download loop with optional scheduler."""
@@ -2138,6 +2212,7 @@ class download_thread(PauseableThread):
                 f"（{len(pid_groups.get(pid, []))} 張）</font></p>"))
 
             urls = pid_groups.get(pid, [])
+            self._emit_phase(f"正在下載：PID {pid}")
             if self._scheduler is not None:
                 result, stop = self._download_pid_with_scheduler(pid, urls)
                 if stop:
@@ -2160,6 +2235,7 @@ class download_thread(PauseableThread):
             total = getattr(self, "_step4_pid_total", len(pid_order))
             self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
             self._maybe_flush_url_meta_periodically(done)
+            self._emit_timechanged()
             if self._stop_event.is_set():
                 break
             # _sleep_between_downloads is a no-op when scheduler is set;
@@ -2182,23 +2258,40 @@ class download_thread(PauseableThread):
         total = getattr(self, "_step4_pid_total",
                         sum(len(b) for b in author_batches))
         done = 0
+        pool_stopped = False
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as self.executor:
             for batch in author_batches:
-                if self._stop_event.is_set():
+                if pool_stopped or self._stop_event.is_set():
                     break
+                use_scheduler = self._scheduler is not None
+                worker = self._download_pid_with_scheduler if use_scheduler else self._download_pid_group
                 futures = [
-                    self.executor.submit(self._download_pid_group, pid, pid_groups.get(pid, []))
+                    self.executor.submit(worker, pid, pid_groups.get(pid, []))
                     for pid in batch
                 ]
                 for fu in concurrent.futures.as_completed(futures):
                     try:
-                        failed_nested.append(fu.result())
+                        result = fu.result()
+                        if use_scheduler:
+                            result, stop = result
+                            if stop:
+                                # Stop request or all cookies disabled: the PID
+                                # was never attempted — don't count it as a
+                                # no-failure success, and don't submit further
+                                # batches (its URLs stay in the unattempted set
+                                # that _compute_remaining_urls preserves).
+                                pool_stopped = True
+                                continue
+                        failed_nested.append(result)
                     except Exception:
                         failed_nested.append([])
                     done += 1
                     self._step4_pid_done = done
                     self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
                     self._maybe_flush_url_meta_periodically(done)
+                    self._emit_timechanged()
+        if pool_stopped:
+            self._emit_output("<p><font color='orange'>下載池已停止：剩餘 PID 保留為未嘗試，下次執行續傳</font></p>")
         return failed_nested
 
     def _execute_downloads(self, pid_order, pid_groups, author_batches):
@@ -2450,7 +2543,7 @@ class download_thread(PauseableThread):
                 ))
             except Exception:
                 pass
-        self._q.put(WorkerEvent("timechanged", datetime.datetime.strftime(self.download_time, '%Y-%m-%d %H:%M:%S')))
+        self._emit_timechanged()
         self._emit_step4_filter_skip_final_summary()
         self._emit_cookie_usage_summary("step4", "Step4 Cookie統計")
         if self._stats_collector is not None:
@@ -2801,6 +2894,7 @@ class download_thread(PauseableThread):
                 return [url, my_time.strftime('%Y%m%d_%H%M%S')]
             saved_gif_path = self._build_ugoira_save_path(pid, tag, my_time)
             self._save_ugoira_gif(frame_blobs, saved_gif_path, delay_info)
+            self._apply_download_mtime(saved_gif_path, my_time)
             if self._stats_collector is not None:
                 self._stats_collector.report_file(True)
             self._enqueue_jxl(saved_gif_path)
@@ -2858,6 +2952,23 @@ class download_thread(PauseableThread):
         except Exception:
             return 'illust_' + pid + page_suffix + timetag + '.' + ext
 
+    def _apply_download_mtime(self, filepath, when):
+        """Set the saved file's atime/mtime to its timetag (download.set_file_mtime).
+
+        ``when`` is either a 'YYYYMMDD_HHMMSS' timetag string or a datetime.
+        Keeps the on-disk timestamp consistent with the timestamp embedded in
+        the filename. Best-effort: never fails the download.
+        """
+        if not getattr(self, "set_file_mtime", False):
+            return
+        try:
+            if isinstance(when, str):
+                when = datetime.datetime.strptime(when, '%Y%m%d_%H%M%S')
+            ts = when.timestamp()
+            os.utime(filepath, (ts, ts))
+        except Exception:
+            pass
+
     def _jpg_stream_to_disk(self, htmlfile, filepath):
         """Stream the HTTP body to disk in 1 KiB chunks; returns total bytes written."""
         size = 0
@@ -2897,6 +3008,7 @@ class download_thread(PauseableThread):
         target_dir = self._resolve_download_target_dir(str(tag), pid)
         filepath = os.path.join(target_dir, name)
         size = self._jpg_stream_to_disk(htmlfile, filepath)
+        self._apply_download_mtime(filepath, timetag)
         if self._stats_collector is not None:
             self._stats_collector.report_bytes(size)
             self._stats_collector.report_file(True)

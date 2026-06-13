@@ -1,5 +1,4 @@
 from __future__ import annotations
-import math
 import os
 import threading
 import flet as ft
@@ -73,6 +72,18 @@ class SettingsView:
             value=str(dl.get("filename_template", "") or ""),
             hint_text="例：{timetag}_PID{pid}{page}{hashtag}.{ext}",
             expand=True,
+        )
+        self._tf_download_time = ft.TextField(
+            label="下載時間戳起點 (YYYY-MM-DD HH:MM:SS)",
+            value=str(dl.get("download_time", "") or ""),
+            hint_text="例：2026-01-01 00:00:00",
+            width=320,
+            tooltip="下載檔名/檔案時間使用的時間戳起點。每下載一張 +1 秒並自動回寫此欄位。",
+        )
+        self._sw_set_file_mtime = ft.Switch(
+            label="下載檔案時間設為時間戳 (mtime)",
+            value=bool(dl.get("set_file_mtime", True)),
+            tooltip="將下載完成的檔案修改時間設成與檔名相同的時間戳",
         )
         self._sw_tag_strip_brackets = ft.Switch(
             label="Tag 過濾括號內容",
@@ -182,12 +193,12 @@ class SettingsView:
         # Cooldown controls — replace old pid_wait_min / pid_wait_max text fields
         cooldown_avg = int(perf.get("pid_cooldown_avg", 35))
         self._sl_cooldown = ft.Slider(
-            min=5, max=300, divisions=59, value=float(cooldown_avg),
+            min=0, max=300, divisions=60, value=float(cooldown_avg),
             label="{value}", width=240,
             on_change=self._on_cooldown_slider_change,
         )
         self._tf_cooldown = ft.TextField(
-            label="平均冷卻秒數",
+            label="單帳號冷卻秒數",
             value=str(cooldown_avg),
             width=170,
             keyboard_type=ft.KeyboardType.NUMBER,
@@ -263,6 +274,10 @@ class SettingsView:
                 ctl.focused_border_color = theme.accent
             elif isinstance(ctl, (ft.Slider, ft.Switch)):
                 ctl.active_color = theme.accent
+                # M3 預設的 inactive 軌道色在玻璃淺色背景上幾乎隱形（只剩
+                # 拇指可見 — 「滑桿顯示有問題」bug）；用面板邊框色讓軌道現形。
+                if isinstance(ctl, ft.Slider):
+                    ctl.inactive_color = theme.panel_border
 
     def _cooldown_hint_color(self, avg: int) -> str:
         theme = current_theme(self._page)
@@ -283,6 +298,7 @@ class SettingsView:
             (self._sw_nogif, "filter", "nogif", False),
             (self._sw_notag, "filter", "notag", False),
             (self._sw_notime, "filter", "notime", False),
+            (self._sw_set_file_mtime, "download", "set_file_mtime", False),
             (self._sw_tag_strip_brackets, "download", "tag_strip_brackets", False),
             (self._sw_tag_strip_special_chars, "download", "tag_strip_special_chars", False),
             (self._sw_author_order, "download", "author_order", False),
@@ -379,16 +395,16 @@ class SettingsView:
 
     def _cooldown_hint(self, avg) -> str:
         try:
-            avg_f = max(1.0, float(avg))
+            avg_f = max(0.0, float(avg))
         except (TypeError, ValueError):
             avg_f = 35.0
         n = self._n_cookies
-        throughput = avg_f * math.log(n + 1) / n
+        throughput = avg_f / n
         suffix = "；推薦 >= 30 秒"
         if n == 1:
             return f"1 個 cookie：每請求約 {throughput:.0f} 秒{suffix}"
-        speedup = math.log(2) * n / math.log(n + 1)
-        return f"{n} 個 cookie：每請求約 {throughput:.1f} 秒（比單 cookie 快 {speedup:.1f}x）{suffix}"
+        return (f"{n} 個 cookie：單帳號每 {avg_f:.0f} 秒一次，"
+                f"整體每請求約 {throughput:.1f} 秒{suffix}")
 
     def reload_cookie_count(self) -> None:
         """Re-read cookie count from store; refresh hint label in-place."""
@@ -416,7 +432,7 @@ class SettingsView:
 
     def _on_cooldown_tf_change(self, e: ft.ControlEvent) -> None:
         try:
-            val = max(5, min(300, int(self._tf_cooldown.value or "35")))
+            val = max(0, min(300, int(self._tf_cooldown.value or "35")))
         except (TypeError, ValueError):
             return
         self._tf_cooldown.value = str(val)            # snap displayed text to clamped value
@@ -432,7 +448,7 @@ class SettingsView:
 
     def _safe_int_cooldown(self) -> int:
         try:
-            return max(5, min(300, int(self._tf_cooldown.value or "35")))
+            return max(0, min(300, int(self._tf_cooldown.value or "35")))
         except (TypeError, ValueError):
             return 35
 
@@ -523,6 +539,8 @@ class SettingsView:
             "ban_tag": self._ban_tags,
             "must_tag": self._must_tags,
             "filename_template": (self._tf_filename_template.value or "").strip(),
+            "download_time": (self._tf_download_time.value or "").strip(),
+            "set_file_mtime": bool(self._sw_set_file_mtime.value),
             "tag_strip_brackets": bool(self._sw_tag_strip_brackets.value),
             "tag_strip_special_chars": bool(self._sw_tag_strip_special_chars.value),
             "author_order": bool(self._sw_author_order.value),
@@ -680,6 +698,10 @@ class SettingsView:
                         "留空時使用預設規則。檔名會自動清掉 Windows 不允許的字元。"
                     ),
                     self._tf_filename_template,
+                    subhead("時間戳"),
+                    note("時間戳起點供 {timetag} 檔名與檔案時間使用；每下載一張 +1 秒並自動回寫。格式錯誤時自動回退到 1970-01-01。"),
+                    self._tf_download_time,
+                    self._sw_set_file_mtime,
                     subhead("檔名內容"),
                     ft.Row([self._sw_notag, self._sw_notime], wrap=True),
                     subhead("Tag 整理（套用於 {hashtag} 佔位符）"),

@@ -1,4 +1,3 @@
-import math
 import time
 import threading
 import pytest
@@ -41,13 +40,13 @@ def test_release_sets_cooldown_above_zero():
 
 
 def test_release_cooldown_is_deterministic():
-    # Per-account cooldown is exact `avg × ln(N+1)` (no jitter on this).
+    # Per-account cooldown is exactly the setting value (no jitter on this).
     # Randomness lives on the throughput gate in acquire(), not here.
     acc = AccountState(cookie="c1", alias="A1")
     before = time.monotonic()
     sched, _, _ = _make_scheduler([acc], avg=10.0)
     sched.release(acc, ok=True)
-    expected = 10.0 * math.log(2)  # N=1
+    expected = 10.0
     assert before + expected - 0.05 <= acc.cooldown_until <= before + expected + 0.05
 
 
@@ -153,7 +152,7 @@ def test_initial_cooldowns_staggered_by_throughput():
     accs = [AccountState(cookie=f"c{i}", alias=f"A{i}") for i in range(3)]
     before = time.monotonic()
     sched, _, _ = _make_scheduler(accs, avg=30.0)
-    throughput = 30.0 * math.log(4) / 3  # N=3
+    throughput = 30.0 / 3  # N=3
     # First account ready immediately, each subsequent staggered by throughput.
     assert accs[0].cooldown_until <= before + 0.01
     assert before + throughput - 0.5 <= accs[1].cooldown_until <= before + throughput + 0.5
@@ -170,16 +169,16 @@ def test_initial_cooldowns_no_stagger_for_single_account():
 def test_average_cooldown_returns_throughput():
     accs = [AccountState(cookie=f"c{i}", alias=f"A{i}") for i in range(7)]
     sched, _, _ = _make_scheduler(accs, avg=30.0)
-    expected = 30.0 * math.log(8) / 7  # ≈ 8.91s
+    expected = 30.0 / 7  # ≈ 4.29s
     assert abs(sched.average_cooldown() - expected) < 1e-6
 
 
-def test_release_cooldown_uses_log_scaling():
+def test_release_cooldown_is_fixed_regardless_of_account_count():
     accs = [AccountState(cookie=f"c{i}", alias=f"A{i}") for i in range(7)]
     sched, _, _ = _make_scheduler(accs, avg=30.0)
     before = time.monotonic()
     sched.release(accs[0], ok=True)
-    expected = 30.0 * math.log(8)  # N=7
+    expected = 30.0  # fixed per-account, independent of N
     assert before + expected - 0.05 <= accs[0].cooldown_until <= before + expected + 0.05
 
 
@@ -192,7 +191,7 @@ def test_acquire_advances_throughput_gate(monkeypatch):
     # First acquire fires immediately and advances next_emit_at.
     result = sched.acquire()
     assert result is acc
-    throughput = 10.0 * math.log(2)
+    throughput = 10.0  # N=1
     # ±10% throughput jitter on gate.
     assert clock[0] + throughput * 0.9 <= sched._next_emit_at <= clock[0] + throughput * 1.1
 
@@ -210,7 +209,7 @@ def test_throughput_gate_bounds_inter_request_gap(monkeypatch):
     monkeypatch.setattr(time, "sleep", fake_sleep)
     accs = [AccountState(cookie=f"c{i}", alias=f"A{i}") for i in range(7)]
     sched, _, _ = _make_scheduler(accs, avg=30.0)
-    throughput = 30.0 * math.log(8) / 7  # ≈ 8.91s
+    throughput = 30.0 / 7  # ≈ 4.29s
 
     times = []
     for _ in range(20):

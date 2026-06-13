@@ -8,11 +8,15 @@ import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 import flet as ft
 
 from app.core.app_logging import init_logging, get_logger
 from app.gui.dispatcher import EventDispatcher
-from app.gui.glass import FONT_FAMILY, aurora_background, current_theme, glass_nav
+from app.gui.glass import (
+    FONT_ASSET_PATH, FONT_FALLBACK, FONT_FAMILY,
+    aurora_background, current_theme, glass_nav,
+)
 from app.gui.run_actions import RunController
 from app.gui.views.main_view import MainView
 from app.gui.views.settings_view import SettingsView
@@ -275,8 +279,17 @@ def main(page: ft.Page) -> None:
     )
     page.title = "Pixiv 下載器"
     page.theme_mode = _load_theme_mode()
-    page.theme = ft.Theme(color_scheme_seed="#0096FA", font_family=FONT_FAMILY)
-    page.dark_theme = ft.Theme(color_scheme_seed="#0096FA", font_family=FONT_FAMILY)
+    # 全域字型：repo 附帶的思源黑體（assets/fonts/NotoSansTC.ttf，經
+    # app/entry/main.py 的 assets_dir 提供）。檔案不在（例如以其他進入點
+    # 啟動、assets 沒帶到）就退回微軟正黑體 UI，不影響版面。
+    _font_file = Path(__file__).resolve().parents[2] / "assets" / "fonts" / "NotoSansTC.ttf"
+    if _font_file.is_file():
+        page.fonts = {FONT_FAMILY: FONT_ASSET_PATH}
+        _font_family = FONT_FAMILY
+    else:
+        _font_family = FONT_FALLBACK
+    page.theme = ft.Theme(color_scheme_seed="#0096FA", font_family=_font_family)
+    page.dark_theme = ft.Theme(color_scheme_seed="#0096FA", font_family=_font_family)
     theme = current_theme(page)
     page.window.width = 1100
     page.window.height = 750
@@ -418,8 +431,10 @@ def main(page: ft.Page) -> None:
                 main_view._countdown_text.value = f"倒數：{cd} 秒"
             if bool(_PERSISTENT_UI_STATE.get("is_paused", False)):
                 main_view._is_paused = True
-                # glass_pill 的 content 是 ft.Text — 改字走 .value。
-                main_view._btn_pause.content.value = "▶ 繼續"
+                # 控制膠囊 content 是 Row[Image, Text] — 走 glass 的 helper。
+                from app.gui.glass import set_pill_icon, set_pill_label
+                set_pill_label(main_view._btn_pause, "繼續")
+                set_pill_icon(main_view._btn_pause, "play")
         except Exception:
             _log.exception("failed to restore persisted UI state")
         main_view.set_running(True)
@@ -639,6 +654,17 @@ def main(page: ft.Page) -> None:
                 cookie, status = data
                 cookies_view.apply_cookie_test_result(str(cookie), str(status))
 
+    def handle_timechanged(data) -> None:
+        # Persist the advanced download_time cursor so the next run does not
+        # reuse the same timestamp prefix for thousands of files.
+        try:
+            text = str(data).strip() if data is not None else ""
+            if not text:
+                return
+            _settings_store().update_fields("download", {"download_time": text})
+        except Exception:
+            pass  # never crash the dispatcher
+
     def handle_phase(data) -> None:
         text = str(data) if data else ""
         main_view.set_phase(text)
@@ -655,6 +681,7 @@ def main(page: ft.Page) -> None:
         "cookie_status": handle_cookie_status,
         "phase":         handle_phase,
         "pause_state":   handle_pause_state,
+        "timechanged":   handle_timechanged,
     })
 
     # ── aurora background + floating layout ──────────────────────────────
@@ -679,13 +706,24 @@ def main(page: ft.Page) -> None:
         on_click=lambda e: toggle_theme(e),
     )
 
+    # 防抖：切主題是整頁重排（貴），快速連點會在 event loop 排隊一串
+    # 全頁重繪 → UI 卡死數秒。窗口內的重複點擊直接忽略。
+    _theme_toggle_last = [0.0]
+
     def toggle_theme(e: ft.ControlEvent) -> None:
+        now = time.monotonic()
+        if now - _theme_toggle_last[0] < 0.6:
+            return
+        _theme_toggle_last[0] = now
         page.theme_mode = (
             ft.ThemeMode.DARK
             if page.theme_mode == ft.ThemeMode.LIGHT
             else ft.ThemeMode.LIGHT
         )
-        _save_theme_mode(page.theme_mode)
+        # 設定寫檔是磁碟 I/O — 不能在 event loop 上做（會凍住 UI）。
+        threading.Thread(
+            target=_save_theme_mode, args=(page.theme_mode,), daemon=True,
+        ).start()
         # Recompute the glass theme and repaint theme-bound chrome in place.
         new_theme = current_theme(page)
         aurora.gradient = ft.LinearGradient(
@@ -704,6 +742,8 @@ def main(page: ft.Page) -> None:
             except Exception:
                 pass
         page.update()
+        # 全頁重排會把 log 捲回頂部 — 跟隨中就跳回底部。
+        main_view._log_panel.notify_relayout()
 
     page.appbar = ft.AppBar(
         title=_appbar_title,

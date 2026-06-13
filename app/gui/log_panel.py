@@ -24,9 +24,12 @@ import flet as ft
 
 from app.gui.log_format import html_to_spans
 
-_MAX_LOG_LINES = 2000
-# END 事件 extent_after 在這個距離內視為「貼底」。
-_BOTTOM_EPS = 8.0
+# 2000 行時整塊 selectable Text 的 Flutter 重排會卡住 event loop 數秒
+# （切主題、scroll_to 跳底都要重排整段文字）— 縮小緩衝直接降低重排成本。
+_MAX_LOG_LINES = 600
+# END 事件 extent_after 在這個距離內視為「貼底」。8px 太嚴：滾輪/拖曳常停在
+# 離底十幾 px，使用者以為已到底卻沒恢復跟隨（「跳到最新」顯得不靈敏）。
+_BOTTOM_EPS = 48.0
 
 
 class LogPanel:
@@ -139,6 +142,15 @@ class LogPanel:
             del self._text.spans[:n]
         # detached（如切到其他分頁）時不排程 scroll_to — 對已不渲染的
         # widget 發 _invoke_method 會在 event loop 堆積 awaited tasks。
+        if self._following and self._is_attached():
+            self._schedule_scroll_to_bottom()
+
+    def notify_relayout(self) -> None:
+        """整頁重排（開/關 dialog、page.update）後呼叫：跟隨中就跳回底部。
+
+        Flet 0.84 的全頁重排會把 ListView 捲回頂部；立即排程 scroll_to 讓
+        _scroll_pending 同時吃掉重排產生的「離底 END」事件，跟隨不被誤關。
+        """
         if self._following and self._is_attached():
             self._schedule_scroll_to_bottom()
 

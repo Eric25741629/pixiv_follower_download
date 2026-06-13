@@ -164,7 +164,7 @@ def test_partial_download_failure_still_refreshes_cookie_first_success():
         get_cooldown_avg=lambda: 0,
         pause_event=t._pause_event,
         stop_event=t._stop_event,
-        on_first_success=lambda account: refreshed.append(account.cookie),
+        on_success=lambda account: refreshed.append(account.cookie),
         on_disable=lambda account: disabled.append(account.cookie),
     )
     t._scheduler = scheduler

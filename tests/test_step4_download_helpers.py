@@ -151,7 +151,8 @@ def test_download_pid_group_uses_account_proxy_session(monkeypatch):
     t.q = __import__("queue").Queue()
     t._attempted_urls = set()
     t._attempted_urls_lock = __import__("threading").Lock()
-    t._current_account = AccountState(
+    t._current_account_local = __import__("threading").local()
+    t._current_account_local.account = AccountState(
         cookie="test_cookie", alias="A1", proxy_url="http://1.2.3.4:8080"
     )
     t.exist_pid = set()

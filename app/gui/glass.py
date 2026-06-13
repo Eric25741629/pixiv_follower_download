@@ -11,9 +11,12 @@ import flet as ft
 
 GITHUB_URL = "https://github.com/Eric25741629/pixiv_follower_download"
 
-# 全域字型：繁中 UI 在 Windows 上用微軟正黑體 UI，比 Flutter 預設的 CJK
-# fallback 粗實清晰。由 flet_app 接到 page.theme(font_family=FONT_FAMILY)。
-FONT_FAMILY = "Microsoft JhengHei UI"
+# 全域字型：思源黑體（Noto Sans TC），隨 repo 附在 assets/fonts/NotoSansTC.ttf
+# （flet_app 以 page.fonts 註冊）。深色背景上筆畫比微軟正黑體飽滿清晰。
+# 字型檔不存在時退回微軟正黑體 UI（FONT_FALLBACK），不會壞版面。
+FONT_FAMILY = "Noto Sans TC"
+FONT_FALLBACK = "Microsoft JhengHei UI"
+FONT_ASSET_PATH = "/fonts/NotoSansTC.ttf"   # 相對 assets_dir 的資產路徑
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,67 @@ def glass_panel(
     )
 
 
+# 膠囊圖標：自繪 SVG（圓角向量），取代不齊的 emoji 字符 ⏸⏹▶。
+# 24x24 viewBox；顏色由 style_pill 用前景色重染（重設 Image.src）。
+_PILL_ICON_SHAPES = {
+    "play": (
+        '<path d="M9 6.2 L17.8 12 L9 17.8 Z" fill="{c}" stroke="{c}"'
+        ' stroke-width="3" stroke-linejoin="round"/>'
+    ),
+    "pause": (
+        '<rect x="6.4" y="5" width="4.2" height="14" rx="2.1" fill="{c}"/>'
+        '<rect x="13.4" y="5" width="4.2" height="14" rx="2.1" fill="{c}"/>'
+    ),
+    "stop": '<rect x="6" y="6" width="12" height="12" rx="3" fill="{c}"/>',
+}
+
+
+def _pill_icon_svg(kind: str, color: str) -> bytes:
+    shape = _PILL_ICON_SHAPES[kind].format(c=color)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">{shape}</svg>'
+    ).encode()
+
+
+def pill_icon(kind: str, color: str, size: int = 13) -> ft.Image:
+    """一顆膠囊內嵌 SVG 圖標。``data`` 記住 kind，重染時重生 src。"""
+    return ft.Image(
+        src=_pill_icon_svg(kind, color), width=size, height=size, data=kind,
+    )
+
+
+def _pill_text(pill: ft.Container) -> ft.Text | None:
+    """取出膠囊裡的 ft.Text（純文字或 Row[Image, Text] 兩種結構）。"""
+    content = pill.content
+    if isinstance(content, ft.Text):
+        return content
+    if isinstance(content, ft.Row):
+        for c in content.controls:
+            if isinstance(c, ft.Text):
+                return c
+    return None
+
+
+def set_pill_label(pill: ft.Container, text: str) -> None:
+    """改膠囊文字 — 不論 content 是 Text 還是 Row[Image, Text]。"""
+    t = _pill_text(pill)
+    if t is not None:
+        t.value = text
+
+
+def set_pill_icon(pill: ft.Container, kind: str) -> None:
+    """換膠囊圖標（如 暫停⇄繼續），沿用目前文字的前景色。"""
+    content = pill.content
+    if not isinstance(content, ft.Row):
+        return
+    t = _pill_text(pill)
+    fg = (t.color if t is not None else None) or "#FFFFFF"
+    for c in content.controls:
+        if isinstance(c, ft.Image):
+            c.src = _pill_icon_svg(kind, fg)
+            c.data = kind
+
+
 def style_pill(pill: ft.Container, theme: GlassTheme, *, primary: bool = False) -> None:
     """就地重染一顆 glass_pill（主題切換時用，不重建控件）。"""
     fg = "#FFFFFF" if (primary and theme.name == "dark") else (
@@ -159,6 +223,12 @@ def style_pill(pill: ft.Container, theme: GlassTheme, *, primary: bool = False) 
     pill.border = ft.Border.all(1, theme.panel_border)
     if isinstance(pill.content, ft.Text):
         pill.content.color = fg
+    elif isinstance(pill.content, ft.Row):
+        for c in pill.content.controls:
+            if isinstance(c, ft.Text):
+                c.color = fg
+            elif isinstance(c, ft.Image) and c.data in _PILL_ICON_SHAPES:
+                c.src = _pill_icon_svg(c.data, fg)
 
 
 def glass_pill(
@@ -169,21 +239,95 @@ def glass_pill(
     on_click=None,
     width: int | None = None,
     disabled: bool = False,
+    icon: str | None = None,
 ) -> ft.Container:
-    """膠囊按鈕。primary=True 用 accent_fill 底；否則低透明白底。"""
+    """膠囊按鈕。primary=True 用 accent_fill 底；否則低透明白底。
+
+    ``icon`` 指定 ``_PILL_ICON_SHAPES`` 的 key（play/pause/stop）時，
+    content 為 Row[Image, Text]；改字請走 :func:`set_pill_label`。
+    """
+    # no_wrap: a fixed-width pill must never wrap its label to a second
+    # line — a wrapped label grows the pill vertically (oval pills bug).
+    label = ft.Text(text, size=13, weight=ft.FontWeight.W_600,
+                    text_align=ft.TextAlign.CENTER, no_wrap=True)
+    if icon:
+        content: ft.Control = ft.Row(
+            [pill_icon(icon, "#FFFFFF"), label],
+            spacing=7, tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+    else:
+        content = label
+    # 不可加 animate：flet 0.84 container.dart 的 ink 分支在 animate 非 None
+    # 時走 AnimatedContainer，而該分支把 padding 重複套在外層（InkWell 內層
+    # Container 已套過一次）→ 可點擊的膠囊比 disabled 的大一圈（disabled 不走
+    # ink 路徑）。
     pill = ft.Container(
-        content=ft.Text(text, size=13, weight=ft.FontWeight.W_600,
-                        text_align=ft.TextAlign.CENTER),
+        content=content,
         padding=ft.Padding(14, 8, 14, 8),
         border_radius=999,
         on_click=on_click,
         ink=on_click is not None,
         width=width,
         disabled=disabled,
-        animate=ft.Animation(150, ft.AnimationCurve.EASE_OUT),
     )
     style_pill(pill, theme, primary=primary)
     return pill
+
+
+class GlassProgressBar:
+    """全圓角進度條（雙層 Container），取代 ft.ProgressBar。
+
+    M3 LinearProgressIndicator 即使設了 border_radius，fill 交界處與
+    track 兩端仍是直角切邊（track-gap 樣式），和玻璃語彙的全圓角衝突。
+    這裡改用與統計頁長條圖相同的做法：圓角 track Container 內放一條
+    圓角 fill Container，寬度用 Row flex（千分比）控制。
+
+    介面模仿 ft.ProgressBar 的 value / color / bar_height / expand
+    屬性，main_view 的呼叫點與既有測試不用改；放進版面的控件是
+    ``.track``（wrapper 本身不是 Flet control）。
+    """
+
+    def __init__(self, *, color: str, bar_height: int = 12, radius: int = 6,
+                 bgcolor: str = "#1FFFFFFF"):
+        self.bar_height = bar_height
+        self.expand = True
+        self._value = 0.0
+        self._fill = ft.Container(
+            bgcolor=color, border_radius=radius, height=bar_height,
+            expand=False, visible=False,
+        )
+        self._rest = ft.Container(expand=1000)
+        self.track = ft.Container(
+            content=ft.Row([self._fill, self._rest], spacing=0),
+            bgcolor=bgcolor, border_radius=radius, height=bar_height,
+            expand=True,
+        )
+
+    @property
+    def value(self) -> float:
+        return self._value
+
+    @value.setter
+    def value(self, v) -> None:
+        try:
+            f = float(v or 0.0)
+        except (TypeError, ValueError):
+            f = 0.0
+        self._value = max(0.0, min(1.0, f))
+        k = round(self._value * 1000)
+        self._fill.visible = k > 0
+        self._fill.expand = k if k > 0 else False
+        self._rest.visible = k < 1000
+        self._rest.expand = (1000 - k) if k < 1000 else False
+
+    @property
+    def color(self):
+        return self._fill.bgcolor
+
+    @color.setter
+    def color(self, c) -> None:
+        self._fill.bgcolor = c
 
 
 def state_colors(theme: GlassTheme) -> dict[str, tuple[str, str]]:

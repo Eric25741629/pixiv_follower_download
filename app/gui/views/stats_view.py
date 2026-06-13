@@ -37,7 +37,9 @@ class StatsView:
             ft.Text("0:00:00", size=20, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER),
         ]
 
-        self._chart_container = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO)
+        # No scroll here — the outer build() Column already scrolls; nesting a
+        # second unbounded scrollable inside it is layout-fragile on Flet 0.84.
+        self._chart_container = ft.Column(spacing=6)
 
         # Flet 0.84's Tabs requires TabBar+TabBarView with separate content
         # bodies. Both modes here share one body, so a plain button toggle
@@ -123,12 +125,15 @@ class StatsView:
                 theme,
                 padding=16,
                 radius=theme.radius_sm,
-                width=160,
+                expand=1,
             )
             self._card_containers.append(panel)
             self._card_labels.append(label_text)
             cards.append(panel)
-        return ft.Row(controls=cards, wrap=True, spacing=12)
+        # wrap=True here rendered the whole row as an opaque gray block on
+        # Flet 0.84 (Wrap + glass Containers inside the scrollable Column);
+        # equal-expand cards in a plain Row sidestep it and scale with width.
+        return ft.Row(controls=cards, spacing=12)
 
     def start_auto_refresh(self) -> None:
         if self._refresh_task is not None:

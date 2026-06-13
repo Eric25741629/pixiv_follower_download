@@ -67,6 +67,11 @@ def test_source_mode_buttons_live_in_wrapping_mode_row(view):
     # 模式列 = [來源群組, 範圍群組]，wrap=True 讓縮窗時整組換行不重疊。
     assert view._mode_row.wrap is True
     assert view._mode_row.controls == [view._source_group, view._scope_row]
+    # 群組必須 tight=True（MainAxisSize.min）：非 tight 的巢狀 Row 在 Wrap 裡
+    # 會撐滿整行，導致來源與範圍永遠各佔一列。
+    assert view._source_group.tight is True
+    assert view._scope_row.tight is True
+    assert view._source_mode_controls.tight is True
     assert view._source_mode_controls.controls == [
         view._btn_source_following,
         view._btn_source_bookmarks,

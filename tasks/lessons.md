@@ -1,5 +1,25 @@
 # Lessons
 
+## settings.json 是無鎖 read-modify-write:combined/Step4 下「GUI 數值偶爾不更新」要先想到跨 section 互相覆蓋
+
+症狀(使用者回報):combined(3+4)下載成功、cookie 可用,但 cookies 頁狀態/檢查時間「不是動態的」、不刷新。單跑步驟 3 看起來正常。
+
+關鍵證據(不是用猜的):讀 `settings.json` 確認 10 個 cookie 全是「有效」、且 6 個 `last_tested_at` 是 ~18 分鐘前(=真的有刷新過),4 個是 9 小時前 → 刷新機制「有時成功有時失敗」=競態,不是邏輯死路。再追到 `SettingsStore.update_section/update_fields` 是 `load→改一個 section→save 整份檔` 且**完全沒鎖**,`_store()` 每次 new 一個實例(實例鎖無效)。combined 每個 PID 由 dispatcher 執行緒寫 `download.download_time`(`handle_timechanged`),worker 執行緒寫 `auth.cookies_entries`(cookie 刷新),兩執行緒各存整份 → 後者用舊快照蓋掉前者那個 section。
+
+修法:module 級 per-path `RLock`(所有實例共用,key=絕對路徑),包住所有 `update_*`/`migrate`。決定性測試:讓 A 在 RMW 中途 park、B 寫另一 section、A 再存,斷言兩個 section 都還在;壓力測試未修前 60 次只剩 27(丟 33)。
+
+規則:
+1. **「值偶爾不更新/被回退」+ 多執行緒 + 共用 JSON 設定檔 → 先查 read-modify-write 競態**,不要急著找邏輯錯。`load→改→save 整份` 沒鎖,任兩個寫「不同 section」的執行緒都會互相吃掉。
+2. **用真資料先證偽假設**:直接讀 `settings.json` 看 `last_tested_at` 分佈(部分新、部分舊)就知道是競態而非「完全沒接線」。比讀程式碼猜更快定位。
+3. 共用設定檔的鎖必須是 **module/class 級且 key 在檔案路徑**,因為 store 是每次 new 的;掛在 `self` 上等於沒鎖。
+4. 使用者直覺「3+4 整合問題」常常方向對(競爭者=combined 每 PID 的 timechanged 寫入),但根因未必在他指的那個檔——要追到共用資源(settings.json)。
+
+**補(2026-06-14,被使用者證偽後的真根因)**:上面 settings RMW 競態是真 bug 但**只是次要**。使用者回報「還是沒刷新」後,我讀**當下** `settings.json`:現在 00:21、檔案 mtime 00:20(這輪一直在寫),但 10 個 cookie 的 `last_tested_at` 全凍在 2~3 小時前(各自首次使用時間)。→ 不是寫入被吃掉,是**根本沒再寫 cookie 時間**。真根因:刷新掛 `AccountScheduler.on_first_success`,`_used_cookies` 閘門讓它**每個 cookie 每輪只觸發一次**;長跑一輪就凍在首次使用時間。修法:改成 `on_success` 每次 `release(ok=True)` 都回呼 → 每次成功使用都刷時間。
+
+5. **被回報「還是沒好」時,先讀「當下」的真實狀態去證偽自己的修法,不要急著再補一個修法。** 這次的決定性證據是「檔案 mtime 是現在、但目標欄位卻凍在數小時前」=「有人在寫檔但沒寫這個欄位」→ 直接指向「這個欄位的更新路徑根本沒被觸發」,而不是「被別的寫入蓋掉」。一個 `ls -la mtime` + 欄位時間戳的對照,比再讀一遍程式碼猜更快分辨「沒觸發」vs「被覆蓋」。
+6. **GUI 數值「該動態卻凍住」要分清楚兩種**:(a) 完全沒更新路徑(壞);(b) 有更新但**設計上只觸發一次**(on_first_success 這種 once-per-run)。使用者要的是「動態=每次都動」,once-per-run 在長任務裡看起來就跟壞掉一樣。
+7. **Flet 不熱載入**:改完碼若使用者沒重啟,他看到的永遠是舊行為。回報修復時必須明講「要重啟 app」,否則「還是沒好」可能只是沒載入新碼,白白多繞一輪。
+
 ## 邊查邊下:整體進度條在「進入下一個 PID」時消失(真根因,推翻下面那條 Row reflow 假設)
 
 症狀(使用者多次回報,視窗全程開著):整體進度條+總數+ETA 其實**會顯示**,但只在「某 PID 全部分頁下載完、下一個 PID 還沒進 p0」的空檔出現;**一進入下一個 PID 的 p0 就整個消失**。本作分頁與 log 全程正常。

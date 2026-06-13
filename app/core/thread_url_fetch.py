@@ -1,3 +1,4 @@
+import contextlib
 import time
 import json
 import os
@@ -1528,6 +1529,9 @@ class get_img_url_thread(PauseableThread):
 
             # Pick up any mid-run 「儲存設定」 before filtering/querying this PID.
             self._apply_live_settings_if_changed()
+
+            with contextlib.suppress(Exception):
+                self._q.put(WorkerEvent("phase", f"正在查詢：PID {pid}"))
 
             if self._scheduler is not None:
                 one, stop = self._fetch_one_pid_via_scheduler(pid)

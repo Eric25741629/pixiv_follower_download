@@ -167,6 +167,37 @@ def test_append_log_does_not_schedule_scroll_when_detached():
     assert called == []
 
 
+# ---------------------------------------------------------------- relayout
+
+def test_notify_relayout_schedules_scroll_when_following_and_attached():
+    # 按下停止（show_dialog + page.update）等整頁重排會把 log 捲回頂部 —
+    # 跟隨中必須排程跳回底部。
+    p = make_panel()
+    called = []
+    p._schedule_scroll_to_bottom = lambda: called.append(True)
+    p._is_attached = lambda: True
+    p.notify_relayout()
+    assert called == [True]
+
+
+def test_notify_relayout_noop_when_not_following():
+    p = make_panel()
+    p._on_wheel(wheel(-40.0))
+    called = []
+    p._schedule_scroll_to_bottom = lambda: called.append(True)
+    p._is_attached = lambda: True
+    p.notify_relayout()
+    assert called == []
+
+
+def test_notify_relayout_noop_when_detached():
+    p = make_panel()  # 測試環境必然 detached
+    called = []
+    p._schedule_scroll_to_bottom = lambda: called.append(True)
+    p.notify_relayout()
+    assert called == []
+
+
 # ---------------------------------------------------------------- 控件結構
 
 def test_text_is_single_selectable_control():

@@ -213,6 +213,17 @@ def test_invalidate_cookie_status_writes_失效(run_controller, monkeypatch):
     assert new_entries[0]["last_tested_at"] > 1.0  # bumped to now
     assert new_entries[1] == {"cookie": "c2", "alias": "A2"}  # untouched
 
+    # A live cookie_status event must be emitted so the cookies view flips to
+    # 失效 immediately, not only after the next reload_from_settings.
+    events = []
+    while not run_controller._event_q.empty():
+        events.append(run_controller._event_q.get_nowait())
+    cookie_status = [e for e in events if getattr(e, "type", None) == "cookie_status"]
+    assert cookie_status, "on_disable must emit a cookie_status event"
+    payload = cookie_status[-1].data
+    assert payload[0] == "c1"
+    assert payload[1] == "失效"
+
 
 def test_attach_aliases_pairs_cookies_with_alias_map(run_controller):
     auth = {

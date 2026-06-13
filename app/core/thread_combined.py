@@ -123,6 +123,7 @@ class combined_thread(PauseableThread):
         tag_strip_brackets=False,
         tag_strip_special_chars=False,
         author_order=False,
+        set_file_mtime=True,
         special_like_rules=None,
         rescrape_within_days=365,
         scheduler=None,
@@ -164,7 +165,8 @@ class combined_thread(PauseableThread):
             filename_template=filename_template,
             tag_strip_brackets=tag_strip_brackets,
             tag_strip_special_chars=tag_strip_special_chars,
-            author_order=author_order, stats_collector=stats_collector,
+            author_order=author_order, set_file_mtime=set_file_mtime,
+            stats_collector=stats_collector,
             event_log=event_log,
             defer_step4_scan=True, db_base_path=self.path,
             live=live,
@@ -291,6 +293,13 @@ class combined_thread(PauseableThread):
         self.fetcher._apply_live_settings_if_changed()
         self.downloader._apply_live_settings_if_changed()
         self._last_pid_ok = False
+        # Phase BEFORE acquire: the cooldown wait happens inside
+        # _acquire_account, so emitting here lets the UI show
+        # 「正在查詢：PID x」(or 正在下載) alongside the 倒數 ticks instead of
+        # leaving the previous PID's label on screen during the wait.
+        with contextlib.suppress(Exception):
+            verb = "正在查詢" if needs_query else "正在下載"
+            self._q.put(WorkerEvent("phase", f"{verb}：PID {pid}"))
         acc = self._acquire_account()
         if acc is None:
             return None  # stop signal / all disabled -> caller breaks
@@ -308,6 +317,8 @@ class combined_thread(PauseableThread):
                 # "bar disappears when the next PID starts" bug. combined owns
                 # overall progress (one tick per PID in run()), so drop the
                 # fetcher's progress events for the duration of the query.
+                # (The 「正在查詢」 phase event was already emitted before
+                # _acquire_account so the countdown wait shows it.)
                 prev_fetcher_q = self.fetcher._q
                 self.fetcher._q = _DropOverallProgressQueue(prev_fetcher_q)
                 try:
@@ -329,7 +340,9 @@ class combined_thread(PauseableThread):
                 # Seed the pending pages before download so a partial failure /
                 # crash leaves a recoverable pending trail in the DB.
                 self._seed_pending_urls(pid, urls)
-                self.downloader._current_account = acc
+                with contextlib.suppress(Exception):
+                    self._q.put(WorkerEvent("phase", f"正在下載：PID {pid}"))
+                self.downloader._set_current_download_account(acc)
                 account_ok, failed, _ = self._run_with_network_retry(
                     f"PID {pid} 下載",
                     lambda: self._download_pid_group_with_page_progress(pid, urls),
@@ -361,7 +374,7 @@ class combined_thread(PauseableThread):
             else:
                 self._clear_page_progress()
         finally:
-            self.downloader._current_account = None
+            self.downloader._clear_current_download_account()
             self._release_account(acc, ok=ok and account_ok)
             with contextlib.suppress(Exception):
                 sess.close()
@@ -450,6 +463,12 @@ class combined_thread(PauseableThread):
                 if needs_query and self._last_pid_ok:
                     self.fetcher._mark_pid_processed(pid)
                 self._q.put(WorkerEvent("progress", (1, total)))
+                # Persist the advanced timetag counter after every PID —
+                # combined never runs Step 4's finalize, so without this the
+                # next run reuses the same download_time start and stamps
+                # duplicate filename prefixes.
+                with contextlib.suppress(Exception):
+                    self.downloader._emit_timechanged()
 
             self._finalize(failed_nested)
         except Exception as e:

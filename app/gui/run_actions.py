@@ -482,6 +482,12 @@ class RunController:
                 else:
                     new_entries.append(e)
             store.update_section("auth", {**auth, "cookies_entries": new_entries})
+            # Mirror _refresh_cookie_timestamp: push a live cookie_status event
+            # so a cookie disabled mid-run flips to 失效 in the cookies view
+            # immediately, not only after the next reload_from_settings.
+            self._event_q.put(
+                WorkerEvent("cookie_status", (cookie.strip(), "失效", now))
+            )
         except Exception:
             pass
 
@@ -533,7 +539,7 @@ class RunController:
             emit=self._log,
             q=self._event_q,
             on_disable=lambda acc: self._invalidate_cookie_status(acc.cookie),
-            on_first_success=lambda acc: self._refresh_cookie_timestamp(acc.cookie),
+            on_success=lambda acc: self._refresh_cookie_timestamp(acc.cookie),
         )
 
     def _start_step(self, n: int) -> None:
@@ -754,6 +760,7 @@ class RunController:
             tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
             tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
             author_order=bool(dl.get("author_order", False)),
+            set_file_mtime=bool(dl.get("set_file_mtime", True)),
             rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
             stats_collector=self._stats_collector, event_log=self._event_log,
             live=self._live,
@@ -810,6 +817,7 @@ class RunController:
             tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
             tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
             author_order=bool(dl.get("author_order", False)),
+            set_file_mtime=bool(dl.get("set_file_mtime", True)),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
             live=self._live,

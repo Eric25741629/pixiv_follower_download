@@ -69,23 +69,23 @@ class CookiesView:
             label="全選", value=False, on_change=self._on_toggle_all,
         )
         self._btn_test_selected = glass_pill(
-            "測試選取", theme, primary=True,
+            "測試選取", theme, primary=True, width=120,
             on_click=self._on_test_selected,
         )
         self._btn_test_all = glass_pill(
-            "測試全部", theme,
+            "測試全部", theme, width=120,
             on_click=self._on_test_all,
         )
         self._btn_enable_selected = glass_pill(
-            "啟用選取", theme,
+            "啟用選取", theme, width=120,
             on_click=lambda e: self._set_enabled_for_selected(True),
         )
         self._btn_disable_selected = glass_pill(
-            "禁用選取", theme,
+            "禁用選取", theme, width=120,
             on_click=lambda e: self._set_enabled_for_selected(False),
         )
         self._btn_auto_pair = glass_pill(
-            "自動配對", theme,
+            "自動配對", theme, width=120,
             on_click=self._on_auto_pair,
         )
         # Replaced DataTable with a ListView of compact custom rows.
@@ -519,7 +519,7 @@ class CookiesView:
         header = ft.Row([
             ft.Text("Cookies", size=20, weight=ft.FontWeight.BOLD),
             self._count_text,
-            glass_pill("+ 新增", current_theme(self._page), primary=True,
+            glass_pill("+ 新增", current_theme(self._page), primary=True, width=120,
                        on_click=lambda e: self._open_edit_dialog(None)),
             self._select_all_cb,
             self._btn_test_selected,

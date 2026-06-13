@@ -47,6 +47,20 @@ def test_update_page_progress_resets_when_pid_changes(view):
     assert "分頁 1/3" in view._page_progress_text.value
 
 
+def test_update_page_progress_hidden_for_single_page_artwork(view):
+    """單張作品（total == 1）不顯示第二條進度條 — 1/1 沒有資訊量。"""
+    view.update_page_progress(1, 1, "999")
+
+    assert view._page_progress_row.visible is False
+    assert view._page_progress_text.value == ""
+    assert view._page_progress_bar.value == 0
+
+    # A following multi-page artwork must still reveal the row.
+    view.update_page_progress(1, 4, "1000")
+    assert view._page_progress_row.visible is True
+    assert "分頁 1/4" in view._page_progress_text.value
+
+
 def test_update_page_progress_hides_for_non_positive_total_and_clear(view):
     view.update_page_progress(1, 5, "123")
 
@@ -62,3 +76,29 @@ def test_update_page_progress_hides_for_non_positive_total_and_clear(view):
     assert view._page_progress_row.visible is False
     assert view._page_progress_text.value == ""
     assert view._page_progress_bar.value == 0
+
+
+def test_downloading_pid_shown_even_when_bar_hidden(view):
+    """單頁作品隱藏分頁條，但 meta 列的「正在下載：PID」必須照常顯示。"""
+    view.update_page_progress(1, 1, "999")
+
+    assert view._page_progress_row.visible is False
+    assert view._downloading_text.value == "正在下載：PID 999"
+
+
+def test_downloading_pid_updates_and_clears_on_terminal_clear(view):
+    view.update_page_progress(1, 4, "123")
+    assert view._downloading_text.value == "正在下載：PID 123"
+
+    view.update_page_progress(1, 3, "456")
+    assert view._downloading_text.value == "正在下載：PID 456"
+
+    # terminal clear（finished / next=-1 / combined 每 PID 收尾）才清掉
+    view.clear_page_progress()
+    assert view._downloading_text.value == ""
+
+
+def test_downloading_text_sits_before_eta_on_meta_row(view):
+    controls = view._meta_row.controls
+    assert controls.index(view._downloading_text) < controls.index(view._eta_text)
+    assert controls.index(view._eta_text) < controls.index(view._countdown_text)

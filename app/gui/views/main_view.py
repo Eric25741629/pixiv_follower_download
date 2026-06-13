@@ -7,10 +7,13 @@ import flet as ft
 
 from app.core.worker_event import WorkerEvent
 from app.gui.glass import (
+    GlassProgressBar,
     current_theme,
     glass_dialog,
     glass_panel,
     glass_pill,
+    set_pill_icon,
+    set_pill_label,
     state_colors,
     style_pill,
 )
@@ -73,17 +76,18 @@ class MainView:
         # from settings and refreshed when the user returns to the 主頁 tab.
         self._combined_mode = False
 
-        # 控制鈕＝glass_pill 膠囊（與模式列同語彙）。標籤改字一律走
-        # pill.content.value（內部 ft.Text），不再對 content 指派字串；
-        # 啟用/停用走 _set_pill_enabled（disabled + 半透明）。
+        # 控制鈕＝glass_pill 膠囊（與模式列同語彙），內嵌自繪 SVG 圖標
+        # （play/pause/stop）。標籤改字走 set_pill_label、換圖標走
+        # set_pill_icon（content 是 Row[Image, Text]，不可對 content 指派
+        # 字串）；啟用/停用走 _set_pill_enabled（disabled + 半透明）。
         self._btn_run_all = self._make_action_pill(
-            "▶ 一鍵執行", primary=True, on_click=self._on_run_all,
+            "一鍵執行", icon="play", primary=True, on_click=self._on_run_all,
         )
         self._btn_pause = self._make_action_pill(
-            "⏸ 暫停", on_click=self._on_pause_toggle, enabled=False,
+            "暫停", icon="pause", on_click=self._on_pause_toggle, enabled=False,
         )
         self._btn_stop = self._make_action_pill(
-            "⏹ 停止", on_click=self._on_stop, enabled=False,
+            "停止", icon="stop", on_click=self._on_stop, enabled=False,
         )
         self._is_paused = False
         self._cards_disabled = False
@@ -109,7 +113,13 @@ class MainView:
         self._page_progress_total = 0
         self._page_progress_pid = ""
 
-        # ── meta line (ETA + cooldown countdown), indented under the bars ────
+        # ── meta line (正在下載 PID + ETA + cooldown countdown) ──────────────
+        # 獨立於第二進度條：單頁作品會隱藏分頁條（t<=1），但「正在下載：PID」
+        # 與倒數計時必須照常顯示，所以放在永遠可見的 meta 列上。
+        self._downloading_text = ft.Text(
+            "", size=12, color=current_theme(page).info,
+            weight=ft.FontWeight.W_600,
+        )
         self._eta_text = ft.Text(
             "", size=12, color=current_theme(page).text_secondary
         )
@@ -120,6 +130,7 @@ class MainView:
         self._meta_row = ft.Row(
             controls=[
                 ft.Container(width=_PROG_LEAD_W),
+                self._downloading_text,
                 self._eta_text,
                 self._countdown_text,
             ],
@@ -219,6 +230,7 @@ class MainView:
                 self._btn_scope_all,
             ],
             spacing=6,
+            tight=True,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         # Backward-compatible alias for older tests / callers.
@@ -226,11 +238,13 @@ class MainView:
         self._source_mode_controls = ft.Row(
             controls=[self._btn_source_following, self._btn_source_bookmarks],
             spacing=6,
+            tight=True,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         self._source_group = ft.Row(
             controls=[self._source_label, self._source_mode_controls],
             spacing=8,
+            tight=True,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         self._mode_row = ft.Row(
@@ -242,16 +256,18 @@ class MainView:
         )
 
     def _make_action_pill(
-        self, label: str, *, primary: bool = False, on_click=None,
-        enabled: bool = True,
+        self, label: str, *, icon: str | None = None, primary: bool = False,
+        on_click=None, enabled: bool = True,
     ) -> ft.Container:
         """glass_pill for the run/pause/stop controls.
 
-        The pill's ``content`` is an ``ft.Text``; change its label via
-        ``pill.content.value`` (never assign a string to ``content``).
+        With ``icon`` the pill's ``content`` is a ``Row[Image, Text]``;
+        change its label via :func:`set_pill_label`, its icon via
+        :func:`set_pill_icon` (never assign a string to ``content``).
         """
         pill = glass_pill(
-            label, current_theme(self._page), primary=primary, on_click=on_click,
+            label, current_theme(self._page), icon=icon, primary=primary,
+            on_click=on_click,
         )
         self._set_pill_enabled(pill, enabled)
         return pill
@@ -310,9 +326,12 @@ class MainView:
             self._step_card_containers[i].bgcolor = bg
             self._step_card_texts[i].color = fg
         self._phase_label.color = theme.info
-        # 進度條雙色 + 控制鈕/模式列膠囊就地重染。
+        # 進度條雙色 + meta 列 + 控制鈕/模式列膠囊就地重染。
         self._progress_bar.color = theme.accent
         self._page_progress_bar.color = theme.info
+        self._downloading_text.color = theme.info
+        self._eta_text.color = theme.text_secondary
+        self._countdown_text.color = theme.warning
         style_pill(self._btn_run_all, theme, primary=True)
         style_pill(self._btn_pause, theme)
         style_pill(self._btn_stop, theme)
@@ -321,7 +340,7 @@ class MainView:
         # 模式 pills 由 apply_source_mode 以新 theme 重建。
         self.refresh_source_mode()
         self._safe_update(
-            self._progress_row, self._page_progress_row,
+            self._progress_row, self._page_progress_row, self._meta_row,
             self._btn_run_all, self._btn_pause, self._btn_stop,
             self._source_label,
         )
@@ -522,13 +541,12 @@ class MainView:
         :meth:`_render_progress_row`.
         """
         theme = current_theme(self._page)
-        bar = ft.ProgressBar(
-            value=0,
-            expand=True,
-            bar_height=_PROG_BAR_HEIGHT,
-            border_radius=_PROG_BAR_RADIUS,
+        # GlassProgressBar（圓角 track + 圓角 fill）取代 ft.ProgressBar —
+        # M3 進度條的 fill/track 切邊是直角，與全圓角的玻璃語彙混搭突兀。
+        bar = GlassProgressBar(
             color=color,
-            bgcolor="#1FFFFFFF",
+            bar_height=_PROG_BAR_HEIGHT,
+            radius=_PROG_BAR_RADIUS,
         )
         text = ft.Text(
             "",
@@ -542,7 +560,7 @@ class MainView:
             controls=[
                 ft.Text(label, size=12, color=theme.text_secondary,
                         width=_PROG_LEAD_W),
-                bar,
+                bar.track,
                 text,
             ],
             spacing=_PROG_ROW_SPACING,
@@ -624,8 +642,13 @@ class MainView:
         except (TypeError, ValueError):
             return
         pid_text = "" if pid is None else str(pid)
-        if t <= 0:
-            self.clear_page_progress()
+        # 「正在下載：PID」獨立於分頁條 — 單頁作品也要顯示目前下載對象。
+        if pid_text:
+            self._set_downloading_pid(pid_text)
+        # 單張作品（page_count == 1）沒有「分頁」可言 — 顯示 1/1 只是噪音，
+        # 只隱藏第二條進度條（meta 列的 PID／倒數照常顯示）。
+        if t <= 1:
+            self._hide_page_progress_bar()
             return
 
         if pid_text != self._page_progress_pid:
@@ -645,7 +668,17 @@ class MainView:
             self._page_progress_text, self._page_progress_value, t, trailing,
         )
 
-    def clear_page_progress(self) -> None:
+    def _set_downloading_pid(self, pid_text: str) -> None:
+        self._set_downloading_status(f"正在下載：PID {pid_text}" if pid_text else "")
+
+    def _set_downloading_status(self, value: str) -> None:
+        """Single render slot for the current-PID status (查詢中/下載中)."""
+        if self._downloading_text.value != value:
+            self._downloading_text.value = value
+            self._safe_update(self._meta_row)
+
+    def _hide_page_progress_bar(self) -> None:
+        """只收掉第二條進度條本體，保留 meta 列（正在下載／倒數）。"""
         self._page_progress_value = 0
         self._page_progress_total = 0
         self._page_progress_pid = ""
@@ -653,6 +686,10 @@ class MainView:
             self._page_progress_row, self._page_progress_bar,
             self._page_progress_text, 0, 0, "",
         )
+
+    def clear_page_progress(self) -> None:
+        self._hide_page_progress_bar()
+        self._set_downloading_pid("")
 
     def _format_eta(self, now: float) -> str:
         if self._progress_started_at is None:
@@ -685,8 +722,18 @@ class MainView:
         self._safe_update(self._meta_row)
 
     def set_phase(self, text: str) -> None:
-        """Update the phase indicator row below the progress bar."""
-        has_text = bool(text and text.strip())
+        """Update the phase indicator row below the progress bar.
+
+        「正在查詢/正在下載」 per-PID messages are routed to the meta row's
+        正在下載 slot instead — the meta row (next to ETA/倒數) is where the
+        current PID already shows, so rendering them in the phase row too
+        would duplicate the same PID on two lines.
+        """
+        t = (text or "").strip()
+        if t.startswith("正在查詢") or t.startswith("正在下載"):
+            self._set_downloading_status(t)
+            return
+        has_text = bool(t)
         self._phase_label.value = text if has_text else ""
         self._phase_row.visible = has_text
         try:
@@ -714,6 +761,10 @@ class MainView:
             self._page.update()
         except Exception:
             pass
+        # show_dialog/pop_dialog 引發的整頁重排會把 log 捲回最上方（按下停止
+        # 時最明顯）— 跟隨中就排程跳回底部，且 pending 旗標會吃掉重排產生的
+        # 「離底 END」事件，避免跟隨被誤關。
+        self._log_panel.notify_relayout()
 
     def set_running(self, is_running: bool) -> None:
         self._set_pill_enabled(self._btn_pause, is_running)
@@ -724,7 +775,8 @@ class MainView:
         # run starts, otherwise the button could keep saying "繼續" with no
         # active worker to resume.
         self._is_paused = False
-        self._btn_pause.content.value = "⏸ 暫停"
+        set_pill_label(self._btn_pause, "暫停")
+        set_pill_icon(self._btn_pause, "pause")
         if not is_running:
             self.set_phase("")
 
@@ -771,7 +823,8 @@ class MainView:
                 except Exception:
                     pass
             self._is_paused = False
-            self._btn_pause.content.value = "⏸ 暫停"
+            set_pill_label(self._btn_pause, "暫停")
+            set_pill_icon(self._btn_pause, "pause")
         else:
             if hasattr(t, "pause"):
                 try:
@@ -779,7 +832,8 @@ class MainView:
                 except Exception:
                     pass
             self._is_paused = True
-            self._btn_pause.content.value = "▶ 繼續"
+            set_pill_label(self._btn_pause, "繼續")
+            set_pill_icon(self._btn_pause, "play")
         try:
             self._btn_pause.update()
         except Exception:

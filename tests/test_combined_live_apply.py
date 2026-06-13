@@ -19,6 +19,12 @@ def test_combined_process_one_pid_refreshes_fetcher_and_downloader_before_work()
         def _apply_live_settings_if_changed(self):
             calls.append(self.name)
 
+        def _set_current_download_account(self, acc):
+            pass
+
+        def _clear_current_download_account(self):
+            pass
+
     class _Acc:
         cookie = "cookie"
         proxy_url = None
