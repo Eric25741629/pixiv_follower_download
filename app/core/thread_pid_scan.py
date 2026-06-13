@@ -205,8 +205,10 @@ class get_pixiv_author_imgID_Thread(PauseableThread, _Step2BookmarkMixin,
         # 增量寫入用：避免兩個 worker 同時 flush；用 try-acquire 跳過已在跑的呼叫
         self._step2_flush_lock = threading.Lock()
         # Serialises the per-artist user_id backfill DB writes across the 2
-        # scan workers (no busy_timeout is set on the connection, so concurrent
-        # writers would otherwise risk "database is locked").
+        # scan workers. MetadataDB already serialises its own writes under an
+        # internal lock and opens connections with a 30s busy_timeout, so this
+        # is a belt-and-suspenders guard against contention, not a correctness
+        # requirement.
         self._step2_db_write_lock = threading.Lock()
         self._step2_artists_done = 0
 
@@ -419,8 +421,8 @@ class get_pixiv_author_imgID_Thread(PauseableThread, _Step2BookmarkMixin,
 
         只在開啟 author_order（或一次性 force_rescan 重掃）時做（其餘情況零
         成本）。DB 寫入經 ``_step2_db_write_lock`` 序列化，避免兩條掃描 worker
-        同時寫（連線沒設 busy_timeout）。全程吞例外——best-effort，失敗下次
-        重跑會自癒。
+        同時寫；MetadataDB 本身也以內部鎖序列化寫入並設了 30s busy_timeout，
+        故此鎖只是額外保險。全程吞例外——best-effort，失敗下次重跑會自癒。
         """
         if not (getattr(self, "author_order", False) or getattr(self, "force_rescan", False)):
             return
@@ -523,7 +525,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread, _Step2BookmarkMixin,
             _current_pid_num = pid_num
             _current_pid_len = pid_len
         if not self._stop_event.is_set():
-            self._q.put(WorkerEvent("progress", (1, _current_pid_len - 1)))
+            self._q.put(WorkerEvent("progress", (1, _current_pid_len)))
         self._pause_event.wait()
         if self._stop_event.is_set():
             return 'stop'

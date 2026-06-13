@@ -249,7 +249,7 @@ class _Step2IncrementalIOMixin:
         with self._step2_skip_lock:
             skip_lines = sorted(
                 [str(x) for x in self._step2_early_skip_pids if str(x).strip()],
-                key=lambda s: int(s) if str(s).isdigit() else str(s),
+                key=lambda s: (0, int(s)) if str(s).isdigit() else (1, str(s)),
             )
         atomic_write_text(skip_file, skip_lines, backup=True)
         try:

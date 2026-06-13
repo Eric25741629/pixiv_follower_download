@@ -227,10 +227,16 @@ class PauseableThread(threading.Thread):
         else:
             selected = str(self.cookies or "").strip()
         try:
-            self._pid_cookie_selection[pid_key] = selected
-            alias_cache = getattr(self, "_pid_cookie_alias_selection", None)
-            if alias_cache is not None:
-                alias_cache[pid_key] = cookie_usage_label(selected, self.cookie_pool, self._cookie_alias_map)
+            # setdefault under the cookie-usage lock so two pool workers racing
+            # on the same fresh PID agree on one cookie (first writer wins).
+            with self._cookie_usage_lock:
+                selected = self._pid_cookie_selection.setdefault(pid_key, selected)
+                alias_cache = getattr(self, "_pid_cookie_alias_selection", None)
+                if alias_cache is not None:
+                    alias_cache.setdefault(
+                        pid_key,
+                        cookie_usage_label(selected, self.cookie_pool, self._cookie_alias_map),
+                    )
         except Exception:
             pass
         return selected

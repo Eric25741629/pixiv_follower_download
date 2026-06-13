@@ -212,6 +212,10 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         self._pending_pid_file_path = os.path.join(self.path, "pictures_id.txt")
         self._pending_pid_lock = threading.Lock()
         self._pending_pid_remaining = set()
+        # Per-PID filter-decision cache; cleared by _apply_live_settings_if_changed
+        # on a live settings change. Initialized here so the first mid-run change
+        # does not hit an AttributeError (only the download thread defines it too).
+        self._pid_filter_decision = {}
 
     def _load_cookie_requirement_cache(self):
         """Populate self._cookie_requirement_map from the saved trace JSON."""

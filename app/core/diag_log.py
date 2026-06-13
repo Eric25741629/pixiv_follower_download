@@ -24,6 +24,7 @@ import contextlib
 import logging
 import logging.handlers
 import os
+import threading
 import time
 
 # Channel -> on-disk file stem. Public names callers pass to the helpers below.
@@ -33,6 +34,7 @@ WORKER = "worker"
 
 _LOG_SUBDIR = "logs"
 _loggers: dict[str, logging.Logger] = {}
+_loggers_lock = threading.Lock()
 _enabled = True
 
 
@@ -55,22 +57,29 @@ def _get(channel: str) -> logging.Logger | None:
     lg = _loggers.get(channel)
     if lg is not None:
         return lg
-    lg = logging.getLogger(f"pixiv.diag.{channel}")
-    lg.setLevel(logging.INFO)
-    lg.propagate = False  # keep diagnostics out of app.log / stderr
-    if not lg.handlers:  # idempotent across re-imports / re-inits
-        try:
-            handler = logging.handlers.RotatingFileHandler(
-                os.path.join(_logs_dir(), f"{channel}.log"),
-                maxBytes=8 * 1024 * 1024, backupCount=5, encoding="utf-8",
-            )
-            # Default asctime already carries ",mmm" millisecond precision.
-            handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-            lg.addHandler(handler)
-        except Exception:
-            return None
-    _loggers[channel] = lg
-    return lg
+    # Lazy init under a lock (double-checked) so two threads racing on first
+    # use of a channel can't each attach a RotatingFileHandler (double-logged
+    # lines).
+    with _loggers_lock:
+        lg = _loggers.get(channel)
+        if lg is not None:
+            return lg
+        lg = logging.getLogger(f"pixiv.diag.{channel}")
+        lg.setLevel(logging.INFO)
+        lg.propagate = False  # keep diagnostics out of app.log / stderr
+        if not lg.handlers:  # idempotent across re-imports / re-inits
+            try:
+                handler = logging.handlers.RotatingFileHandler(
+                    os.path.join(_logs_dir(), f"{channel}.log"),
+                    maxBytes=8 * 1024 * 1024, backupCount=5, encoding="utf-8",
+                )
+                # Default asctime already carries ",mmm" millisecond precision.
+                handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+                lg.addHandler(handler)
+            except Exception:
+                return None
+        _loggers[channel] = lg
+        return lg
 
 
 def log(channel: str, message: str) -> None:

@@ -294,7 +294,8 @@ class MetadataDB(_MigrationMixin, _ArtworkMixin, _PagesMixin, _ClosedSetMixin):
         cur = self._conn().execute(
             "SELECT tags, like_count, page_count, img_url_template, "
             "requires_cookie, meta_updated_at, upload_date "
-            "FROM artworks WHERE pid = ? AND meta_updated_at IS NOT NULL",
+            "FROM artworks WHERE pid = ? AND meta_updated_at IS NOT NULL "
+            "AND meta_updated_at != '0001-01-01 00:00:00'",
             (pid_key,),
         )
         row = cur.fetchone()
@@ -321,14 +322,16 @@ class MetadataDB(_MigrationMixin, _ArtworkMixin, _PagesMixin, _ClosedSetMixin):
             return False
         cur = self._conn().execute(
             "SELECT 1 FROM artworks WHERE pid = ? "
-            "AND meta_updated_at IS NOT NULL LIMIT 1", (pid_key,)
+            "AND meta_updated_at IS NOT NULL "
+            "AND meta_updated_at != '0001-01-01 00:00:00' LIMIT 1", (pid_key,)
         )
         return cur.fetchone() is not None
 
     def meta_count(self) -> int:
         """Count artworks for which meta has ever been recorded."""
         cur = self._conn().execute(
-            "SELECT COUNT(*) FROM artworks WHERE meta_updated_at IS NOT NULL"
+            "SELECT COUNT(*) FROM artworks WHERE meta_updated_at IS NOT NULL "
+            "AND meta_updated_at != '0001-01-01 00:00:00'"
         )
         return int(cur.fetchone()[0])
 

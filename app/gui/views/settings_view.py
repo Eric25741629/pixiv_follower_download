@@ -429,7 +429,7 @@ class SettingsView(_SettingsHandlersMixin):
             "path": self._tf_path.value,
             "like_num": _safe_int(self._tf_like_num.value, 0),
             "r18_like_num": _safe_int(self._tf_r18_like_num.value, 0),
-            "rescrape_within_days": _safe_int(self._tf_rescrape_within_days.value, 0),
+            "rescrape_within_days": _safe_int(self._tf_rescrape_within_days.value, 365),
             "ban_tag": self._ban_tags,
             "must_tag": self._must_tags,
             "filename_template": (self._tf_filename_template.value or "").strip(),
