@@ -2,12 +2,10 @@ from __future__ import annotations
 import contextlib
 import queue
 import threading
-import time
 import flet as ft
 
 from app.core.worker_event import WorkerEvent
 from app.gui.glass import (
-    GlassProgressBar,
     current_theme,
     glass_dialog,
     glass_panel,
@@ -18,21 +16,30 @@ from app.gui.glass import (
     style_pill,
 )
 from app.gui.log_panel import LogPanel
+from app.gui.views.main_mode_row import (
+    _BOOKMARK_STEP_LABELS,
+    _MERGED_STEP3_LABEL,
+    _SOURCE_TOOLTIPS,
+    _MainModeRowMixin,
+    _settings_base_path,
+    STEP_LABELS,
+)
+from app.gui.views.main_progress import _PROG_LEAD_W, _MainProgressMixin
 
+# Constants/helpers moved to the mixin modules (file-size refactor) and
+# re-exported above: STEP_LABELS / _MERGED_STEP3_LABEL etc. so call sites here
+# (_make_step_card) and tests that ``from app.gui.views.main_view import
+# STEP_LABELS`` keep working. The progress-bar geometry (_PROG_*) and ETA logic
+# live in main_progress; the source/scope/combined logic in main_mode_row.
 
-STEP_LABELS = ["步驟 1\n抓追蹤", "步驟 2\n抓 PID", "步驟 3\n抓 URL", "步驟 4\n下載"]
-_BOOKMARK_STEP_LABELS = ["步驟 1\n略過追隨", "步驟 2\n抓收藏 PID"]
-
-# When 邊查邊下 (download.combined_mode) is on, step 3 absorbs step 4: the
-# step-3 card is relabeled and the step-4 card is hidden (see
-# MainView.apply_combined_mode).
-_MERGED_STEP3_LABEL = "步驟 3+4\n邊查邊下"
-
-# 模式說明（舊 _mode_subtitle 文案）改為來源 pill 的 tooltip。
-_SOURCE_TOOLTIPS = {
-    "following": "維持原本流程：抓追蹤畫師，再掃描畫師作品 PID。",
-    "bookmarks": "步驟 2 會掃描你按過愛心的作品 PID，後續抓 URL / 下載流程不變。",
-}
+__all__ = [
+    "MainView",
+    "STEP_LABELS",
+    "_BOOKMARK_STEP_LABELS",
+    "_MERGED_STEP3_LABEL",
+    "_SOURCE_TOOLTIPS",
+    "_settings_base_path",
+]
 
 
 def _state_palette(page: ft.Page) -> dict[str, tuple[str, str]]:
@@ -40,26 +47,7 @@ def _state_palette(page: ft.Page) -> dict[str, tuple[str, str]]:
     return state_colors(current_theme(page))
 
 
-# Shared geometry for the two stacked progress bars (整體進度 / 本作分頁). Both
-# rows use the SAME leading-label width, trailing-count width and spacing so the
-# expand=True bars start and end at exactly the same x — otherwise they look
-# misaligned (the old layout indented the page row 24px and reserved a wildly
-# different trailing width on each row).
-_PROG_LEAD_W = 84      # leading label column ("整體進度" / "本作分頁")
-_PROG_TRAIL_W = 210    # trailing count column (fits "PID 1234567 分頁 12/15")
-_PROG_BAR_HEIGHT = 12  # thicker than the default ~4px hairline
-_PROG_BAR_RADIUS = 6
-_PROG_ROW_SPACING = 12
-
-
-def _settings_base_path() -> str:
-    import os
-    path = os.getenv("APPDATA") + r"/pixiv_download/"
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-class MainView:
+class MainView(_MainProgressMixin, _MainModeRowMixin):
     """The primary workflow view: step cards, controls, progress, log."""
 
     def __init__(self, page: ft.Page, event_q: queue.Queue):
@@ -359,162 +347,8 @@ class MainView:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # Combined mode (邊查邊下) — merge step 3+4 cards into one
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _read_combined_mode_setting() -> bool:
-        """Read download.combined_mode from settings (best-effort)."""
-        try:
-            import os
-            from app.core.settings_store import SettingsStore
-            base = os.getenv("APPDATA") + r"/pixiv_download/"
-            return bool(
-                SettingsStore(base).get_section("download").get("combined_mode", False)
-            )
-        except Exception:
-            return False
-
-    def apply_combined_mode(self, enabled: bool) -> None:
-        """Merge step 3+4 into a single card when *enabled*.
-
-        Step 3's card is relabeled 「步驟 3+4 邊查邊下」 and the step-4 card is
-        hidden (the Row reflows). When disabled both revert to the default
-        4-card layout. Step-state colors are untouched — combined mode still
-        runs as step 3 (card index 2), so progress / done coloring is correct,
-        and clicking the merged card still launches step 3 → the combined
-        thread via the store flag.
-        """
-        self._combined_mode = bool(enabled)
-        self._step_card_texts[2].value = (
-            _MERGED_STEP3_LABEL if enabled else STEP_LABELS[2]
-        )
-        self._step_cards[3].visible = not enabled
-        for ctrl in (self._step_card_texts[2], self._step_cards[3]):
-            try:
-                ctrl.update()
-            except Exception:
-                pass
-
-    def refresh_combined_mode(self) -> None:
-        """Re-read the setting and re-apply the merged / normal card layout.
-
-        Called when the user returns to the 主頁 tab so a toggle made in the
-        settings page is reflected without an app restart.
-        """
-        self.apply_combined_mode(self._read_combined_mode_setting())
-
-    @staticmethod
-    def _read_source_settings() -> tuple[str, str, str]:
-        """Read download.source_mode and source privacy scopes from settings."""
-        try:
-            from app.core.settings_store import SettingsStore
-            dl = SettingsStore(_settings_base_path()).get_section("download")
-            return (
-                str(dl.get("source_mode", "following") or "following"),
-                str(dl.get("following_scope", "all") or "all"),
-                str(dl.get("bookmark_scope", "all") or "all"),
-            )
-        except Exception:
-            return "following", "all", "all"
-
-    def apply_source_mode(self, mode: str, scope: str = "all") -> None:
-        """Paint the main-page source-mode pills and step labels."""
-        mode = "bookmarks" if str(mode) == "bookmarks" else "following"
-        scope = self._normalize_scope(scope)
-        self._source_mode = mode
-        self._active_scope = scope
-        if mode == "bookmarks":
-            self._bookmark_scope = scope
-            self._scope_label.value = "收藏範圍"
-            self._scope_row.visible = True
-            self._step_card_texts[0].value = _BOOKMARK_STEP_LABELS[0]
-            self._step_card_texts[1].value = _BOOKMARK_STEP_LABELS[1]
-        else:
-            self._following_scope = scope
-            self._scope_label.value = "追隨範圍"
-            self._scope_row.visible = True
-            self._step_card_texts[0].value = STEP_LABELS[0]
-            self._step_card_texts[1].value = STEP_LABELS[1]
-        self._btn_source_following = self._make_mode_button(
-            "抓追隨", mode == "following",
-            lambda e: self._on_source_mode_change("following"),
-            tooltip=_SOURCE_TOOLTIPS["following"],
-        )
-        self._btn_source_bookmarks = self._make_mode_button(
-            "抓收藏", mode == "bookmarks",
-            lambda e: self._on_source_mode_change("bookmarks"),
-            tooltip=_SOURCE_TOOLTIPS["bookmarks"],
-        )
-        self._btn_scope_public = self._make_mode_button(
-            "公開", scope == "public", lambda e: self._on_scope_change("public")
-        )
-        self._btn_scope_private = self._make_mode_button(
-            "非公開", scope == "private", lambda e: self._on_scope_change("private")
-        )
-        self._btn_scope_all = self._make_mode_button(
-            "全部", scope == "all", lambda e: self._on_scope_change("all")
-        )
-        self._source_mode_controls.controls = [
-            self._btn_source_following, self._btn_source_bookmarks,
-        ]
-        self._scope_row.controls = [
-            self._scope_label,
-            self._btn_scope_public,
-            self._btn_scope_private,
-            self._btn_scope_all,
-        ]
-        self._bookmark_scope_row = self._scope_row
-        self._safe_update(
-            self._mode_row,
-            self._source_mode_controls, self._scope_row, self._scope_label,
-            self._step_card_texts[0], self._step_card_texts[1],
-        )
-
-    def _make_mode_button(self, text: str, active: bool, on_click,
-                          tooltip: str | None = None):
-        pill = glass_pill(
-            text, current_theme(self._page), primary=active, on_click=on_click
-        )
-        if tooltip:
-            pill.tooltip = tooltip
-        return pill
-
-    @staticmethod
-    def _normalize_scope(scope: str) -> str:
-        scope = str(scope or "all")
-        return scope if scope in {"public", "private", "all"} else "all"
-
-    def refresh_source_mode(self) -> None:
-        mode, following_scope, bookmark_scope = self._read_source_settings()
-        self._following_scope = self._normalize_scope(following_scope)
-        self._bookmark_scope = self._normalize_scope(bookmark_scope)
-        active_scope = self._bookmark_scope if mode == "bookmarks" else self._following_scope
-        self.apply_source_mode(mode, active_scope)
-
-    def _persist_source_settings(self, fields: dict) -> None:
-        with contextlib.suppress(Exception):
-            from app.core.settings_store import SettingsStore
-            SettingsStore(_settings_base_path()).update_fields("download", fields)
-
-    def _on_source_mode_change(self, mode: str) -> None:
-        self._persist_source_settings({"source_mode": mode})
-        mode = "bookmarks" if str(mode) == "bookmarks" else "following"
-        scope = self._bookmark_scope if mode == "bookmarks" else self._following_scope
-        self.apply_source_mode(mode, scope)
-
-    def _on_scope_change(self, scope: str) -> None:
-        scope = self._normalize_scope(scope)
-        key = "bookmark_scope" if self._source_mode == "bookmarks" else "following_scope"
-        self._persist_source_settings({key: scope})
-        self.apply_source_mode(self._source_mode, scope)
-
-    def _on_bookmark_scope_change(self, scope: str) -> None:
-        self._on_scope_change(scope)
-
-    def _on_following_scope_change(self, scope: str) -> None:
-        self._on_scope_change(scope)
+    # Source / scope / combined mode pills + persistence + step-card relabel
+    # moved to main_mode_row._MainModeRowMixin (file-size refactor); inherited.
 
     def append_log(self, html_line: str) -> None:
         self._log_panel.append_log(html_line)
@@ -531,142 +365,12 @@ class MainView:
             with contextlib.suppress(Exception):
                 c.update()
 
-    def _make_progress_row(self, label: str, color: str):
-        """Build one labeled progress row: [label] [expand bar] [count text].
-
-        Returns ``(bar, text, row)``. Used for BOTH 整體進度 and 本作分頁 so the
-        two bars are constructed identically (same geometry); ``color`` differs
-        per row (accent vs info) so the two bars are visually distinct.
-        The row starts hidden — it is revealed on its first real update by
-        :meth:`_render_progress_row`.
-        """
-        theme = current_theme(self._page)
-        # GlassProgressBar（圓角 track + 圓角 fill）取代 ft.ProgressBar —
-        # M3 進度條的 fill/track 切邊是直角，與全圓角的玻璃語彙混搭突兀。
-        bar = GlassProgressBar(
-            color=color,
-            bar_height=_PROG_BAR_HEIGHT,
-            radius=_PROG_BAR_RADIUS,
-        )
-        text = ft.Text(
-            "",
-            size=13,
-            color=theme.text_primary,
-            weight=ft.FontWeight.W_600,
-            width=_PROG_TRAIL_W,
-            text_align=ft.TextAlign.LEFT,
-        )
-        row = ft.Row(
-            controls=[
-                ft.Text(label, size=12, color=theme.text_secondary,
-                        width=_PROG_LEAD_W),
-                bar.track,
-                text,
-            ],
-            spacing=_PROG_ROW_SPACING,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            visible=False,
-        )
-        return bar, text, row
-
-    def _render_progress_row(self, row, bar, text, value: int, total: int,
-                             trailing: str) -> None:
-        """The ONE update path shared by 整體進度 and 本作分頁.
-
-        Sets the bar fraction + trailing count, reveals (or hides) the row, then
-        flushes it. Toggling ``visible`` False -> True on first data is the
-        load-bearing fix: it forces Flet to (re)lay out the row with real
-        content. An always-visible row first laid out with empty children
-        renders degenerate and later ``.value`` patches never reflow it — the
-        整體進度 freeze. 本作分頁 always worked because it was visible-gated; now
-        both rows are, via this single method.
-        """
-        if total > 0:
-            bar.value = max(0.0, min(1.0, value / total))
-            text.value = trailing
-            row.visible = True
-        else:
-            bar.value = 0
-            text.value = ""
-            row.visible = False
-        self._safe_update(row)
-
-    def _paint_progress(self, now: float | None = None) -> None:
-        """Render overall progress into the bar + count via the shared path.
-
-        Safe to call from build() before the controls are attached: the
-        _safe_update inside _render_progress_row swallows the detached-control
-        error, leaving the values painted for the imminent mount.
-        """
-        t = self._progress_total
-        if t > 0:
-            self._eta_text.value = self._format_eta(
-                now if now is not None else time.monotonic()
-            )
-            trailing = f"{self._progress_value} / {t}"
-        else:
-            self._eta_text.value = ""
-            trailing = ""
-        self._render_progress_row(
-            self._progress_row, self._progress_bar, self._progress_text,
-            self._progress_value, t, trailing,
-        )
-
-    def update_progress(self, delta: int, total: int) -> None:
-        # Workers emit (delta, total) per step, with delta == 0 marking a reset
-        # at the start of a phase. We accumulate locally so the bar grows.
-        try:
-            d = int(delta)
-            t = int(total)
-        except (TypeError, ValueError):
-            return
-        now = time.monotonic()
-        if d <= 0:
-            self._progress_value = 0
-            self._progress_started_at = now
-        else:
-            self._progress_value += d
-            if self._progress_started_at is None:
-                self._progress_started_at = now
-        self._progress_total = t
-        self._paint_progress(now)
-        # _paint_progress already flushed the progress row; ETA lives on the
-        # separate meta row, so flush that too.
-        self._safe_update(self._meta_row)
-
-    def update_page_progress(self, delta: int, total: int, pid: str = "") -> None:
-        """Update the current PID's page progress without touching PID progress."""
-        try:
-            d = int(delta)
-            t = int(total)
-        except (TypeError, ValueError):
-            return
-        pid_text = "" if pid is None else str(pid)
-        # 「正在下載：PID」獨立於分頁條 — 單頁作品也要顯示目前下載對象。
-        if pid_text:
-            self._set_downloading_pid(pid_text)
-        # 單張作品（page_count == 1）沒有「分頁」可言 — 顯示 1/1 只是噪音，
-        # 只隱藏第二條進度條（meta 列的 PID／倒數照常顯示）。
-        if t <= 1:
-            self._hide_page_progress_bar()
-            return
-
-        if pid_text != self._page_progress_pid:
-            self._page_progress_value = 0
-        if d <= 0:
-            self._page_progress_value = 0
-        else:
-            self._page_progress_value += d
-
-        self._page_progress_total = t
-        self._page_progress_pid = pid_text
-        self._page_progress_value = max(0, min(self._page_progress_value, t))
-        label = f"PID {pid_text} 分頁" if pid_text else "分頁"
-        trailing = f"{label} {self._page_progress_value}/{self._page_progress_total}"
-        self._render_progress_row(
-            self._page_progress_row, self._page_progress_bar,
-            self._page_progress_text, self._page_progress_value, t, trailing,
-        )
+    # Dual progress-bar machinery (_make_progress_row / _render_progress_row /
+    # _paint_progress / update_progress / update_page_progress /
+    # _hide_page_progress_bar / clear_page_progress / _format_eta /
+    # update_countdown) moved to main_progress._MainProgressMixin (file-size
+    # refactor); inherited. _set_downloading_pid / _set_downloading_status stay
+    # here (they own the meta-row status slot the mixin calls into).
 
     def _set_downloading_pid(self, pid_text: str) -> None:
         self._set_downloading_status(f"正在下載：PID {pid_text}" if pid_text else "")
@@ -676,50 +380,6 @@ class MainView:
         if self._downloading_text.value != value:
             self._downloading_text.value = value
             self._safe_update(self._meta_row)
-
-    def _hide_page_progress_bar(self) -> None:
-        """只收掉第二條進度條本體，保留 meta 列（正在下載／倒數）。"""
-        self._page_progress_value = 0
-        self._page_progress_total = 0
-        self._page_progress_pid = ""
-        self._render_progress_row(
-            self._page_progress_row, self._page_progress_bar,
-            self._page_progress_text, 0, 0, "",
-        )
-
-    def clear_page_progress(self) -> None:
-        self._hide_page_progress_bar()
-        self._set_downloading_pid("")
-
-    def _format_eta(self, now: float) -> str:
-        if self._progress_started_at is None:
-            return ""
-        if self._progress_value <= 0 or self._progress_total <= 0:
-            return ""
-        if self._progress_value >= self._progress_total:
-            return "預計剩餘：完成"
-        elapsed = now - self._progress_started_at
-        if elapsed <= 0:
-            return ""
-        remaining_items = self._progress_total - self._progress_value
-        eta_sec = int(remaining_items * elapsed / self._progress_value)
-        if eta_sec <= 0:
-            return ""
-        if eta_sec >= 3600:
-            h, rem = divmod(eta_sec, 3600)
-            m, s = divmod(rem, 60)
-            return f"預計剩餘：{h}:{m:02d}:{s:02d}"
-        m, s = divmod(eta_sec, 60)
-        return f"預計剩餘：{m:02d}:{s:02d}"
-
-    def update_countdown(self, remaining: int) -> None:
-        try:
-            r = int(remaining)
-        except (TypeError, ValueError):
-            r = 0
-        self._countdown_text.value = f"倒數：{r} 秒" if r > 0 else ""
-        # Update the meta Row, not just the Text, so it reflows reliably.
-        self._safe_update(self._meta_row)
 
     def set_phase(self, text: str) -> None:
         """Update the phase indicator row below the progress bar.
