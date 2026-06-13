@@ -1,12 +1,10 @@
 import json
 import os
 import random
-import threading
 import time
 
 import bs4
 import requests
-from bs4 import BeautifulSoup
 
 from app.core.proxy_utils import to_requests_proxies
 
@@ -27,34 +25,8 @@ def make_session(proxy_url: "str | None" = None) -> requests.Session:
 
 # 子執行緒的工作函數
 import re
-from queue import Queue
-from time import sleep
 
-try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.support.ui import WebDriverWait
-    _SELENIUM_AVAILABLE = True
-    _SELENIUM_IMPORT_ERROR = None
-except Exception as _selenium_err:
-    webdriver = None
-    By = None
-    Keys = None
-    EC = None
-    WebDriverWait = None
-    _SELENIUM_AVAILABLE = False
-    _SELENIUM_IMPORT_ERROR = _selenium_err
-from tqdm import trange
-
-
-if _SELENIUM_AVAILABLE:
-    option = webdriver.ChromeOptions()
-else:
-    option = None
-from pathlib import Path
-from app.core.pixiv_thread_utils import safe_json, safe_read_json
+from app.core.pixiv_thread_utils import safe_read_json
 
 
 def _extract_artwork_body(payload):
@@ -191,7 +163,14 @@ def _extract_artwork_img_url(body):
     try:
         urls_obj = body.get('urls', {})
         if isinstance(urls_obj, dict):
-            original_url = urls_obj.get('original') or urls_obj.get('regular')
+            # ONLY use 'original'. The old `or urls_obj.get('regular')` fallback
+            # was doubly wrong: a 'regular' URL is `..._p0_master1200.jpg` — a
+            # non-downloadable preview — and the `.replace("p0","p",1)` below
+            # mangles its `_p0_master1200` into `_p_master1200`, so every derived
+            # per-page URL 404'd silently. Returning None when 'original' is
+            # absent makes `valid` False, which triggers the cookie re-fetch that
+            # yields the real 'original' (e.g. for restricted works).
+            original_url = urls_obj.get('original')
         else:
             original_url = None
         if not original_url:
@@ -265,154 +244,10 @@ def _normalize_artwork_id(raw_value):
         return m.group(1)
     return token
 
-# 防止打印一些无用的日志
-#option.add_experimental_option("excludeSwitches", ['enable-automation', 'enable-logging'])
-#options = Options()
-#https://www.pixiv.net/ajax/user/490219/profile/illustswork_category=illustManga&is_first_page=0&lang=zh_tw
-def _require_selenium():
-    if not _SELENIUM_AVAILABLE:
-        raise RuntimeError(f"selenium is required for this action: {_SELENIUM_IMPORT_ERROR}")
-
-
-def logging(address,password):
-    _require_selenium()
-    url = 'https://pixiv.net/'
-    driver = webdriver.Chrome(options=option)
-    try:
-        driver.get(url)
-        driver.find_element(By.XPATH,'//*[@id="wrapper"]/div[3]/div[2]/a[2]').click()
-        driver.find_element(By.XPATH,"//input[@autocomplete = 'username']").send_keys(address)
-        passwd=driver.find_element(By.XPATH,"//input[@autocomplete = 'current-password']")
-        passwd.send_keys(password)
-        passwd.send_keys(Keys.RETURN)
-    finally:
-        driver.quit()
-
-#about_cookies
-def auto_get_cookie(address,password,mode=0):
-    _require_selenium()
-    print(f"[pixiv_api] auto_get_cookie called with mode={mode}")
-    def facebook_login(driver,email,password):
-        print("[pixiv_api] google_login: trying CSS selector button.btn-item.btn-gplus")
-        try:
-            btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn-item.btn-gplus"))
-            )
-            btn.click()
-        except Exception as e:
-            print(f"[pixiv_api] google_login: primary selector failed: {e}")
-        # 等待 email 輸入欄位出現，若沒有則嘗試其他頁面上的按鈕作為 fallback
-        try:
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], #identifierId, input[autocomplete='username']"))
-            )
-        except Exception as e:
-            print(f"[pixiv_api] google_login: no email input after click: {e}")
-            try:
-                buttons = driver.find_elements(By.TAG_NAME, "button")
-                for b in buttons:
-                    dl = (b.get_attribute('data-label') or '').lower()
-                    txt = (b.text or '').lower()
-                    cls = (b.get_attribute('class') or '').lower()
-                    if 'google' in dl or 'google' in txt or 'gplus' in cls:
-                        try:
-                            print('[pixiv_api] google_login: trying alternative button with', dl, txt, cls)
-                            b.click()
-                            WebDriverWait(driver, 6).until(
-                                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], #identifierId, input[autocomplete='username']"))
-                            )
-                            break
-                        except Exception as e2:
-                            print('[pixiv_api] google_login: alternative click failed', e2)
-            except Exception as e3:
-                print('[pixiv_api] google_login: failed enumerating buttons', e3)
-        # 填寫帳號密碼（等待 email 欄位存在）
-        try:
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], #identifierId, input[autocomplete='username']"))
-            ).send_keys(email)
-            passwd = driver.find_element(By.XPATH, "//input[@autocomplete = 'current-password']")
-            passwd.send_keys(password)
-            passwd.send_keys(Keys.RETURN)
-        except Exception as e:
-            print(f"[pixiv_api] google_login: failed to fill login form: {e}")
-        try:
-            driver.find_element(By.XPATH, '//*[@class="x1lliihq x6ikm8r x10wlt62 x1n2onr6 xlyipyv xuxw1ft x1j85h84"]').click()
-        except Exception:
-            pass
-    def google_login(driver,email, password):
-        print("[pixiv_api] google_login: trying CSS selector button.btn-item.btn-gplus")
-        try:
-            btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn-item.btn-gplus"))
-            )
-            btn.click()
-        except Exception as e:
-            print(f"[pixiv_api] google_login: primary selector failed: {e}")
-            try:
-                buttons = driver.find_elements(By.TAG_NAME, "button")
-                infos = []
-                for b in buttons:
-                    infos.append({
-                        'text': b.text[:30],
-                        'class': b.get_attribute('class'),
-                        'data-label': b.get_attribute('data-label')
-                    })
-                print('[pixiv_api] google_login: found buttons:', infos)
-            except Exception:
-                pass
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, "//input[@autocomplete='username']"))
-        ).send_keys(email)
-        passwd = driver.find_element(By.XPATH, "//input[@autocomplete = 'current-password']")
-        passwd.send_keys(password)
-        passwd.send_keys(Keys.RETURN)
-    def pixiv_login(driver,email,password):
-        driver.find_element(By.XPATH,'//*[@id="wrapper"]/div[3]/div[2]/a[2]').click()
-        driver.find_element(By.XPATH,"//input[@autocomplete = 'username']").send_keys(email)
-        passwd=driver.find_element(By.XPATH,"//input[@autocomplete = 'current-password']")
-        passwd.send_keys(password)
-        passwd.send_keys(Keys.RETURN)
-    def get_cookies():
-        cookies = ""
-        selenium_cookies = driver.get_cookies()
-        for cookie in selenium_cookies:
-            cookies+=str(cookie['name'])
-            cookies+="="
-            cookies+=str(cookie['value'])
-            cookies+=";"
-        return cookies
-    option = webdriver.ChromeOptions()
-    option.add_experimental_option("excludeSwitches", ['enable-automation', 'enable-logging'])
-    #option.add_argument("--headless")
-    option.add_argument("--disable-backgrounding-occluded-windows")
-    driver = webdriver.Chrome(options=option)
-    try:
-        url = 'https://pixiv.net/'
-        driver.get(url)
-        print(f"[pixiv_api] selected login mode: {mode}")
-        if (mode == 0):
-            pixiv_login(driver, address, password)
-        elif (mode == 1):
-            # UI: mode 1 = Google
-            google_login(driver, address, password)
-        elif (mode == 2):
-            # UI: mode 2 = Facebook
-            facebook_login(driver, address, password)
-        sleep(2)
-        url = 'https://pixiv.net/'
-        driver.get(url)
-        sleep(5)
-        soup = bs4.BeautifulSoup(driver.page_source, 'lxml')
-        user_num=(str(soup.head).split('user_id')[1].split('_gaq.push')[0].split('"')[1])
-        url='https://www.pixiv.net/artworks/96509143'
-        driver.get(url)
-        sleep(5)
-        agent=driver.execute_script("return navigator.userAgent")
-        cookies=get_cookies()
-        return str(user_num),str(cookies),str(agent)
-    finally:
-        driver.quit()
+# Selenium-dependent login / cookie-grab helpers (_require_selenium /
+# logging / auto_get_cookie / get_author_picture_ids) moved to
+# pixiv_selenium_login (file-size refactor); re-imported at the bottom of this
+# module so ``from pixiv_api import *`` and ``pixiv_api.NAME`` keep resolving.
 
 def Test_cookies(lists,agent):
     cookies=[]
@@ -438,128 +273,10 @@ def Test_cookies(lists,agent):
             pass
     return i,cookies
 
-def get_author_picture_ids(illust_ids,path,num,q,exist_pid):
-    _require_selenium()
-    download_Pid=[]
-    temp = 0
-    total = len(illust_ids)     
-    for illust_id in illust_ids:
-        try:
-            temp += 1
-            print('\r' + '[線程%s]:[%s%s]%.2f%%' % (num,'█' * int(temp*20/total), ' ' * (20-int(temp*20/total)),float(temp/total*100)), end='')
-            driver = webdriver.Chrome(options=option)
-            try:
-                time.sleep(5)
-                url = ('https://pixiv.net/ajax/user/' + illust_id + '/profile/all?lang=zh')				#畫師id 輸入後可得到畫師所有的作品
-                driver.switch_to.window(driver.window_handles[num])
-                driver.get(url)
-                #time.sleep(1)
-                soup = BeautifulSoup(driver.page_source, 'html.parser')
-                res=soup.find('pre')
-                res=str(res)
-                res=res.replace('<pre style="word-wrap: break-word; white-space: pre-wrap;">','')	#清除後才能夠轉為json
-                res=res.replace('</pre>','')														#清除後才能夠轉為json
-                #print(res)
-                res=res.encode('UTF-8')
-                resdict = json.loads(res)['body']['illusts']		  								# 將json轉化為python的字典后提取元素
-                Pids=[key for key in resdict]                        #將元素放入陣列裡
-                for Pid in Pids:
-                    if Pid in exist_pid:
-                        break
-                    else :
-                        download_Pid.append(Pid)
-            finally:
-                driver.quit()
-        except Exception as err:
-            print(Pid+'獲取失敗',err)
-            try:
-                from safe_io import atomic_append_text
-                atomic_append_text(os.path.join(path, f"get_download_author_err{int(num)}.txt"), illust_id)
-            except Exception:
-                try:
-                    f = open((path+"get_download_author_err"+str(num)+".txt"), "a")
-                    f.write(illust_id+'\n')
-                    f.close()
-                except Exception:
-                    pass
-        time.sleep(random.random())
-        #print(num)
-    q.put(download_Pid)
-def get_follow_illust(id,headers,state,times):
-    '''獲得所有你關注的畫師 需輸入查詢的ID 第幾個 偽裝 公開/私人'''
-    url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
-    
-    res = requests.get(url.format(id), headers=headers, timeout=(10, 30))
-    resdicts = safe_json(res, 'body', 'users', default=[])
-    return [int(_.get('userId')) for _ in resdicts]
-def illusts(id,cookie,Agent):				#輸入你的id得到你所有關注的P站畫師
-    headers = {
-        'User-Agent': Agent,
-        'Cookie':cookie
-        ,'referer': 'https://www.pixiv.net/users/'+id+'/following',        
-    }
-    times=0
-    pixiv_author_id=[]
-    url = ('https://www.pixiv.net/ajax/user/27915696/following?offset='+str(times)+'&limit=1&rest=show&tag=&lang=zh_tw') # 访问存有画师所有作品
-    print(url)
-    res = requests.get(url, headers=headers, timeout=(10, 30))
-    show_total_num = safe_json(res, 'body', 'total', default=0)
-    url = ('https://www.pixiv.net/ajax/user/27915696/following?offset='+str(times)+'&limit=1&rest=hide&tag=&lang=zh_tw')
-    res = requests.get(url, headers=headers, timeout=(10, 30))
-    hide_total_num = safe_json(res, 'body', 'total', default=0)
-    print(show_total_num,hide_total_num)
-    threads=[]
-    queue=Queue() 
-    for i in range(0,show_total_num+100,100):
-        threads.append(threading.Thread(target =get_follow_illust, args =(i,headers,queue,'show') ))
-        #print(i)
-    for i in range(0,len(threads)):
-        threads[i].start()
-        while(threading.activeCount()>=7):
-            sleep(0.01)
-    for i in range(0,len(threads)):
-        threads[i].join()
-    
-    threads.clear()
-    for i in range(0,hide_total_num+100,100):
-        threads.append(threading.Thread(target =get_follow_illust, args =(i,headers,queue,'hide') ))
-        #print(i)
-    for i in range(0,len(threads)):
-        threads[i].start()
-        while(threading.activeCount()>=7):
-            sleep(0.01)
-    for i in range(0,len(threads)):
-        threads[i].join()
-    while not(queue.empty()):
-        pixiv_author_id.append(queue.get())
-    return (pixiv_author_id)
-def thread_no_use_seleium_get_pid(cookie,Agent,path,num,author_pids):
-    #author_pids=str(author_pids)
-    pid=[]
-    try:
-        url='https://www.pixiv.net/ajax/user/'+author_pids+'/profile/all?lang=zh%27'
-        headers = {
-        'User-Agent': Agent,
-        'Cookie':cookie
-        ,'referer': 'https://www.pixiv.net/users/'+author_pids,
-        }
-        res = requests.get(url, headers=headers, timeout=(10, 30))
-        resdicts = safe_json(res, 'body', 'illusts', default={})
-        for key in resdicts:
-            pid.append(key)
-    except Exception as err:
-        print(err)
-        try:
-            from safe_io import atomic_append_text
-            atomic_append_text(os.path.join(path, f"authorPids_err{int(num)}.txt"), author_pids)
-        except Exception:
-            try:
-                f = open((path+"authorPids_err"+str(num)+".txt"), "a+")
-                f.write(author_pids+'\n')
-                f.close()
-            except Exception:
-                pass
-    return pid
+# get_author_picture_ids moved to pixiv_selenium_login (re-imported below).
+# Legacy following-scan free functions (get_follow_illust / illusts /
+# thread_no_use_seleium_get_pid) moved to pixiv_legacy_utils (re-imported
+# below) — superseded by the worker-thread class methods.
 
 def random_Agent():
     # Updated modern User-Agent list (desktop and mobile, common browsers)
@@ -585,94 +302,14 @@ def random_Agent():
         "Mozilla/5.0 (Linux; Android 13; SAMSUNG SM-S916B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/21.0 Chrome/115.0.5790.170 Mobile Safari/537.36",
     ]
     return random.choice(USER_AGENTS)
-def Pixiv_Tag(url):                                                 #回傳標籤
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50',
-        'Cookie':''
-        ,'referer': 'https://www.pixiv.net/users/27915696/following',        
-    }
-    id=url.rsplit('/',1)[1]
-    res = requests.get(url, headers=headers, timeout=(10, 30))
-    obj = str(bs4.BeautifulSoup(res.text, 'lxml').find_all('meta')[25])
-    obj=obj.replace('<meta content=\'','')
-    obj=obj.replace('id="meta-preload-data" name="preload-data"/>','') 
-    o=obj.rsplit('\'',1)[0] 
-    o=o.encode('UTF-8')
-    resdicts = str(json.loads(o)['illust'][str(id)]['tags']['tags'])
-    #print(resdicts)
-    #resdicts = str(json.loads(o)['illust'][str(id)]['tags']['tags'])
-    return resdicts
-_R18G_GORE_TAGS = (
-    '死姦', '脫腸', '斬首', '屍姦', 'necrophilia', '割脖', '砍頭', '食糞', '眼孔姦',
-)
-_EXCLUDE_TAGS = ('gay', '原創BL')
-_DEFAULT_LIKE_THRESHOLD = 300
 
+# Pixiv_Tag, the R-18G/exclude tag constants, _pixiv_info_with_retry, the
+# get_download_url filter helpers (_is_blocked_r18g_artwork /
+# _is_excluded_orientation_tag / _build_per_page_urls) and get_download_url
+# itself moved to pixiv_legacy_utils (file-size refactor); re-imported at the
+# bottom of this module so the star surface + helper-test imports keep working.
+# (_result_preview stays here — it has a live caller in _record_pixiv_info_trace.)
 
-def _pixiv_info_with_retry(url, Agent, max_attempts=2):
-    """Fetch Pixiv info with up to ``max_attempts`` retries.
-
-    Returns the ``(tag, like, pagecount, img_url)`` 4-tuple to keep the legacy
-    utility script (``get_download_url``) untouched.  ``Pixiv_info`` itself
-    returns an 8-element list including upload/create dates and user info;
-    this wrapper deliberately slices it down to the first 4 fields.
-    Returns ``None`` if every attempt produced the empty/404 response shape.
-    """
-    for _ in range(max_attempts):
-        info = Pixiv_info(url, Agent=Agent)
-        if info == [404]:
-            return None
-        try:
-            tag, like, pagecount, img_url, *_rest = info
-        except Exception:
-            continue
-        if tag != [] or like != 404:
-            return tag, like, pagecount, img_url
-        if tag == 404 and like == 404:
-            return None
-    return None
-
-
-def _is_blocked_r18g_artwork(tag):
-    """An R-18G work mixed with any of the gore-marker tags is hard-blocked."""
-    tag_str = str(tag)
-    if 'R-18G' not in tag_str:
-        return False
-    return any(marker in tag_str for marker in _R18G_GORE_TAGS)
-
-
-def _is_excluded_orientation_tag(tag):
-    """Hard-exclude based on orientation/genre tags hard-coded in the original script."""
-    tag_str = str(tag)
-    return any(marker in tag_str for marker in _EXCLUDE_TAGS)
-
-
-def _build_per_page_urls(img_url, pagecount):
-    """Expand a single img_url into one URL per page using the original path scheme."""
-    parts = img_url.rsplit(".", 1)
-    return [parts[0] + str(i) + "." + parts[1] for i in range(pagecount)]
-
-
-def get_download_url(path, cookie, Agent, num, pid):
-    """回傳下載連結 — utility script entrypoint, not used by the main worker pipeline."""
-    url = 'https://www.pixiv.net/artworks/' + pid
-    try:
-        info = _pixiv_info_with_retry(url, Agent)
-    except Exception as err:
-        print(pid + '獲取失敗', err)
-        return []
-    if info is None:
-        return []
-    tag, like, pagecount, img_url = info
-    if _is_blocked_r18g_artwork(tag):
-        return []
-    if _is_excluded_orientation_tag(tag):
-        return pid
-    if like < _DEFAULT_LIKE_THRESHOLD:
-        return pid
-    download_url = _build_per_page_urls(img_url, pagecount)
-    time.sleep(random.random() / 5)
-    return download_url
 def _result_preview(final_result):
     """Build the small dict logged into pixiv_cookie_requirement.json under ``result_preview``."""
     if not isinstance(final_result, list):
@@ -782,8 +419,14 @@ def Pixiv_info(url,
                 # Propagate so the scheduler-aware caller can disable the cookie/proxy.
                 raise
             except Exception as e:
+                # TRANSIENT failure (ReadTimeout, SSL hiccup, malformed socket
+                # read, etc.) — NOT a 404. Returning [404] here would make the
+                # callers permanently mark_artwork_revoked() a live artwork on a
+                # momentary glitch. Return the distinct ["error"] sentinel so the
+                # `== [404]` revoke checks skip it and the PID stays pending for
+                # retry. (B6)
                 print(f"Pixiv_info request error pid={id}: {e}")
-                return [404], False, -1
+                return ["error"], False, -1
             if res.status_code == 404:
                 return [404], False, 404
             if res.status_code == 429 and retry < 1:
@@ -793,10 +436,13 @@ def Pixiv_info(url,
             try:
                 payload = res.json()
             except Exception as e:
+                # A 200 that didn't parse as JSON (Cloudflare interstitial,
+                # truncated body) is transient, not a deletion. Same ["error"]
+                # sentinel as above so we never revoke on a parse glitch. (B6)
                 print(f"Pixiv_info json error pid={id}: {e}")
                 print(f"Pixiv_info response content: {res.text[:500]}")
                 print(f"Pixiv_info status code: {res.status_code}")
-                return [404], False, res.status_code
+                return ["error"], False, res.status_code
             parsed, valid = _parse_payload(payload)
             return parsed, valid, res.status_code
 
@@ -852,35 +498,44 @@ def userId(url,
         data = json.loads(o)
         userId = data['illust'].get(id)
         return userId['userId']
-def pixiv_following_count(id,cookie,Agent):
-    url = ("https://www.pixiv.net/ajax/user/extra?lang=zh_tw") # 访问存有画师所有作品
-    print(url)
-    headers = {
-        'User-Agent': Agent,
-        'Cookie':cookie
-        ,'referer': 'https://www.pixiv.net/users/'+id+'/following',        
-    }
-    res = requests.get(url,headers=headers, timeout=(10, 30))
-    return safe_json(res, 'body', 'following', default=0)
 
-    #objSoup = bs4.BeautifulSoup(res.content, 'lxml')
-    #print(objSoup)
+# pixiv_following_count / no_use_seleium_get_pid moved to pixiv_legacy_utils
+# (re-imported below).
 
-def no_use_seleium_get_pid(author_pids,cookie,Agent,q,path,num,exist_pid):
-    for i in trange(0,len(author_pids)):
-        try:
-            url='https://www.pixiv.net/ajax/user/'+author_pids[i]+'/profile/all?lang=zh%27'
-            headers = {
-            'User-Agent': Agent,
-            'Cookie':cookie
-            ,'referer': 'https://www.pixiv.net/users/'+author_pids[i],        
-            }
-            res = requests.get(url, headers=headers, timeout=(10, 30))
-            resdicts = safe_json(res, 'body', 'illusts', default={})
-            for key in resdicts:
-                if key not in exist_pid:
-                    q.put(key)
-        except Exception:
-            with open((path+"authorPids_err"+str(num)+".txt"), "a+") as f:
-                f.write(author_pids[i]+'\n')
 
+# ── facade re-exports (file-size refactor) ────────────────────────────────────
+# The selenium-login block and the shadowed/legacy free functions were split
+# into sibling modules. Re-import them back here so ``from pixiv_api import *``
+# (the star surface relied on by thread_following / thread_pid_scan /
+# thread_url_fetch / thread_download and the root ``pixiv_api`` shim's
+# ``dir(_impl)`` __all__) and direct ``pixiv_api.NAME`` / ``from app.core.
+# pixiv_api import NAME`` lookups (incl. the underscore helpers the tests
+# import) stay byte-identical. The wildcard imports are placed at the bottom so
+# the live HTTP surface above always wins on any (non-existent) name clash.
+from app.core.pixiv_selenium_login import (  # noqa: E402,F401  (facade re-export)
+    _require_selenium,
+    _SELENIUM_AVAILABLE,
+    _SELENIUM_IMPORT_ERROR,
+    auto_get_cookie,
+    get_author_picture_ids,
+    logging,
+    option,
+)
+from app.core.pixiv_selenium_login import *  # noqa: E402,F401,F403  (star surface)
+from app.core.pixiv_legacy_utils import (  # noqa: E402,F401  (facade re-export)
+    _DEFAULT_LIKE_THRESHOLD,
+    _EXCLUDE_TAGS,
+    _R18G_GORE_TAGS,
+    _build_per_page_urls,
+    _is_blocked_r18g_artwork,
+    _is_excluded_orientation_tag,
+    _pixiv_info_with_retry,
+    Pixiv_Tag,
+    get_download_url,
+    get_follow_illust,
+    illusts,
+    no_use_seleium_get_pid,
+    pixiv_following_count,
+    thread_no_use_seleium_get_pid,
+)
+from app.core.pixiv_legacy_utils import *  # noqa: E402,F401,F403  (star surface)

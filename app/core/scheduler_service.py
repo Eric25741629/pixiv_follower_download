@@ -75,7 +75,13 @@ class SchedulerService:
         self._last_fire = now
         try:
             self._run_all()
-        except Exception:
+        except Exception as exc:
+            # Surface the failure in the same log channel as the skip notice —
+            # a silently-swallowed run_all left the user with no diagnostic and
+            # still advanced _last_fire, costing a whole scheduled cycle.
+            self._emit(
+                f"<p><font color='red'>排程執行失敗：{exc}</font></p>"
+            )
             return False
         return True
 

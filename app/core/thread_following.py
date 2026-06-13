@@ -168,8 +168,11 @@ class get_following(PauseableThread):
             atomic_write_text(os.path.join(self.path, "following.txt"), texts, backup=True)
             atomic_write_json(os.path.join(self.path, "following.json"), texts, backup=True)
             self._q.put(WorkerEvent("output", "<p><font color='red'>抓取關注畫師完成</font></p>"))
-            self._q.put(WorkerEvent("next", 2))
+            # Emit finished BEFORE next so the dispatcher tears down step 1 first
+            # and THEN starts step 2 — otherwise handle_finished re-marks the
+            # just-started step 2 'done' and disables its pause/stop. (B7)
             self._q.put(WorkerEvent("finished", '抓取關注畫師完成'))
+            self._q.put(WorkerEvent("next", 2))
         except Exception as e:
             self._q.put(WorkerEvent("output", 'Task failed'))
             self._q.put(WorkerEvent("output", output_err(e)))

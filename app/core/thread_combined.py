@@ -180,6 +180,13 @@ class combined_thread(PauseableThread):
         with contextlib.suppress(Exception):
             self.downloader._metadata_db.close()
         self.downloader._metadata_db = self.fetcher._metadata_db
+        # Bridge the just-queried meta to the download leg. combined runs each
+        # PID sequentially (query then download), so the fetcher's url_meta —
+        # which get_download_url populates during the query — is exactly what the
+        # downloader's _get_meta needs. Aliasing the dict means the download leg
+        # reads that meta in-memory instead of re-issuing a redundant,
+        # un-cooldowned, un-proxied Pixiv_info network fetch per page.
+        self.downloader.url_meta = self.fetcher.url_meta
 
     def _share_scheduler(self):
         """Propagate the scheduler set by run_actions after construction."""
@@ -315,6 +322,7 @@ class combined_thread(PauseableThread):
         ok = True
         account_ok = True
         download_ok = True
+        neutral = False
         try:
             if needs_query:
                 # The fetcher's get_download_url emits one ("progress",(1,
@@ -351,6 +359,13 @@ class combined_thread(PauseableThread):
                 with contextlib.suppress(Exception):
                     self._q.put(WorkerEvent("phase", f"正在下載：PID {pid}"))
                 self.downloader._set_current_download_account(acc)
+                # Bind THIS account's cookie to the PID so the download leg sends
+                # the held account's cookie over the held account's proxy (the
+                # hard cookie<->IP contract). Without this seed,
+                # _select_cookie_for_pid would pick a RANDOM pool cookie and send
+                # it over acc's IP — a mismatch Pixiv anti-fraud flags. Mirrors
+                # standalone Step 4 (_download_pid_with_scheduler).
+                self.downloader._pid_cookie_selection[normalize_pid(pid) or str(pid)] = acc.cookie
                 with diag_log.span(diag_log.WORKER, f"PID {pid} download ({len(urls)} pages)"):
                     account_ok, failed, _ = self._run_with_network_retry(
                         f"PID {pid} 下載",
@@ -382,9 +397,16 @@ class combined_thread(PauseableThread):
                         self._persist_pid_meta(pid)
             else:
                 self._clear_page_progress()
+        except Exception:
+            neutral = True  # non-network failure: not the cookie's fault
+            raise
         finally:
             self.downloader._clear_current_download_account()
-            self._release_account(acc, ok=ok and account_ok)
+            # Stop mid-PID or a non-network error releases NEUTRALLY: don't credit
+            # the cookie with a success (ok=True would refresh its trust window for
+            # work the user aborted) nor disable it. Off those paths, a
+            # network-exhausted account (account_ok False) still disables as before.
+            self._release_account_after_work(acc, ok=ok and account_ok, neutral=neutral)
             with contextlib.suppress(Exception):
                 sess.close()
         # "Genuine success": query succeeded (or not needed) AND downloads

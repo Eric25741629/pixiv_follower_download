@@ -1,6 +1,4 @@
 import contextlib
-import time
-import json
 import os
 import datetime
 import re
@@ -8,19 +6,14 @@ import random as pyrandom
 import threading
 import concurrent.futures
 import requests
-import io
-import zipfile
 from queue import Queue, Empty
-from PIL import Image
 from pixiv_api import *  # noqa: F403  (intentional: re-exports Pixiv_info/gif_download/etc.)
 from app.core.worker_event import WorkerEvent
 import pixiv_api
 from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
-    atomic_write_json,
     atomic_write_text,
     count_text_lines,
-    fetch_with_cookie_retry,
     init_cookie_fields,
     mirror_meta_dict_to_db,
     normalize_filter_tags,
@@ -33,12 +26,19 @@ from app.core.metadata_db import emit_db_stats, mirror_exist_pid_set, open_metad
 from app.core.pixiv_thread_base import (
     PauseableThread,
     _normalize_special_like_rules,
-    _resolve_like_threshold,
-    _is_ai_artwork_tagged,
-    _cookie_usage_label,
 )
 from app.core.step4_filename import _FilenameMixin
 from app.core.step4_jxl_conversion import _JXLMixin
+from app.core.step4_filters import _Step4FiltersMixin
+from app.core.step4_media import _Step4MediaMixin
+# Author-ordering primitives moved to step4_author_order (file-size refactor);
+# re-imported here so ``thread_download.compute_author_order`` (read by
+# thread_combined / thread_pid_scan) and the in-module references keep working.
+from app.core.step4_author_order import (  # noqa: F401  (facade re-export)
+    _leading_pid_int,
+    _within_author_sorted,
+    compute_author_order,
+)
 from app.core import diag_log
 
 def _safe_meta_count(db) -> int:
@@ -54,60 +54,13 @@ def _safe_meta_count(db) -> int:
 # the mixin, so they remain reachable as self._build_download_filename etc.
 
 
-def _leading_pid_int(pid) -> int | None:
-    """Return the leading-digit run of ``pid`` as an int, or None if it has
-    no leading digit. Robust to hash-form pids like ``"12345-abcdef"``."""
-    s = str(pid)
-    i = 0
-    while i < len(s) and s[i].isdigit():
-        i += 1
-    return int(s[:i]) if i else None
+# Author-ordering primitives (_leading_pid_int / _within_author_sorted /
+# compute_author_order) moved to step4_author_order (file-size refactor) and
+# re-imported above so the module facade is unchanged.
 
 
-def _within_author_sorted(pids: list[str]) -> list[str]:
-    """Sort one author's pids: by leading-digit value descending (so hash-form
-    pids like ``"12345-abcdef"`` still sort numerically), then any pids with no
-    leading digit in reverse-lexical order at the end (deterministic)."""
-    numeric = sorted((p for p in pids if _leading_pid_int(p) is not None),
-                     key=_leading_pid_int, reverse=True)
-    nonnumeric = sorted((p for p in pids if _leading_pid_int(p) is None),
-                        reverse=True)
-    return numeric + nonnumeric
-
-
-def compute_author_order(pid_order, pid_to_user_id):
-    """Reorder pids so each author's works are contiguous.
-
-    - Authors are sequenced by first-encounter order in ``pid_order``.
-    - Within an author, pids are PID-descending (see _within_author_sorted).
-    - pids whose user_id is None/empty/missing form one "unknown" bucket
-      appended last.
-
-    Returns ``(flat_order, author_batches)`` where ``author_batches`` is a
-    list of per-author pid lists (one batch per author, unknown bucket last)
-    and ``flat_order`` is those batches concatenated.
-    """
-    author_seq: list[str] = []
-    groups: dict[str, list[str]] = {}
-    unknown: list[str] = []
-    for pid in pid_order:
-        uid = pid_to_user_id.get(pid)
-        key = "" if uid is None else str(uid).strip()
-        if not key:
-            unknown.append(pid)
-            continue
-        if key not in groups:
-            groups[key] = []
-            author_seq.append(key)
-        groups[key].append(pid)
-    author_batches = [_within_author_sorted(groups[k]) for k in author_seq]
-    if unknown:
-        author_batches.append(_within_author_sorted(unknown))
-    flat_order = [pid for batch in author_batches for pid in batch]
-    return flat_order, author_batches
-
-
-class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
+class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+                      _Step4FiltersMixin, _Step4MediaMixin):
     pid_max=0
     pid_now=0
     path=os.getenv('APPDATA')+r'/pixiv_download/'
@@ -212,7 +165,6 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
         self.allurl, self._task_filter_stats = self._prepare_download_tasks(self.allurl)
         self.pid_max = len(self.allurl)
         self._emit_step4_init_diag(raw_allurl_count)
-        print(self.pid_max)
 
     # ── __init__ helpers ───────────────────────────────────────────────────
 
@@ -405,6 +357,17 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
         self._active_group_pid = None
         self._attempted_urls = set()
         self._attempted_urls_lock = threading.Lock()
+        # URLs whose page is CONFIRMED on disk (a genuine download success or an
+        # already-existing skip). Only these are marked 'downloaded' in the DB
+        # and dropped from the remaining-to-download set. A URL that was merely
+        # *attempted* but then failed (network-retry exhausted) or was cut short
+        # by a user Stop is deliberately NOT in this set, so it stays 'pending'
+        # and is re-queued next run instead of being silently lost.
+        self._completed_urls = set()
+        self._completed_urls_lock = threading.Lock()
+        # Per-PID author-folder id cache for create_dir (filled from metadata,
+        # never a live HTTP call). See _resolve_author_dir_id.
+        self._author_dir_cache = {}
         # Serializes read-modify-write of self.url_meta + the JSON flush. With
         # 4 ThreadPoolExecutor workers in _execute_downloads() racing against
         # _mark_gif_cookie_usage / _persist_url_meta, an unguarded dict mutation
@@ -601,46 +564,41 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
     def _normalize_filter_tags(self, tags):
         return normalize_filter_tags(tags)
 
-    def _normalize_artwork_tags(self, tags):
-        if isinstance(tags, list):
-            source = tags
-        elif tags in (None, 404):
-            source = []
-        else:
-            source = [tags]
-        out = []
-        for t in source:
-            s = str(t).strip()
-            if s:
-                out.append(s.lower())
-        return out
+    # _normalize_artwork_tags / _tag_hit / _is_r18g_artwork / _is_r18_artwork /
+    # _is_ai_artwork moved to step4_filters._Step4FiltersMixin (file-size
+    # refactor). Inherited; still reachable as self._is_r18_artwork etc.
 
-    def _tag_hit(self, target_tag, artwork_tags):
-        key = str(target_tag).strip().lower()
-        if not key:
-            return False
-        return any(key in tag for tag in artwork_tags)
+    def _resolve_author_dir_id(self, pid):
+        """Author-folder id from already-known metadata — NO live HTTP call.
 
-    def _is_r18g_artwork(self, tag):
-        """Gore-adjacent adult content: r-18g / 糞 / 子宮脫."""
-        artwork_tags = self._normalize_artwork_tags(tag)
-        return any(self._tag_hit(marker, artwork_tags) for marker in ("r-18g", "糞", "子宮脫"))
-
-    def _is_r18_artwork(self, tag):
-        """General adult content (r-18) excluding r-18g markers."""
-        if self._is_r18g_artwork(tag):
-            return False
-        artwork_tags = self._normalize_artwork_tags(tag)
-        return any(t == "r-18" for t in artwork_tags)
-
-    def _is_ai_artwork(self, tag):
-        artwork_tags = self._normalize_artwork_tags(tag)
-        return _is_ai_artwork_tagged(artwork_tags, self._tag_hit)
+        create_dir used to call pixiv_api.userId() per page: an unauthenticated,
+        un-proxied GET that leaked the local IP (defeating the proxy binding),
+        ran unthrottled, and returned the junk '(404, 404, 404, 404)' tuple for
+        deleted works (which then became a literal directory name). The author is
+        already known from Step 2/3 (url_meta in-memory, or artworks.user_id in
+        the DB), so read it from there and cache per PID. Returns '' when the
+        author is unknown (caller buckets the file directly under download_path).
+        """
+        pid_key = normalize_pid(pid) or str(pid)
+        cache = self._author_dir_cache
+        if pid_key in cache:
+            return cache[pid_key]
+        uid = ""
+        meta = self._get_meta(pid_key)
+        if isinstance(meta, dict):
+            uid = str(meta.get("user_id") or "").strip()
+        if not uid:
+            db = getattr(self, "_metadata_db", None)
+            if db is not None:
+                with contextlib.suppress(Exception):
+                    uid = str((db.user_id_map_for_pids([pid_key]) or {}).get(pid_key) or "").strip()
+        cache[pid_key] = uid
+        return uid
 
     def _resolve_download_target_dir(self, tag, pid, media_kind=None):
         if self.create_dir:
-            user_id = pixiv_api.userId('https://www.pixiv.net/artworks/' + str(pid), self.agent)
-            base_dir = os.path.join(self.download_path, str(user_id))
+            uid = self._resolve_author_dir_id(pid)
+            base_dir = os.path.join(self.download_path, uid) if uid else self.download_path
         else:
             base_dir = self.download_path
         if media_kind:
@@ -654,91 +612,12 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
         os.makedirs(base_dir, exist_ok=True)
         return base_dir
 
-    def _bump_step4_skip_count(self, reason):
-        """Increment a counter; create the key on first sight. Returns the key."""
-        key = str(reason or "other")
-        try:
-            self._step4_filter_skip_counts.setdefault(key, 0)
-            self._step4_filter_skip_counts[key] += 1
-        except Exception:
-            pass
-        return key
-
-    def _step4_skip_total(self):
-        try:
-            return int(sum(int(v or 0) for v in self._step4_filter_skip_counts.values()))
-        except Exception:
-            return 0
-
-    def _maybe_emit_step4_skip_notice(self):
-        if self._step4_filter_skip_notice_emitted:
-            return
-        self._step4_filter_skip_notice_emitted = True
-        self._emit_output("<p><font color='gray'>[Step4過濾] 已啟用精簡輸出，將改為摘要顯示</font></p>")
-
-    def _maybe_emit_step4_skip_summary(self, total):
-        try:
-            if total > 0 and total % int(self._step4_filter_skip_every) == 0:
-                self._q.put(WorkerEvent("output",
-                    "<p><font color='gray'>[Step4過濾摘要] 已略過 {} 筆"
-                    "（標籤={}、低愛心={}、無meta={}）</font></p>".format(
-                        total,
-                        int(self._step4_filter_skip_counts.get("tag", 0)),
-                        int(self._step4_filter_skip_counts.get("like", 0)),
-                        int(self._step4_filter_skip_counts.get("no_meta", 0)),
-                    )))
-        except Exception:
-            pass
-
-    def _record_step4_filter_skip(self, reason, pid_key=None):
-        key = self._bump_step4_skip_count(reason)
-        with contextlib.suppress(Exception):
-            self._diag("step4_filter_skip", reason=key, pid=str(pid_key or ""))
-        self._maybe_emit_step4_skip_notice()
-        self._maybe_emit_step4_skip_summary(self._step4_skip_total())
-
-    def _emit_step4_filter_skip_final_summary(self):
-        try:
-            total = int(sum(int(v or 0) for v in self._step4_filter_skip_counts.values()))
-        except Exception:
-            total = 0
-        if total <= 0:
-            return
-        with contextlib.suppress(Exception):
-            self._q.put(WorkerEvent("output",
-                "<p><font color='gray'>[Step4過濾完成] 共略過 {} 筆（標籤={}、低愛心={}、無meta={}）</font></p>".format(
-                    total,
-                    int(self._step4_filter_skip_counts.get("tag", 0)),
-                    int(self._step4_filter_skip_counts.get("like", 0)),
-                    int(self._step4_filter_skip_counts.get("no_meta", 0)),
-                )
-            ))
-
-
-    def _refresh_cookie_requirement(self, pid, fallback=None):
-        pid_key = normalize_pid(pid)
-        if not pid_key:
-            return fallback
-        try:
-            if isinstance(getattr(self, '_cookie_requirement_map', None), dict) and pid_key in self._cookie_requirement_map:
-                return self._cookie_requirement_map.get(pid_key)
-        except Exception:
-            pass
-
-        latest = fallback
-        # First-time resolution only: if fallback already exists, don't re-query trace.
-        if latest is None:
-            try:
-                latest = pixiv_api.get_pixiv_cookie_requirement(pid_key)
-            except Exception:
-                latest = fallback
-        try:
-            if not isinstance(getattr(self, '_cookie_requirement_map', None), dict):
-                self._cookie_requirement_map = {}
-            self._cookie_requirement_map[pid_key] = latest
-        except Exception:
-            pass
-        return latest
+    # The step4 filter-skip bookkeeping (_bump_step4_skip_count /
+    # _step4_skip_total / _maybe_emit_step4_skip_notice /
+    # _maybe_emit_step4_skip_summary / _record_step4_filter_skip /
+    # _emit_step4_filter_skip_final_summary) and the cookie-requirement /
+    # meta-for-filter fetch + _passes_pid_filter pipeline moved to
+    # step4_filters._Step4FiltersMixin (file-size refactor). Inherited unchanged.
 
     def _has_any_cookie(self):
         if self.cookie_pool:
@@ -833,159 +712,13 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
         except Exception:
             pass
 
-    def _fetch_filter_meta_via_scheduler(self, pid_key, url, need_cookie):
-        """Network fallback through the AccountScheduler — bound proxy + cooldown applies."""
-        acc = self._acquire_account()
-        if acc is None:
-            return None
-        self._record_cookie_usage("step3", pid_key, acc.cookie)
-        session = pixiv_api.make_session(acc.proxy_url)
-
-        def _do_fetch():
-            if need_cookie is False:
-                return pixiv_api.Pixiv_info(url, self.agent, session=session)
-            return pixiv_api.Pixiv_info(
-                url, self.agent, cookie=acc.cookie, session=session,
-            )
-
-        info = None
-        try:
-            ok, info, _ = self._run_with_network_retry(f"PID {pid_key}", _do_fetch)
-        except Exception:
-            ok = True
-        self._release_account(acc, ok=ok)
-        return info
-
-    def _fetch_filter_meta_direct(self, pid_key, url, need_cookie):
-        """Network fallback without a scheduler — used by tests / single-account runs."""
-        pid_cookie = self._select_cookie_for_pid(pid_key)
-        self._record_cookie_usage("step3", pid_key, pid_cookie)
-        try:
-            if need_cookie is False or not pid_cookie:
-                return pixiv_api.Pixiv_info(url, self.agent)
-            return pixiv_api.Pixiv_info(url, self.agent, cookie=pid_cookie)
-        except Exception:
-            return None
-
-    def _build_filter_meta_entry(self, url, tag, like, pagecount, img_url, need_cookie):
-        """Compose the meta dict written into self.url_meta after a filter fetch."""
-        tag_list = tag if isinstance(tag, list) else []
-        like_int = self._to_int(like, like)
-        page_int = self._to_int(pagecount, pagecount)
-        return {
-            "tag": tag_list,
-            "like": like_int,
-            "pagecount": page_int,
-            "img_url": img_url,
-            "requires_cookie": need_cookie,
-            "artwork_url": url,
-            "pixiv_info": {
-                "tag": tag_list,
-                "like": like_int,
-                "pagecount": page_int,
-                "img_url": img_url,
-                "requires_cookie": need_cookie,
-                "queried_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "source": "filter_fetch",
-            },
-        }
-
-    def _fetch_meta_for_filter(self, pid, allow_network=False):
-        pid_key = normalize_pid(pid)
-        if not pid_key:
-            return None
-        meta = self._get_meta(pid_key)
-        if meta and (meta.get("tag") is not None or meta.get("like") is not None):
-            return meta
-        if not allow_network:
-            return None
-        need_cookie = self._refresh_cookie_requirement(pid_key, fallback=None)
-        url = "https://www.pixiv.net/artworks/" + pid_key
-        # Route the network fallback through the scheduler when present so
-        # the bound proxy + per-account cooldown applies (otherwise this
-        # path bypasses proxies and hammers pixiv unthrottled — every PID
-        # rate-limits and then the whole step 4 ends up "no_meta").
-        if self._scheduler is not None:
-            info = self._fetch_filter_meta_via_scheduler(pid_key, url, need_cookie)
-        else:
-            info = self._fetch_filter_meta_direct(pid_key, url, need_cookie)
-        if info == [404]:
-            db = getattr(self, "_metadata_db", None)
-            if db is not None:
-                with contextlib.suppress(Exception):
-                    db.mark_artwork_revoked(pid_key)
-        normalized = self._normalize_pixiv_info(info)
-        if not normalized:
-            return None
-        tag, like, pagecount, img_url = normalized
-        meta = self._build_filter_meta_entry(url, tag, like, pagecount, img_url, need_cookie)
-        with contextlib.suppress(Exception):
-            self.url_meta[pid_key] = meta
-        return meta
-
-    def _filter_no_meta_decision(self):
-        """Decision when meta is unavailable: skip if a like filter is set, else keep pending."""
-        if self.like_num > 0 or self.special_like_rules:
-            return False, "no_meta"
-        return True, "no_meta"
-
-    def _filter_blocked_by_ban_tag(self, artwork_tags):
-        """True iff any ban_tag matches the artwork's tag list."""
-        return any(self._tag_hit(blocked, artwork_tags) for blocked in self._ban_tag_norm)
-
-    def _filter_missing_must_tag(self, artwork_tags):
-        """True iff at least one must_tag is configured but none match."""
-        if not self._must_tag_norm:
-            return False
-        return not any(self._tag_hit(required, artwork_tags) for required in self._must_tag_norm)
-
-    def _filter_below_like_threshold(self, artwork_tags, like_value):
-        """True iff a like threshold is configured AND the artwork's like count is below it."""
-        like_limit, _matched_rules = _resolve_like_threshold(
-            self.like_num,
-            artwork_tags,
-            self.special_like_rules,
-            self._tag_hit,
-            self._to_int,
-        )
-        return (
-            like_limit > 0
-            and like_value is not None
-            and like_value < like_limit
-        )
-
-    def _record_filter_decision(self, pid_key, passed, reason):
-        """Cache the per-PID filter decision and (when failing) emit a step4 skip event."""
-        if not passed and reason in ("tag", "like", "no_meta"):
-            self._record_step4_filter_skip(reason, pid_key=pid_key)
-        decision = (passed, reason)
-        self._pid_filter_decision[pid_key] = decision
-        return decision
-
-    def _passes_pid_filter(self, pid, allow_network=False):
-        pid_key = normalize_pid(pid)
-        if not pid_key:
-            return False, "invalid"
-        if pid_key in self._pid_filter_decision:
-            cached = self._pid_filter_decision[pid_key]
-            if cached[1] != "no_meta" or (not allow_network):
-                return cached
-
-        meta = self._fetch_meta_for_filter(pid_key, allow_network=allow_network)
-        if not isinstance(meta, dict):
-            passed, reason = self._filter_no_meta_decision()
-            return self._record_filter_decision(pid_key, passed, reason)
-
-        artwork_tags = self._normalize_artwork_tags(meta.get("tag", []))
-        if self._filter_blocked_by_ban_tag(artwork_tags):
-            return self._record_filter_decision(pid_key, False, "tag")
-        if self._filter_missing_must_tag(artwork_tags):
-            return self._record_filter_decision(pid_key, False, "tag")
-
-        like_value = self._to_int(meta.get("like"), None)
-        if self._filter_below_like_threshold(artwork_tags, like_value):
-            return self._record_filter_decision(pid_key, False, "like")
-        return self._record_filter_decision(pid_key, True, "pass")
+    # The meta-for-filter fetch fallbacks (_fetch_filter_meta_via_scheduler /
+    # _fetch_filter_meta_direct / _build_filter_meta_entry /
+    # _fetch_meta_for_filter), the per-PID filter predicates
+    # (_filter_no_meta_decision / _filter_blocked_by_ban_tag /
+    # _filter_missing_must_tag / _filter_below_like_threshold), and the
+    # _record_filter_decision / _passes_pid_filter pipeline moved to
+    # step4_filters._Step4FiltersMixin (file-size refactor). Inherited unchanged.
 
     _LEGACY_POSITIONAL_SCHEMA = [
         ("jxl_enable", bool),
@@ -1078,67 +811,8 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
     # download_thread inherits the mixin, so they stay reachable as
     # self._enqueue_jxl / self._drain_jxl_queue etc.
 
-    def _normalize_ugoira_frames(self, frame_blobs):
-        loaded_frames = []
-        max_width = 0
-        max_height = 0
-
-        for blob in frame_blobs:
-            if not blob:
-                continue
-            try:
-                with Image.open(io.BytesIO(blob)) as img:
-                    rgba = img.convert("RGBA")
-                frame = rgba.copy()
-            except Exception:
-                continue
-            width, height = frame.size
-            if width > max_width:
-                max_width = width
-            if height > max_height:
-                max_height = height
-            loaded_frames.append(frame)
-
-        if not loaded_frames:
-            raise ValueError("no valid ugoira frames to encode")
-
-        normalized_frames = []
-        target_size = (max_width, max_height)
-        for frame in loaded_frames:
-            if frame.size != target_size:
-                canvas = Image.new("RGBA", target_size, (0, 0, 0, 0))
-                canvas.paste(frame, (0, 0), frame)
-                frame = canvas
-            normalized_frames.append(frame.convert("P", palette=Image.ADAPTIVE))
-        return normalized_frames
-
-    def _save_ugoira_gif(self, frame_blobs, output_path, delay_info):
-        frames = self._normalize_ugoira_frames(frame_blobs)
-        frame_count = len(frames)
-
-        durations = []
-        if isinstance(delay_info, list) and delay_info:
-            for value in delay_info[:frame_count]:
-                try:
-                    durations.append(max(1, int(value)))
-                except Exception:
-                    durations.append(100)
-            if len(durations) < frame_count:
-                pad_value = durations[-1] if durations else 100
-                durations.extend([pad_value] * (frame_count - len(durations)))
-        else:
-            durations = [100] * frame_count
-
-        frames[0].save(
-            output_path,
-            format="GIF",
-            save_all=True,
-            append_images=frames[1:],
-            duration=durations,
-            loop=0,
-            optimize=False,
-            disposal=2,
-        )
+    # _normalize_ugoira_frames / _save_ugoira_gif moved to
+    # step4_media._Step4MediaMixin (file-size refactor). Inherited unchanged.
 
     # _normalize_tag_for_filename / _build_hashtag_text / _split_timetag /
     # _filename_template_fields / _render_template_filename /
@@ -1567,7 +1241,6 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
         return None
 
     def splitID(self, Filelist):
-        print(len(Filelist))
         parsers = (
             self._parse_pid_from_pid_equals,
             self._parse_pid_from_pid_prefix,
@@ -1866,14 +1539,17 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
         except Exception:
             failed_to_download = []
         try:
-            with self._attempted_urls_lock:
-                attempted_snapshot = set(self._attempted_urls)
+            with self._completed_urls_lock:
+                completed_snapshot = set(self._completed_urls)
         except Exception:
-            attempted_snapshot = set()
-        unattempted_urls = [u for u in self.allurl if u not in attempted_snapshot]
+            completed_snapshot = set()
+        # Anything not confirmed-on-disk is still owed: this includes genuinely
+        # unattempted URLs AND attempted-but-failed / network-exhausted /
+        # stop-interrupted ones, so none of them are silently dropped.
+        not_completed_urls = [u for u in self.allurl if u not in completed_snapshot]
         remaining_urls = []
         seen = set()
-        for u in stop_to_download + failed_to_download + unattempted_urls:
+        for u in stop_to_download + failed_to_download + not_completed_urls:
             if u in seen:
                 continue
             seen.add(u)
@@ -1882,9 +1558,9 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
             "step4_remaining_computed",
             stop_queue_count=len(stop_to_download),
             failed_url_count=len(failed_to_download),
-            unattempted_count=len(unattempted_urls),
+            not_completed_count=len(not_completed_urls),
             remaining_count=len(remaining_urls),
-            attempted_count=len(attempted_snapshot),
+            completed_count=len(completed_snapshot),
         )
         return remaining_urls
 
@@ -1949,18 +1625,21 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
             if lock is not None:
                 lock.release()
 
-    def _mark_completed_urls_in_db(self, fail_records):
-        """Mark URLs that were attempted and didn't fail as done in SQLite.
-        Silently skips if the DB is not wired or anything goes wrong — this
-        is purely an optimisation for subsequent runs."""
+    def _mark_completed_urls_in_db(self):
+        """Mark URLs whose page is confirmed on disk as 'downloaded' in SQLite.
+
+        Only genuinely-completed URLs (see :meth:`_record_completed`) are
+        marked — a network-retry-exhausted or stop-interrupted URL is *not* in
+        ``self._completed_urls`` and therefore stays ``status='pending'`` so the
+        next run re-queues it. Silently skips if the DB is not wired or anything
+        goes wrong — this is purely an optimisation for subsequent runs."""
         db = getattr(self, "_metadata_db", None)
         if db is None:
             return
         try:
-            fail_url_set = {str(u) for u, _ in fail_records}
-            with self._attempted_urls_lock:
-                attempted = set(self._attempted_urls)
-            done_urls = [u for u in self.allurl if u in attempted and u not in fail_url_set]
+            with self._completed_urls_lock:
+                completed = set(self._completed_urls)
+            done_urls = [u for u in self.allurl if u in completed]
             db.mark_urls_done(done_urls)
         except Exception:
             pass
@@ -1979,7 +1658,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
             except Empty:
                 break
         remaining_urls = self._compute_remaining_urls(stop_to_download, fail_records)
-        self._mark_completed_urls_in_db(fail_records)
+        self._mark_completed_urls_in_db()
         self._write_all_url_file(remaining_urls, reason="step4_remaining")
         self._emit_output(f"<p><font color='gray'>已更新 all_url.txt，剩餘 {len(remaining_urls)} 筆待下載</font></p>")
         self._persist_url_meta()
@@ -2177,15 +1856,32 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
             pass
 
     def _record_attempted_and_advance(self, original_url):
-        """Mark a URL as attempted and bump the progress counter."""
+        """Mark a URL as attempted and bump the progress counter.
+
+        Being *attempted* only drives progress display — it does NOT imply the
+        page landed on disk. Completion is tracked separately by
+        :meth:`_record_completed` so a failed/stopped attempt is never mistaken
+        for a download."""
         try:
             with self._attempted_urls_lock:
                 self._attempted_urls.add(original_url)
         except Exception:
             pass
         if not self._stop_event.is_set():
-            self.pid_now = self.pid_now + 1
             self._q.put(WorkerEvent("progress", (1, self.pid_max)))
+
+    def _record_completed(self, original_url):
+        """Record a URL whose page is confirmed on disk.
+
+        Called only on a genuine download success (``ret == 0``) or an
+        already-existing skip (``ret == -1``). These are the sole URLs that
+        :meth:`_mark_completed_urls_in_db` flips to ``status='downloaded'`` and
+        that :meth:`_compute_remaining_urls` drops from the retry set."""
+        try:
+            with self._completed_urls_lock:
+                self._completed_urls.add(original_url)
+        except Exception:
+            pass
 
     @staticmethod
     def _extract_pid_from_pximg_url(resolved_url, *, is_ugoira):
@@ -2199,7 +1895,6 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
         """Choose gif_download vs jpg_download, swap original_url back into the result."""
         pid = self._extract_pid_from_pximg_url(resolved_url, is_ugoira=is_ugoira)
         if pid in self.exist_pid:
-            print('頝喲?')
             return -1
         if is_ugoira:
             ret = self.gif_download(resolved_url, session=session)
@@ -2216,357 +1911,29 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
         self._pause_event.wait()
         self._record_attempted_and_advance(original_url)
         if self._stop_event.is_set():
+            # Stop fired before this page was fetched: hand the URL back to the
+            # remaining-queue and return the 0 sentinel WITHOUT recording it as
+            # completed, so it stays pending and is retried next run.
             self.q.put(original_url)
             return 0
         is_ugoira = 'ugoira' in resolved_url
-        return self._dispatch_download(original_url, resolved_url, session, is_ugoira)
-    def _stamp_step4_gif_cookie_usage(self, pid_key, source):
-        """Mark requires_cookie + cookie_used on the in-memory url_meta entry and DB."""
-        try:
-            meta = dict(self._get_meta(pid_key))
-            meta["requires_cookie"] = True
-            meta["cookie_used"] = True
-            meta["cookie_used_source"] = str(source)
-            meta["cookie_used_updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.url_meta[pid_key] = meta
-            self._upsert_meta_in_db(pid_key, meta)
-        except Exception:
-            pass
-
-    def _atomic_write_url_meta_with_raw_fallback(self):
-        """atomic_write_json with raw open()-fallback on failure."""
-        try:
-            atomic_write_json(self.url_meta_path, self.url_meta, backup=True)
-        except Exception:
-            try:
-                with open(self.url_meta_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.url_meta, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-
-    def _mark_gif_cookie_usage(self, pid, used, source="unknown"):
-        pid_key = normalize_pid(pid) or str(pid)
-        used_flag = bool(used)
-        with contextlib.suppress(Exception):
-            self._pid_cookie_used[pid_key] = used_flag
-        if not used_flag:
-            return
-
-        # Hold _url_meta_lock so the read-modify-write of self.url_meta and
-        # the JSON serialization-then-replace cannot race a concurrent worker.
-        lock = getattr(self, "_url_meta_lock", None)
-        if lock is not None:
-            lock.acquire()
-        try:
-            self._stamp_step4_gif_cookie_usage(pid_key, source)
-            self._atomic_write_url_meta_with_raw_fallback()
-        finally:
-            if lock is not None:
-                lock.release()
-
-        with contextlib.suppress(Exception):
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='blue'>[GIF][Cookie] PID {pid_key} 使用 cookies（來源：{source}），已更新 all_url_meta 暫存</font></p>"
-            ))
-
-    def _stream_ugoira_zip_bytes(self, url, headers, http, pid_cookie):
-        """Fetch a ugoira zip URL and return the full bytes blob (or None on error).
-
-        Advances ``self.download_time`` (under timelock) and reports stats
-        when streaming succeeds, matching the original inline behavior.
-        """
-        try:
-            resp = http.get(url, headers=headers, stream=True)
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
-            raise
-        except Exception:
-            return None
-        if resp.status_code != 200:
-            return None
-        chunks = [data for data in resp.iter_content(chunk_size=65536) if data]
-        zip_bytes = b"".join(chunks)
-        if self._stats_collector is not None and zip_bytes:
-            self._stats_collector.report_bytes(len(zip_bytes))
-            label = _cookie_usage_label(pid_cookie, self.cookie_pool, self._cookie_alias_map)
-            self._stats_collector.report_request(label)
-        return zip_bytes or None
-
-    def _extract_ugoira_frame_blobs(self, zip_bytes):
-        """Return the per-frame byte blobs from a ugoira zip, in archive order."""
-        frame_blobs = []
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zipo:
-            for member in zipo.namelist():
-                if member.endswith('/'):
-                    continue
-                frame_blobs.append(zipo.read(member))
-        return frame_blobs
-
-    def _build_ugoira_save_path(self, pid, tag, my_time):
-        """Build the absolute save path for a ugoira GIF, with fallback on naming failure."""
-        try:
-            hashtag = self._build_hashtag_text(tag, max_len=230)
-            name = self._build_download_filename(
-                pid,
-                page_suffix="",
-                ext="gif",
-                hashtag=hashtag,
-                timetag=my_time.strftime('%Y%m%d_%H%M%S'),
-                notag=self.notag,
-                notime=self.notime,
-                template=getattr(self, "filename_template", ""),
-            )
-        except Exception:
-            name = 'illust_' + pid + my_time.strftime('_%Y%m%d_%H%M%S.gif')
-        target_dir = self._resolve_download_target_dir(tag, pid, media_kind='GIF')
-        return os.path.join(target_dir, name)
-
-    def _diag_ugoira_meta_fetch(self, pid, meta_trace):
-        """Append a step4 diagnostic record describing the ugoira meta fetch result."""
-        with contextlib.suppress(Exception):
-            self._diag(
-                "ugoira_meta_fetch",
-                pid=str(pid),
-                first_try_status=meta_trace.get("first_try_status"),
-                retry_used=bool(meta_trace.get("retry_used")),
-                retry_with_cookie_status=meta_trace.get("retry_with_cookie_status"),
-                final_status=meta_trace.get("final_status"),
-            )
-
-    def _maybe_mark_meta_retry_cookie(self, pid, meta_trace):
-        """If the with-cookie retry succeeded, record cookie usage and return True."""
-        try:
-            retry_used = bool(meta_trace.get("retry_used"))
-            retry_status = int(meta_trace.get("retry_with_cookie_status") or 0)
-        except Exception:
-            return False
-        if retry_used and retry_status == 200:
-            self._mark_gif_cookie_usage(pid, True, source="ugoira_meta_retry")
-            return True
-        return False
-
-    @staticmethod
-    def _parse_ugoira_meta_payload(htmlfile, pid):
-        """Parse the ugoira_meta JSON. Returns (download_url, delay_info) or None on bad payload."""
-        try:
-            gif_info = json.loads(htmlfile.content)['body']
-            download_url = gif_info['originalSrc']
-            delay_info = [item["delay"] for item in gif_info["frames"]]
-            return download_url, delay_info
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            print(f"[pixiv_thread] PID {pid} JSON parse failed: {e}")
-            print(f"[pixiv_thread] response preview: {htmlfile.text[:500]}")
-            return None
-
-    def _fetch_ugoira_meta(self, pid, pid_cookie, need_cookie, session):
-        """Fetch ugoira_meta with cookie-retry. Returns (download_url, delay_info, need_cookie)
-        on success, or ``None`` on any failure (404 / parse error / non-200)."""
-        url = f'https://www.pixiv.net/ajax/illust/{pid}/ugoira_meta?lang=zh_tw'
-        headers = self._build_artwork_headers(pid, pid_cookie, need_cookie)
-        self._mark_gif_cookie_usage(
-            pid,
-            bool(need_cookie is True and pid_cookie),
-            source="ugoira_meta_initial",
-        )
-        http = session if session is not None else requests
-        htmlfile, meta_trace, first_try_resp = fetch_with_cookie_retry(
-            http_get=http.get,
-            url=url,
-            headers=headers,
-            cookies=pid_cookie,
-            retry_statuses=(403, 404),
-        )
-        if self._maybe_mark_meta_retry_cookie(pid, meta_trace):
-            need_cookie = True
-        self._diag_ugoira_meta_fetch(pid, meta_trace)
-        if htmlfile.status_code != 200:
-            self._log_ugoira_meta_failure(pid, htmlfile, meta_trace, first_try_resp)
-            return None
-        htmlfile.raise_for_status()
-        if self._stats_collector is not None:
-            label = _cookie_usage_label(pid_cookie, self.cookie_pool, self._cookie_alias_map)
-            self._stats_collector.report_request(label)
-        parsed = self._parse_ugoira_meta_payload(htmlfile, pid)
-        if parsed is None:
-            return None
-        download_url, delay_info = parsed
-        return download_url, delay_info, need_cookie
-
-    def gif_download(self, url, session=None):
-        with self.timelock:
-            my_time = self.download_time
-        try:
-            pid, pid_cookie, need_cookie = self._resolve_pid_and_cookie(url, source="step4")
-            normalized = self._load_artwork_metadata(pid, pid_cookie)
-            if not normalized:
-                with contextlib.suppress(Exception):
-                    self._q.put(WorkerEvent("output",
-                        f"<p><font color='orange'>PID {pid} 取得 ugoira 資訊失敗，"
-                        f"已標記為失敗任務</font></p>"))
-                return [url, my_time.strftime('%Y%m%d_%H%M%S')]
-            tag, like, pagecount, img_url = normalized
-            meta = self._fetch_ugoira_meta(pid, pid_cookie, need_cookie, session)
-            if meta is None:
-                return None
-            download_url, delay_info, need_cookie = meta
-            url = download_url
-            http = session if session is not None else requests
-            headers = self._build_artwork_headers(pid, pid_cookie, need_cookie, honour_pid_used=True)
-            with self.timelock:
-                my_time = self.download_time
-                self.download_time = self.download_time + datetime.timedelta(seconds=1)
-            zip_bytes = self._stream_ugoira_zip_bytes(url, headers, http, pid_cookie)
-            if not zip_bytes:
-                return [url, my_time.strftime('%Y%m%d_%H%M%S')]
-            frame_blobs = self._extract_ugoira_frame_blobs(zip_bytes)
-            if not frame_blobs:
-                return [url, my_time.strftime('%Y%m%d_%H%M%S')]
-            saved_gif_path = self._build_ugoira_save_path(pid, tag, my_time)
-            self._save_ugoira_gif(frame_blobs, saved_gif_path, delay_info)
-            self._apply_download_mtime(saved_gif_path, my_time)
-            if self._stats_collector is not None:
-                self._stats_collector.report_file(True)
-            self._enqueue_jxl(saved_gif_path)
-            return 0
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
-            # Network/proxy failures must propagate so the scheduler-aware caller
-            # can disable the cookie/proxy for this run.
-            raise
-        except Exception as err:
-            print(err, self.cookies)
-        return [url, my_time.strftime('%Y%m%d_%H%M%S')]
-
-    _JPG_USER_AGENT = (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-        '(KHTML, like Gecko) Chrome/99.0.4844.82 Safari/537.36'
-    )
-
-    def _jpg_advance_timetag(self):
-        """Reserve and return a unique timetag for this download (timelock-guarded)."""
-        with self.timelock:
-            timetag = self.download_time.strftime('%Y%m%d_%H%M%S')
-            self.download_time += datetime.timedelta(seconds=1)
-        return timetag
-
-    @staticmethod
-    def _jpg_extract_page_and_format(url):
-        """Pull the page number and file extension out of a pximg URL."""
-        url_str = str(url)
-        page = url_str.rsplit('_', 1)[1].rsplit('.', 1)[0]
-        picture_format = url_str.rsplit('.', 1)[1]
-        return page, picture_format
-
-    def _jpg_build_headers(self, pid, pid_cookie, need_cookie):
-        """Headers for the jpg fetch — same shape as gif but with a different UA."""
-        headers = self._build_artwork_headers(pid, pid_cookie, need_cookie)
-        headers['User-Agent'] = self._JPG_USER_AGENT
-        return headers
-
-    def _jpg_resolve_filename(self, pid, page_suffix, ext, tag, timetag):
-        """Build the final filename, falling back to a safe default on any error."""
-        try:
-            hashtag = self._build_hashtag_text(tag, max_len=230)
-            return self._build_download_filename(
-                pid,
-                page_suffix=page_suffix,
-                ext=ext,
-                hashtag=hashtag,
-                timetag=timetag,
-                notag=self.notag,
-                notime=self.notime,
-                template=getattr(self, "filename_template", ""),
-            )
-        except Exception:
-            return 'illust_' + pid + page_suffix + timetag + '.' + ext
-
-    def _apply_download_mtime(self, filepath, when):
-        """Set the saved file's atime/mtime to its timetag (download.set_file_mtime).
-
-        ``when`` is either a 'YYYYMMDD_HHMMSS' timetag string or a datetime.
-        Keeps the on-disk timestamp consistent with the timestamp embedded in
-        the filename. Best-effort: never fails the download.
-        """
-        if not getattr(self, "set_file_mtime", False):
-            return
-        try:
-            if isinstance(when, str):
-                when = datetime.datetime.strptime(when, '%Y%m%d_%H%M%S')
-            ts = when.timestamp()
-            os.utime(filepath, (ts, ts))
-        except Exception:
-            pass
-
-    def _jpg_stream_to_disk(self, htmlfile, filepath):
-        """Stream the HTTP body to disk in 1 KiB chunks; returns total bytes written."""
-        size = 0
-        chunk_size = 1024
-        with open(filepath, 'wb') as file:
-            for data in htmlfile.iter_content(chunk_size=chunk_size):
-                file.write(data)
-                size += len(data)
-        return size
-
-    def _jpg_attempt(self, url, session, timetag):
-        """One download attempt. Returns 0 on success, None on a recoverable error."""
-        pid, pid_cookie, need_cookie = self._resolve_pid_and_cookie(url, source="step4")
-        normalized = self._load_artwork_metadata(pid, pid_cookie)
-        if not normalized:
-            raise ValueError("Pixiv_info 回傳格式異常")
-        tag, like, pagecount, img_url = normalized
-        if like == 404 and tag == 404:
-            db = getattr(self, "_metadata_db", None)
-            if db is not None:
-                with contextlib.suppress(Exception):
-                    db.mark_artwork_revoked(pid)
-            return 0  # treat as success — nothing to download
-        page, picture_format = self._jpg_extract_page_and_format(url)
-        headers = self._jpg_build_headers(pid, pid_cookie, need_cookie)
-        with contextlib.suppress(Exception):
-            self._pid_cookie_used[str(pid)] = bool(need_cookie is True and pid_cookie)
-        http = session if session is not None else requests
-        htmlfile = http.get(url, headers=headers, stream=True, timeout=5)
-        htmlfile.raise_for_status()
-        if self._stats_collector is not None:
-            label = _cookie_usage_label(pid_cookie, self.cookie_pool, self._cookie_alias_map)
-            self._stats_collector.report_request(label)
-        if htmlfile.status_code != 200:
-            return 0
-        name = self._jpg_resolve_filename(pid, page, picture_format, tag, timetag)
-        target_dir = self._resolve_download_target_dir(str(tag), pid)
-        filepath = os.path.join(target_dir, name)
-        size = self._jpg_stream_to_disk(htmlfile, filepath)
-        self._apply_download_mtime(filepath, timetag)
-        if self._stats_collector is not None:
-            self._stats_collector.report_bytes(size)
-            self._stats_collector.report_file(True)
-        self._enqueue_jxl(filepath)
-        return 0
-
-    def jpg_download(self, url, session=None):
-        timetag = self._jpg_advance_timetag()
-        last_err = None
-        for i in range(0, 5):  # 最多重試 5 次，失敗就回傳錯誤
-            try:
-                return self._jpg_attempt(url, session, timetag)
-            except (requests.exceptions.ProxyError,
-                    requests.exceptions.ConnectTimeout,
-                    requests.exceptions.ConnectionError):
-                # Bypass the retry loop entirely — the proxy is dead, retrying
-                # against the same proxy will not help. Let the scheduler disable
-                # this cookie via release(ok=False).
-                raise
-            except Exception as err:
-                last_err = err
-                if i < 4:
-                    time.sleep(min(30.0, (2 ** i) + pyrandom.random()))
-                    continue
-        print(last_err)
-        if self._stats_collector is not None:
-            self._stats_collector.report_file(False)
-        return [url, timetag]
+        ret = self._dispatch_download(original_url, resolved_url, session, is_ugoira)
+        # ret == 0  -> genuine download success; ret == -1 -> already on disk.
+        # Both mean the page is present, so they (and only they) count as done.
+        # ret is None / a fail list -> not recorded, stays pending for retry.
+        if ret == 0 or ret == -1:
+            self._record_completed(original_url)
+        return ret
+    # The per-page media subsystem (cookie-usage stamping:
+    # _stamp_step4_gif_cookie_usage / _atomic_write_url_meta_with_raw_fallback /
+    # _mark_gif_cookie_usage; ugoira: _stream_ugoira_zip_bytes /
+    # _extract_ugoira_frame_blobs / _build_ugoira_save_path /
+    # _diag_ugoira_meta_fetch / _maybe_mark_meta_retry_cookie /
+    # _parse_ugoira_meta_payload / _fetch_ugoira_meta / gif_download; jpg:
+    # _JPG_USER_AGENT / _jpg_advance_timetag / _jpg_extract_page_and_format /
+    # _jpg_build_headers / _jpg_resolve_filename / _apply_download_mtime /
+    # _jpg_stream_to_disk / _jpg_attempt / jpg_download) moved to
+    # step4_media._Step4MediaMixin (file-size refactor). Inherited unchanged.
 
     def flush_for_shutdown(self):
         """Synchronously persist in-flight metadata and close the SQLite cache.

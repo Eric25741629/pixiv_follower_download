@@ -38,36 +38,14 @@ def _settings_store() -> SettingsStore:
 def _event_log_kwargs() -> dict:
     """Read othersettings.event_log durability/rotation knobs for EventLog.
 
-    Defaults batch the fsync (200 events / 1s) so the common write path no
-    longer pays a per-mutation disk barrier; anchor kinds and close() still
-    fsync. Missing/invalid values fall back to the defaults.
+    Thin wrapper over the Flet-free ``event_log_kwargs_from_settings`` (in
+    app.core.event_log) so the GUI and the headless CLI share one reader and the
+    CLI never has to import this Flet module just to read these knobs.
     """
-    try:
-        cfg = _settings_store().get_section("event_log")
-    except Exception:
-        cfg = {}
-    if not isinstance(cfg, dict):
-        cfg = {}
-
-    def _i(key, default):
-        try:
-            return int(cfg.get(key, default))
-        except (TypeError, ValueError):
-            return default
-
-    def _f(key, default):
-        try:
-            return float(cfg.get(key, default))
-        except (TypeError, ValueError):
-            return default
-
-    return {
-        "retention_days": _i("retention_days", 60),
-        "fsync_every_n": _i("fsync_every_n", 200),
-        "fsync_interval_sec": _f("fsync_interval_sec", 1.0),
-        "max_total_bytes": _i("max_total_bytes", 4 * 1024 * 1024 * 1024),
-        "rotate_size_bytes": _i("rotate_size_bytes", 128 * 1024 * 1024),
-    }
+    from app.core.event_log import event_log_kwargs_from_settings
+    path = os.getenv("APPDATA") + r"/pixiv_download/"
+    os.makedirs(path, exist_ok=True)
+    return event_log_kwargs_from_settings(path)
 
 
 def _load_theme_mode() -> ft.ThemeMode:

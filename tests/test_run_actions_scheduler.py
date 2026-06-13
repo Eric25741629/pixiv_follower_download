@@ -205,6 +205,11 @@ def test_invalidate_cookie_status_writes_失效(run_controller, monkeypatch):
         def update_section(self, name, value):
             captured["value"] = value
 
+        def mutate_section(self, name, mutator):
+            # Mirror SettingsStore.mutate_section: run the mutator on the loaded
+            # section and capture the result (the RMW now happens in one lock).
+            captured["value"] = mutator(self.get_section(name))
+
     monkeypatch.setattr("app.gui.run_actions._store", lambda: FakeStore())
 
     run_controller._invalidate_cookie_status("c1")

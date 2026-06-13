@@ -1,10 +1,7 @@
 import contextlib
-import time
-import json
 import os
 import datetime
 import re
-import glob
 import random as pyrandom
 import threading
 import requests
@@ -12,32 +9,25 @@ from queue import Queue
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
 import pixiv_api
-from app.core.metadata_db import MetadataDB, emit_db_stats, open_metadata_db
 from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
-    atomic_write_json,
-    atomic_write_text,
-    canonicalize_pximg_url_for_storage,
     cookie_usage_label,
     count_text_lines,
     init_cookie_fields,
-    mirror_meta_dict_to_db,
-    normalize_filter_tags,
     normalize_pid,
     normalize_pid_set,
     output_err,
     read_pid_lines,
     safe_read_json,
     to_int_lenient,
-    write_all_url_file,
 )
 from app.core.pixiv_thread_base import (
     PauseableThread,
     _normalize_special_like_rules,
-    _resolve_like_threshold,
-    _cookie_usage_label,
-    _format_cookie_usage_summary,
 )
+from app.core.step3_filters import _Step3FiltersMixin
+from app.core.step3_meta_migration import _Step3MigrationMixin
+from app.core.step3_persistence import _Step3PersistenceMixin
 
 def _safe_meta_count(db) -> int:
     try:
@@ -46,7 +36,8 @@ def _safe_meta_count(db) -> int:
         return 0
 
 
-class get_img_url_thread(PauseableThread):
+class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
+                         _Step3MigrationMixin, _Step3PersistenceMixin):
     pid_max=0
     pid_now=0
     path=os.getenv('APPDATA')+r'/pixiv_download/'
@@ -259,177 +250,6 @@ class get_img_url_thread(PauseableThread):
     def _to_int(self, value, default=None):
         return to_int_lenient(value, default)
 
-    def _cookie_requirement_primary_paths(self):
-        """Candidate paths for the canonical pixiv_cookie_requirement.json file."""
-        candidates = []
-        try:
-            p = os.path.join(self.path, "pixiv_cookie_requirement.json")
-            candidates.append(p)
-        except Exception:
-            pass
-        try:
-            appdata_root = os.path.join(os.getenv('APPDATA') or "", "pixiv_download")
-            p = os.path.join(appdata_root, "pixiv_cookie_requirement.json")
-            if p not in candidates:
-                candidates.append(p)
-        except Exception:
-            pass
-        return candidates
-
-    def _cookie_requirement_history_paths(self, primary_candidates):
-        """All sibling history/ backups for the given primary files, newest first."""
-        history_candidates = []
-        for base_file in primary_candidates:
-            try:
-                hist_dir = os.path.join(os.path.dirname(base_file), "history")
-                pattern = os.path.join(hist_dir, os.path.basename(base_file) + ".*")
-                found = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-                for fp in found:
-                    if fp not in history_candidates:
-                        history_candidates.append(fp)
-            except Exception:
-                pass
-        return history_candidates
-
-    @staticmethod
-    def _read_cookie_requirement_json(file_path):
-        """Read a cookie-requirement JSON file. Returns the dict or None on any failure."""
-        try:
-            if not os.path.isfile(file_path):
-                return None
-            with open(file_path, encoding="utf-8", errors="ignore") as f:
-                data = json.load(f)
-        except Exception:
-            return None
-        return data if isinstance(data, dict) else None
-
-    @staticmethod
-    def _apply_cookie_requirement_entry(merged, pid_key, req):
-        """Fold one (pid, req) into the merged dict using first-wins / None-upgrade rules."""
-        if pid_key not in merged:
-            merged[pid_key] = req
-        elif merged.get(pid_key) is None and req in (True, False):
-            merged[pid_key] = req
-
-    def _merge_cookie_requirement_file(self, file_path, merged):
-        """Read one cookie-requirement JSON and fold its entries into ``merged``.
-
-        Earlier files (primary) win over later (history) — the caller orders
-        the file list. A history backup may upgrade an existing ``None`` entry
-        to a concrete True/False, but never overwrites a real value.
-        """
-        data = self._read_cookie_requirement_json(file_path)
-        if data is None:
-            return
-        for raw_pid, entry in data.items():
-            pid_key = normalize_pid(raw_pid)
-            if not pid_key:
-                continue
-            req = entry.get("requires_cookie", None) if isinstance(entry, dict) else None
-            if req not in (True, False, None):
-                continue
-            self._apply_cookie_requirement_entry(merged, pid_key, req)
-
-    def _load_saved_cookie_requirement_map(self):
-        # Only reached from _migrate_url_meta_schema, which now early-returns
-        # when url_meta is empty (always the case in Steps 3/4 — meta is read
-        # on-demand from the DB). So the costly primary+history parse of the
-        # large pixiv_cookie_requirement.json files is skipped in the hot path;
-        # the gap-fill-from-history contract below is preserved for the rare
-        # case where in-memory url_meta is non-empty.
-        merged = {}
-        primary = self._cookie_requirement_primary_paths()
-        history = self._cookie_requirement_history_paths(primary)
-        for file_path in primary + history:
-            self._merge_cookie_requirement_file(file_path, merged)
-        return merged
-
-    def _seed_cookie_requirement_map(self, saved_req_map):
-        """Backfill self._cookie_requirement_map from the saved trace file."""
-        try:
-            if not isinstance(self._cookie_requirement_map, dict):
-                self._cookie_requirement_map = {}
-            for pid, req in saved_req_map.items():
-                if pid not in self._cookie_requirement_map:
-                    self._cookie_requirement_map[pid] = req
-        except Exception:
-            pass
-
-    @staticmethod
-    def _resolve_required_cookie_value(meta, pinfo, saved_req_map, pid_norm):
-        """Pick the best available 'requires_cookie' for ``meta``.
-
-        Priority: meta['requires_cookie'] → pinfo['requires_cookie'] → saved trace.
-        Returns ``None`` when no source has a value.
-        """
-        req = meta.get("requires_cookie", None)
-        if req is None and isinstance(pinfo, dict):
-            req = pinfo.get("requires_cookie", None)
-        if req is None and isinstance(saved_req_map, dict):
-            req = saved_req_map.get(pid_norm, None)
-        return req
-
-    @staticmethod
-    def _build_migrated_pixiv_info(meta, req):
-        """Build the pixiv_info sub-dict from legacy top-level fields."""
-        return {
-            "tag": meta.get("tag", []) if isinstance(meta.get("tag"), list) else [],
-            "like": meta.get("like", 0),
-            "pagecount": meta.get("pagecount", 0),
-            "img_url": meta.get("img_url", None),
-            "requires_cookie": req,
-            "queried_at": "",
-            "source": "migrated",
-        }
-
-    _MIGRATE_SENTINEL = object()
-
-    def _migrate_one_url_meta_entry(self, pid_key, meta, saved_req_map):
-        """Migrate a single url_meta entry. Returns True iff anything changed."""
-        if not isinstance(meta, dict):
-            return False
-        pid_norm = normalize_pid(pid_key) or str(pid_key)
-        pinfo = meta.get("pixiv_info")
-        req = self._resolve_required_cookie_value(meta, pinfo, saved_req_map, pid_norm)
-        changed = False
-
-        if meta.get("requires_cookie", self._MIGRATE_SENTINEL) != req:
-            meta["requires_cookie"] = req
-            changed = True
-
-        if not isinstance(pinfo, dict):
-            meta["pixiv_info"] = self._build_migrated_pixiv_info(meta, req)
-            self.url_meta[pid_key] = meta
-            return True
-
-        if pinfo.get("requires_cookie", self._MIGRATE_SENTINEL) != req:
-            pinfo["requires_cookie"] = req
-            meta["pixiv_info"] = pinfo
-            self.url_meta[pid_key] = meta
-            changed = True
-        return changed
-
-    def _migrate_url_meta_schema(self):
-        if not isinstance(self.url_meta, dict) or not self.url_meta:
-            # Steps 3/4 load meta on-demand from the DB, so url_meta starts
-            # empty — there is nothing to migrate. Returning early avoids the
-            # (now history-skipped, but still non-trivial) cookie-requirement
-            # file parse when no in-memory meta exists. The dedicated
-            # _load_cookie_requirement_cache() still seeds the runtime map.
-            return False
-        try:
-            saved_req_map = self._load_saved_cookie_requirement_map()
-            self._seed_cookie_requirement_map(saved_req_map)
-            changed = False
-            for pid_key, meta in list(self.url_meta.items()):
-                if self._migrate_one_url_meta_entry(pid_key, meta, saved_req_map):
-                    changed = True
-            if changed:
-                atomic_write_json(self.url_meta_path, self.url_meta, backup=True)
-        except Exception:
-            return False
-        return changed
-
     def _set_requires_cookie_meta(self, pid, need_cookie):
         pid_key = normalize_pid(pid) or str(pid)
         try:
@@ -440,250 +260,6 @@ class get_img_url_thread(PauseableThread):
                 pixiv_info["requires_cookie"] = need_cookie
                 meta["pixiv_info"] = pixiv_info
             self.url_meta[pid_key] = meta
-        except Exception:
-            pass
-
-    def _normalize_filter_tags(self, tags):
-        return normalize_filter_tags(tags)
-
-    def _normalize_artwork_tags(self, tag):
-        if isinstance(tag, list):
-            source = tag
-        elif tag in (None, 404):
-            source = []
-        else:
-            source = [tag]
-        result = []
-        for t in source:
-            s = str(t).strip()
-            if s:
-                result.append(s.lower())
-        return result
-
-    def _tag_hit(self, target_tag, artwork_tags):
-        key = str(target_tag).strip().lower()
-        if not key:
-            return False
-        for item in artwork_tags:
-            if key in item:
-                return True
-        return False
-
-    def _bump_step3_skip_count(self, reason):
-        """Increment a counter, creating the key on first sight."""
-        try:
-            key = str(reason or "other")
-            self._step3_filter_skip_counts.setdefault(key, 0)
-            self._step3_filter_skip_counts[key] += 1
-            return key
-        except Exception:
-            return str(reason or "other")
-
-    def _step3_skip_total(self):
-        """Sum of all step3 filter skip counters."""
-        try:
-            return int(sum(int(v or 0) for v in self._step3_filter_skip_counts.values()))
-        except Exception:
-            return 0
-
-    def _maybe_emit_step3_skip_notice(self):
-        """Emit the one-time '已啟用精簡輸出' notice the first time we filter."""
-        if self._step3_filter_skip_notice_emitted:
-            return
-        self._step3_filter_skip_notice_emitted = True
-        try:
-            self._q.put(WorkerEvent("output",
-                "<p><font color='gray'>[Step3過濾] 已啟用精簡輸出；詳細 PID 可查看 "
-                "tag_ban_pid.txt 與 pid_num_pid.txt</font></p>"
-            ))
-        except Exception:
-            pass
-
-    def _maybe_emit_step3_skip_summary(self, total):
-        """Emit a summary every Nth skip."""
-        try:
-            if total > 0 and total % int(self._step3_filter_skip_every) == 0:
-                self._q.put(WorkerEvent("output",
-                    "<p><font color='gray'>[Step3過濾摘要] 已略過 {} 筆"
-                    "（標籤={}、必含標籤={}、低愛心={}）</font></p>".format(
-                        total,
-                        int(self._step3_filter_skip_counts.get("ban_tag", 0)),
-                        int(self._step3_filter_skip_counts.get("must_tag", 0)),
-                        int(self._step3_filter_skip_counts.get("like", 0)),
-                    )
-                ))
-        except Exception:
-            pass
-
-    def _record_step3_filter_skip(self, reason, pid_key=None):
-        key = self._bump_step3_skip_count(reason)
-        try:
-            self._diag("step3_filter_skip", reason=key, pid=str(pid_key or ""))
-        except Exception:
-            pass
-        self._maybe_emit_step3_skip_notice()
-        self._maybe_emit_step3_skip_summary(self._step3_skip_total())
-
-    def _emit_step3_filter_skip_final_summary(self):
-        try:
-            total = int(sum(int(v or 0) for v in self._step3_filter_skip_counts.values()))
-        except Exception:
-            total = 0
-        if total <= 0:
-            return
-        try:
-            self._q.put(WorkerEvent("output",
-                "<p><font color='gray'>[Step3過濾完成] 共略過 {} 筆（標籤={}、必含標籤={}、低愛心={}）</font></p>".format(
-                    total,
-                    int(self._step3_filter_skip_counts.get("ban_tag", 0)),
-                    int(self._step3_filter_skip_counts.get("must_tag", 0)),
-                    int(self._step3_filter_skip_counts.get("like", 0)),
-                )
-            ))
-        except Exception:
-            pass
-
-    def _bump_step3_query_source(self, query_source):
-        """Increment the per-source query counter (network/cache/skip)."""
-        source = str(query_source or "skip").strip().lower()
-        if source not in self._step3_query_counts:
-            source = "skip"
-        try:
-            self._step3_query_counts[source] += 1
-        except Exception:
-            pass
-
-    def _bump_step3_cookie_requirement(self, need_cookie):
-        """Increment the per-need_cookie counter (need/free/unknown)."""
-        if need_cookie is True:
-            key = "need"
-        elif need_cookie is False:
-            key = "free"
-        else:
-            key = "unknown"
-        try:
-            self._step3_cookie_req_counts[key] += 1
-        except Exception:
-            pass
-
-    def _maybe_emit_step3_progress(self):
-        """Emit a non-final summary every Nth query, if the total is past zero."""
-        try:
-            total = int(sum(int(v or 0) for v in self._step3_query_counts.values()))
-        except Exception:
-            return
-        try:
-            if total > 0 and total % int(self._step3_query_notice_every) == 0:
-                self._emit_step3_query_final_summary(final=False)
-        except Exception:
-            pass
-
-    def _record_step3_query_result(self, query_source, need_cookie=None, wait_applied=False):
-        self._bump_step3_query_source(query_source)
-        self._bump_step3_cookie_requirement(need_cookie)
-        if wait_applied:
-            try:
-                self._step3_wait_applied_count += 1
-            except Exception:
-                pass
-        self._maybe_emit_step3_progress()
-
-    def _emit_step3_query_final_summary(self, final=True):
-        try:
-            total = int(sum(int(v or 0) for v in self._step3_query_counts.values()))
-        except Exception:
-            total = 0
-        if total <= 0:
-            return
-
-        color = "gray" if final else "black"
-        label = "Step3查詢完成" if final else "Step3查詢摘要"
-        try:
-            self._q.put(WorkerEvent("output",
-                "<p><font color='{}'>[{}] 已處理 {} 筆（網路查詢={}、快取={}、未查詢={}、等待執行={}；requires_cookie: 需要={}、不需要={}、未知={}）</font></p>".format(
-                    color,
-                    label,
-                    total,
-                    int(self._step3_query_counts.get("network", 0)),
-                    int(self._step3_query_counts.get("cache", 0)),
-                    int(self._step3_query_counts.get("skip", 0)),
-                    int(self._step3_wait_applied_count or 0),
-                    int(self._step3_cookie_req_counts.get("need", 0)),
-                    int(self._step3_cookie_req_counts.get("free", 0)),
-                    int(self._step3_cookie_req_counts.get("unknown", 0)),
-                )
-            ))
-        except Exception:
-            pass
-
-    def _record_filter_rejection(self, pid_key, reason, queue_attr):
-        """Append the PID to the named queue and record a step3 skip event."""
-        try:
-            getattr(self, queue_attr).put(str(pid_key))
-        except Exception:
-            pass
-        self._record_step3_filter_skip(reason, pid_key=pid_key)
-
-    def _step3_blocked_by_ban_tag(self, artwork_tags):
-        return any(self._tag_hit(blocked, artwork_tags) for blocked in self._ban_tag_norm)
-
-    def _step3_missing_must_tag(self, artwork_tags):
-        if not self._must_tag_norm:
-            return False
-        return not any(self._tag_hit(req, artwork_tags) for req in self._must_tag_norm)
-
-    def _step3_below_like_threshold(self, artwork_tags, like):
-        like_limit, _ = _resolve_like_threshold(
-            self.like_num, artwork_tags, self.special_like_rules,
-            self._tag_hit, self._to_int,
-        )
-        like_value = self._to_int(like, None)
-        return like_limit > 0 and like_value is not None and like_value < like_limit
-
-    def _passes_artwork_filters(self, pid_key, tag, like):
-        artwork_tags = self._normalize_artwork_tags(tag)
-        if self._step3_blocked_by_ban_tag(artwork_tags):
-            self._record_filter_rejection(pid_key, "ban_tag", "tag_queue")
-            return False, "ban_tag"
-        if self._step3_missing_must_tag(artwork_tags):
-            self._record_filter_rejection(pid_key, "must_tag", "tag_queue")
-            return False, "must_tag"
-        if self._step3_below_like_threshold(artwork_tags, like):
-            self._record_filter_rejection(pid_key, "like", "like_queue")
-            return False, "like"
-        return True, "pass"
-
-    def _mark_revoked_pid(self, pid, reason="404"):
-        pid_key = normalize_pid(pid)
-        if not pid_key:
-            return
-        if pid_key in self._revoked_pid_set:
-            return
-        self._revoked_pid_set.add(pid_key)
-        self._revoked_pid_new.add(pid_key)
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                db.mark_artwork_revoked(pid_key)
-            except Exception:
-                pass
-        try:
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='orange'>PID {pid_key} 已標記為失效（{reason}），後續會自動略過</font></p>"
-            ))
-        except Exception:
-            pass
-
-    def _flush_revoked_pid_file(self):
-        try:
-            if not self._revoked_pid_set:
-                return
-            all_pids = sorted(self._revoked_pid_set)
-            try:
-                atomic_write_text(self.revoked_pid_path, all_pids, backup=True)
-            except Exception:
-                with open(self.revoked_pid_path, "w", encoding="utf-8") as f:
-                    f.writelines([str(x) + "\n" for x in all_pids])
         except Exception:
             pass
 
@@ -728,13 +304,6 @@ class get_img_url_thread(PauseableThread):
             else self._calc_cookie_required_delay()
         )
         self._sleep_with_countdown(delay)
-
-    def _extract_pid_from_url(self, url):
-        try:
-            filename = str(url).rsplit('/', 1)[1]
-            return str(filename.split('_', 1)[0])
-        except Exception:
-            return None
 
     def _cookie_label_from_alias_selection(self, pid_key):
         """Try the per-PID alias map first (set by _select_cookie_for_pid)."""
@@ -813,21 +382,6 @@ class get_img_url_thread(PauseableThread):
             pass
         return latest
 
-    def _init_metadata_db(self, json_meta):
-        """Open the SQLite metadata cache; first-run import from JSON."""
-        return open_metadata_db(self.path, json_meta, event_log=getattr(self, "_event_log", None))
-
-    def _emit_metadata_db_stats(self, stage="Step3"):
-        """Print a one-liner with current SQLite cache size."""
-        emit_db_stats(getattr(self, "_metadata_db", None), self._q, stage=stage)
-
-    def _mirror_url_meta_to_db(self):
-        """Best-effort bulk-mirror of self.url_meta into the SQLite cache."""
-        mirror_meta_dict_to_db(getattr(self, "_metadata_db", None), self.url_meta)
-
-    def _flush_url_meta_snapshot(self):
-        self._mirror_url_meta_to_db()
-
     def _stamp_gif_cookie_usage_in_meta(self, pid_key, source):
         """Mark requires_cookie + cookie_used fields on the in-memory url_meta entry."""
         try:
@@ -839,9 +393,6 @@ class get_img_url_thread(PauseableThread):
             self.url_meta[pid_key] = meta
         except Exception:
             pass
-
-    def _persist_url_meta_with_fallback(self):
-        self._mirror_url_meta_to_db()
 
     def _emit_gif_cookie_usage_signal(self, pid_key, source):
         """Best-effort emit via the legacy ._output signal (Qt5 compat)."""
@@ -872,93 +423,6 @@ class get_img_url_thread(PauseableThread):
         self._stamp_gif_cookie_usage_in_meta(pid_key, source)
         self._persist_url_meta_with_fallback()
         self._emit_gif_cookie_usage_signal(pid_key, source)
-
-    def _write_all_url_file(self, urls, reason="unknown"):
-        return write_all_url_file(self.path, urls, reason=reason, diag=self._diag)
-
-    def _read_existing_all_url_lines(self):
-        """Read the current all_url.txt; return [] on any error."""
-        path = os.path.join(self.path, "all_url.txt")
-        try:
-            with open(path, encoding='utf-8') as f:
-                return [line.rstrip() for line in f if line.rstrip()]
-        except Exception:
-            return []
-
-    def _filter_undownloaded_urls(self, urls, *, only_https=False):
-        """Drop URLs whose PID is already in exist_pid; canonicalise the rest."""
-        out = []
-        for u in urls:
-            if only_https and not (isinstance(u, str) and 'https' in u):
-                continue
-            pid = self._extract_pid_from_url(u)
-            if pid is not None and pid in self.exist_pid:
-                continue
-            out.append(canonicalize_pximg_url_for_storage(u))
-        return out
-
-    @staticmethod
-    def _dedupe_preserving_order(items):
-        """Return items deduplicated, preserving first-seen order."""
-        seen = set()
-        out = []
-        for x in items:
-            if x in seen:
-                continue
-            seen.add(x)
-            out.append(x)
-        return out
-
-    def _write_all_url_snapshot(self, fetched_urls, *, full=False):
-        """Write merged all_url snapshot to disk and sync the DELTA to the DB.
-
-        ``full=True`` (terminal flushes) pushes the entire merged set once as a
-        backstop; periodic flushes push only URLs not yet mirrored this run.
-        """
-        try:
-            old_urls = self._filter_undownloaded_urls(self._read_existing_all_url_lines())
-            new_urls = self._filter_undownloaded_urls(fetched_urls, only_https=True)
-            merged = self._dedupe_preserving_order(old_urls + new_urls)
-            try:
-                os.makedirs(self.path, exist_ok=True)
-            except Exception:
-                pass
-            write_ok = self._write_all_url_file(merged, reason="step3_snapshot")
-            self._diag(
-                "step3_snapshot_merged",
-                old_count=len(old_urls),
-                new_count=len(new_urls),
-                merged_count=len(merged),
-                write_ok=bool(write_ok),
-            )
-            db = getattr(self, "_metadata_db", None)
-            if db is not None:
-                try:
-                    # QW1: only mirror URLs not already pushed THIS run. The full
-                    # all_url.txt snapshot above is unchanged; upsert_pending_urls
-                    # is INSERT OR IGNORE (idempotent), so re-deriving the full set
-                    # from all_url.txt on the next run loses nothing. This turns
-                    # the per-batch DB write + pages.upsert_bulk event from
-                    # O(cumulative) into O(new) and collapses the quadratic
-                    # event-log growth at the source.
-                    flushed = getattr(self, "_flushed_urls", None)
-                    if flushed is None:
-                        flushed = set()
-                        self._flushed_urls = flushed
-                    to_push = merged if full else [u for u in merged if u not in flushed]
-                    if to_push:
-                        entries = [
-                            (url, self._extract_pid_from_url(url) or "")
-                            for url in to_push
-                        ]
-                        db.upsert_pending_urls(entries)
-                        flushed.update(to_push)
-                except Exception:
-                    pass
-            return old_urls, new_urls, merged
-        except Exception as err:
-            self._diag("step3_snapshot_failed", error=str(err))
-            return [], [], []
 
     def _on_pause_hook(self):
         self._flush_url_meta_snapshot()
@@ -1120,74 +584,6 @@ class get_img_url_thread(PauseableThread):
                 last_err = err
         self._emit_check_exist_failure(file_candidates, last_err)
         return 0
-
-    def _resolve_pictures_id_file_path(self):
-        candidates = [os.path.join(self.path, "pictures_id.txt")]
-        try:
-            appdata_path = os.path.join(os.getenv('APPDATA') + r'/pixiv_download/', 'pictures_id.txt')
-            if appdata_path not in candidates:
-                candidates.append(appdata_path)
-        except Exception:
-            pass
-        for p in candidates:
-            try:
-                if os.path.isfile(p):
-                    return p
-            except Exception:
-                pass
-        return candidates[0]
-
-    def _persist_pending_pid_file(self):
-        """Flush the pending-PID set to disk.
-
-        Phase 36: this used to be called per-PID with backup=True, costing
-        O(N^2) total disk I/O (sort + atomic_write_text + shutil.copy2 of the
-        whole file each time). It now runs only on the every-100-PID batch
-        flush in ``_run_processing_loop`` and on finalize, with backup=False
-        because pictures_id.txt is a runtime pending-list, not user data
-        worth keeping in history/.
-        """
-        try:
-            lines = sorted(
-                [str(x) for x in (self._pending_pid_remaining or set()) if str(x).strip()],
-                key=lambda s: int(s) if str(s).isdigit() else str(s),
-            )
-            atomic_write_text(self._pending_pid_file_path, lines, backup=False)
-        except Exception:
-            pass
-
-    def _init_pending_pid_tracker(self, fallback_pid_list, reset_with_fallback=False):
-        self._pending_pid_file_path = self._resolve_pictures_id_file_path()
-        loaded = set()
-        if not bool(reset_with_fallback):
-            try:
-                with open(self._pending_pid_file_path, encoding='utf-8', errors='ignore') as f:
-                    loaded = normalize_pid_set([line.rstrip() for line in f if str(line).strip()])
-            except Exception:
-                loaded = set()
-        if not loaded:
-            loaded = normalize_pid_set(fallback_pid_list)
-        self._pending_pid_remaining = set(loaded)
-        self._persist_pending_pid_file()
-
-    def _mark_pid_processed(self, pid):
-        """Phase 36: only update the in-memory set; the disk flush happens
-        on the every-100-PID batch boundary in ``_run_processing_loop`` and
-        on finalize. Per-PID disk writes here were O(N^2)."""
-        pid_key = normalize_pid(pid)
-        if not pid_key:
-            return
-        try:
-            with self._pending_pid_lock:
-                self._pending_pid_remaining.discard(pid_key)
-        except Exception:
-            pass
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                db.mark_pid_done(pid_key)
-            except Exception:
-                pass
 
     def _lookup_url_meta_entry(self, pid_key):
         """Read self.url_meta[pid_key] safely; returns ``None`` for any failure."""
@@ -1465,20 +861,36 @@ class get_img_url_thread(PauseableThread):
             pass
 
     def _fetch_one_pid_via_scheduler(self, pid):
-        """Acquire account → fetch with retry → release. Returns (one, stop)."""
+        """Acquire account → fetch with retry → release. Returns (one, stop).
+
+        Mirrors Step 4's try/finally release contract: the held account is
+        ALWAYS released (even if a non-network exception escapes the retry
+        lambda, which would otherwise leak ``held=True`` and hang the pool on a
+        small cookie set), a user Stop releases neutrally (no disable / no
+        success credit), and the per-PID session is always closed (was leaked
+        once per PID — ~1.1M abandoned sessions on the real dataset)."""
         acc = self._acquire_account()
         if acc is None:
             return None, True  # stop signal or all disabled
         session = pixiv_api.make_session(acc.proxy_url)
-        ok, one, _ = self._run_with_network_retry(
-            f"PID {pid}",
-            lambda: self.get_download_url(
-                self.path, self.Agent, 1, pid,
-                cookie_override=acc.cookie, session=session,
-            ),
-        )
-        self._release_account(acc, ok=ok)
-        return one, False
+        ok = False
+        neutral = False
+        try:
+            ok, one, _ = self._run_with_network_retry(
+                f"PID {pid}",
+                lambda: self.get_download_url(
+                    self.path, self.Agent, 1, pid,
+                    cookie_override=acc.cookie, session=session,
+                ),
+            )
+            return one, False
+        except Exception:
+            neutral = True  # non-network failure: not the cookie's fault
+            raise
+        finally:
+            with contextlib.suppress(Exception):
+                session.close()
+            self._release_account_after_work(acc, ok=ok, neutral=neutral)
 
     @staticmethod
     def _normalize_loop_result(one):
@@ -1545,7 +957,7 @@ class get_img_url_thread(PauseableThread):
             results.append(self._normalize_loop_result(one))
 
             if not self._stop_event.is_set():
-                self._mark_pid_processed(pid)
+                self._mark_pid_processed(pid, one)
 
             processed_count += 1
             task_queue.task_done()
@@ -1555,7 +967,14 @@ class get_img_url_thread(PauseableThread):
 
         return results
 
-    def _finalize_on_stop(self, results):
+    def _finalize_on_stop(self, results, exhausted=False):
+        """Persist pending state and end WITHOUT chaining into Step 4.
+
+        Used for both a user Stop and a cookie-pool exhaustion (``exhausted``):
+        in either case Step 3 did NOT finish the PID list, so emitting the
+        terminal ``next == -1`` (instead of ``next == 4``) stops Run All from
+        advancing into Step 4 on a truncated URL set. The remaining PIDs survive
+        in pictures_id.txt for the next run."""
         try:
             flat_results = [x for item in results if isinstance(item, list) for x in item]
             old_urls, new_urls, merged = self._write_all_url_snapshot(flat_results, full=True)
@@ -1567,11 +986,18 @@ class get_img_url_thread(PauseableThread):
             self._emit_cookie_usage_summary("step3", "Step3 Cookie統計")
             self._diag(
                 "step3_stopped",
+                reason="cookies_exhausted" if exhausted else "user_stop",
                 collected_url_count=len(flat_results),
                 merged_count=len(merged),
                 added_count=len(new_urls),
             )
-            self._q.put(WorkerEvent("output", f"<p><font color='orange'>已停止，已暫存 all_url {len(merged)} 筆（新增 {len(new_urls)}）</font></p>"))
+            if exhausted:
+                msg = (f"<p><font color='orange'>所有 Cookie 已禁用，URL階段未完成；"
+                       f"已暫存 all_url {len(merged)} 筆（新增 {len(new_urls)}），"
+                       f"剩餘 PID 保留待下次重跑</font></p>")
+            else:
+                msg = f"<p><font color='orange'>已停止，已暫存 all_url {len(merged)} 筆（新增 {len(new_urls)}）</font></p>"
+            self._q.put(WorkerEvent("output", msg))
         except Exception:
             pass
         self._q.put(WorkerEvent("finished", 'Task finished'))
@@ -1590,51 +1016,6 @@ class get_img_url_thread(PauseableThread):
         error_pid = [i for i in flat if 'https' not in i]
         url_results = [i for i in flat if 'https' in i]
         return url_results, error_pid
-
-    def _persist_step3_url_meta(self):
-        self._mirror_url_meta_to_db()
-
-    def _drain_queue_to_text_file(self, queue, file_name, mode_append=True):
-        """Drain a Queue and append/write its items to a text file.
-
-        Uses safe_io.atomic_append_text / atomic_write_text first; falls back
-        to plain file open. Both layers swallow errors — the original code
-        treated these as best-effort.
-        """
-        items = [queue.get() for _ in range(queue.qsize())]
-        target = os.path.join(self.path, file_name)
-        try:
-            if mode_append:
-                from safe_io import atomic_append_text
-                atomic_append_text(target, items)
-            else:
-                from safe_io import atomic_write_text
-                atomic_write_text(target, [str(t) for t in items])
-            return
-        except Exception:
-            pass
-        try:
-            mode = "a+" if mode_append else "w+"
-            with open(target, mode) as f:
-                f.writelines([str(text) + "\n" for text in items])
-        except Exception:
-            pass
-
-    def _persist_step3_net_err(self, error_pid):
-        """Write the error-PID list to net_err.txt (overwrite each run)."""
-        target = os.path.join(self.path, "net_err.txt")
-        try:
-            from safe_io import atomic_write_text
-            atomic_write_text(target, [str(t) for t in error_pid])
-            return
-        except Exception:
-            pass
-        try:
-            with open(target, "w+") as f:
-                for text in error_pid:
-                    f.write(str(text) + '\n')
-        except Exception:
-            pass
 
     def _emit_step3_summaries(self):
         """Run the trailing summary emitters in the order the user expects."""
@@ -1699,8 +1080,17 @@ class get_img_url_thread(PauseableThread):
                 return
             task_queue = self._build_and_emit_task_queue(pictures_id)
             results = self._run_processing_loop(task_queue)
-            if self._stop_event.is_set():
-                self._finalize_on_stop(results)
+            # The loop also breaks when the scheduler's whole cookie pool got
+            # disabled (acquire() returns None for BOTH stop AND all-disabled).
+            # That is NOT a clean completion: finishing here and chaining into
+            # Step 4 would download only the truncated set already resolved.
+            pool_exhausted = (
+                not self._stop_event.is_set()
+                and self._scheduler is not None
+                and getattr(self._scheduler, "all_disabled", lambda: False)()
+            )
+            if self._stop_event.is_set() or pool_exhausted:
+                self._finalize_on_stop(results, exhausted=pool_exhausted)
             else:
                 self._finalize_on_complete(results)
         except Exception as e:
@@ -1908,6 +1298,13 @@ class get_img_url_thread(PauseableThread):
             (tag, like, pagecount, img_url,
              upload_date, create_date, user_id, user_name) = info
         except Exception:
+            return None
+        # Empty img_url on an otherwise-parsed 200 body (age-gated without the
+        # right cookie, transient parse anomaly, deleted-but-200): treat it like
+        # a failed fetch — return None so get_download_url emits the [pid] error
+        # sentinel and the PID stays pending, instead of writing a junk url_meta
+        # entry that the batch flush would stamp meta_updated_at on. (B6)
+        if not img_url or str(img_url) in ("None", ""):
             return None
         fallback_req = self._step3_safe_cookie_requirement(pid_key)
         need_cookie = self._refresh_cookie_requirement(pid_key, fallback=fallback_req)

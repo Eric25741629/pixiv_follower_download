@@ -240,6 +240,23 @@ class SettingsStore:
                 data[key] = section_data
             self.save(data)
 
+    def mutate_section(self, section_key, mutator):
+        """Atomically read-modify-write one section under the path lock.
+
+        ``mutator(section_dict) -> section_dict`` runs WHILE the lock is held, so
+        the read and the write are one critical section. Callers that did
+        ``get_section()`` then later ``update_section()`` dropped the lock in
+        between, so two concurrent cookie-status writers each loaded the old
+        section and the slower one clobbered the faster one's edit. Route every
+        such read-then-write through here instead."""
+        with self._lock:
+            data = self.load()
+            section = data.get(section_key)
+            if not isinstance(section, dict):
+                section = copy.deepcopy(DEFAULTS.get(section_key, {}))
+            data[section_key] = mutator(section)
+            self.save(data)
+
     # ── internal helpers ────────────────────────────────────────────────────
 
     def _merge_defaults(self, raw):

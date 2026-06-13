@@ -28,7 +28,7 @@ def test_run_all_starts_at_step2_when_bookmark_source(monkeypatch, tmp_path):
     started = []
     monkeypatch.setattr(ra, "_store", lambda: _FakeStore())
     monkeypatch.setattr(ra.RunController, "_backup_db", lambda self: None)
-    monkeypatch.setattr(ra.RunController, "_start_step", lambda self, n: started.append(n))
+    monkeypatch.setattr(ra.RunController, "_start_step", lambda self, n, **kw: started.append(n))
 
     rc = ra.RunController(main_view=object(), event_q=Queue())
     rc.run_all()

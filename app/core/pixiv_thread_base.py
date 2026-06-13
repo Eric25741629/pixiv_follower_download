@@ -1,7 +1,6 @@
 import random as pyrandom
 import threading
 import queue as _queue
-import time
 
 import requests
 
@@ -305,6 +304,29 @@ class PauseableThread(threading.Thread):
         if self._scheduler is None or account is None:
             return
         self._scheduler.release(account, ok=ok)
+
+    def _release_account_after_work(
+        self, account, ok: bool = True, neutral: bool = False
+    ) -> None:
+        """Release an account per the work-unit contract (the proven Step-4
+        pattern, factored out so Steps 2/3/combined cannot drift from it).
+
+        Call from a ``finally`` with ``neutral=True`` set in an ``except`` so a
+        NON-network exception (disk/decode/sqlite error — not the cookie's
+        fault) releases neutrally. A user Stop during the work also releases
+        neutrally. In both cases the cookie is neither disabled (``ok=False`` ->
+        on_disable persists ``失効`` to settings) nor credited with a success
+        (``ok=True`` refreshes the trust window). Only genuine network-retry
+        exhaustion (``ok=False`` off the stop path) disables the cookie."""
+        if account is None:
+            return
+        if neutral or (not ok and self._stop_event.is_set()):
+            if self._scheduler is not None:
+                self._scheduler.release_neutral(account)
+        else:
+            # Defer to _release_account (which guards a None scheduler itself);
+            # this keeps the single release seam that Steps 2/3/4 stub in tests.
+            self._release_account(account, ok=ok)
 
     def _emit_output(self, html: str) -> None:
         try:

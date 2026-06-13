@@ -365,11 +365,19 @@ class CookiesView:
         )
 
         def save_dialog(e: ft.ControlEvent) -> None:
-            new_entry = {
-                "cookie": tf_cookie.value.strip(),
-                "alias": tf_alias.value.strip(),
-                "status": entry.get("status", "未知"),
-            }
+            new_cookie = tf_cookie.value.strip()
+            cookie_changed = new_cookie != str(entry.get("cookie", "")).strip()
+            # Spread the original entry first so persisted keys (last_tested_at,
+            # enabled, and any future fields) survive an alias-only edit — the old
+            # code rebuilt the dict from scratch and silently re-enabled a disabled
+            # cookie + wiped its trust cache. If the cookie STRING itself changed,
+            # the old test result no longer applies, so reset status/last_tested_at.
+            new_entry = {**entry, "cookie": new_cookie, "alias": tf_alias.value.strip()}
+            if cookie_changed:
+                new_entry["status"] = "未知"
+                new_entry.pop("last_tested_at", None)
+            elif "status" not in new_entry:
+                new_entry["status"] = "未知"
             if idx is None:
                 self._entries.append(new_entry)
             else:

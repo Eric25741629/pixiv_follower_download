@@ -7,6 +7,7 @@ implemented by reacting to WorkerEvent("next", N) inside on_next().
 """
 from __future__ import annotations
 import os
+import threading
 from datetime import datetime
 from queue import Queue
 
@@ -116,6 +117,14 @@ class RunController:
         except Exception:
             self._live = None
         self._active_snapshot = None
+        # Serialises _start_step's idle-check + _active_thread assignment so a
+        # scheduler tick and a user click (or two scheduler ticks) can't both
+        # launch a run that then writes the same on-disk state concurrently.
+        self._start_lock = threading.Lock()
+
+    def _is_run_active(self) -> bool:
+        t = getattr(self._main_view, "_active_thread", None)
+        return t is not None and t.is_alive()
 
     def _backup_db(self) -> None:
         """Run at most once per local-time day. Persists last-success date via
@@ -169,7 +178,7 @@ class RunController:
     def run_step(self, n: int) -> None:
         self._run_all_mode = False
         self._backup_db()
-        self._start_step(n)
+        self._start_step(n, require_idle=True)
 
     def run_all(self) -> None:
         self._run_all_mode = True
@@ -178,12 +187,15 @@ class RunController:
             source_mode = _store().get_section("download").get("source_mode", "following")
         except Exception:
             source_mode = "following"
-        self._start_step(2 if source_mode == "bookmarks" else 1)
+        self._start_step(2 if source_mode == "bookmarks" else 1, require_idle=True)
 
     def on_next(self, n: int) -> None:
         if n == -1 or not self._run_all_mode:
             return
         if 1 <= n <= 4:
+            # Chaining: the previous step's worker may still be alive (about to
+            # return) when this fires, so do NOT require idle here — that is a
+            # legitimate hand-off, not a duplicate run.
             self._start_step(n)
 
     def _log(self, html: str) -> None:
@@ -397,12 +409,11 @@ class RunController:
         keep their existing status untouched."""
         if not tested_results:
             return
-        try:
-            store = _store()
-            auth = store.get_section("auth")
+
+        def _m(auth):
             entries = auth.get("cookies_entries") or []
             if not isinstance(entries, list):
-                return
+                return auth
             new_entries = []
             for e in entries:
                 if not isinstance(e, dict):
@@ -417,7 +428,13 @@ class RunController:
                     })
                 else:
                     new_entries.append(e)
-            store.update_section("auth", {**auth, "cookies_entries": new_entries})
+            return {**auth, "cookies_entries": new_entries}
+
+        try:
+            # mutate_section keeps load+write in one held lock so concurrent
+            # cookie-status writers can't clobber each other (the old
+            # get_section()/update_section() pair dropped the lock between).
+            _store().mutate_section("auth", _m)
         except Exception:
             pass
 
@@ -429,29 +446,31 @@ class RunController:
         if not cookie:
             return
         import time as _time
-        try:
-            store = _store()
-            auth = store.get_section("auth")
+        now = _time.time()
+        refreshed = {"at": None}
+
+        def _m(auth):
             entries = auth.get("cookies_entries") or []
             if not isinstance(entries, list):
-                return
-            now = _time.time()
+                return auth
             new_entries = []
-            refreshed_at = None
             for e in entries:
                 if not isinstance(e, dict):
                     new_entries.append(e)
                     continue
                 c = str(e.get("cookie", "")).strip()
                 if c == cookie.strip() and e.get("status") == "有效":
-                    refreshed_at = now
+                    refreshed["at"] = now
                     new_entries.append({**e, "last_tested_at": now})
                 else:
                     new_entries.append(e)
-            store.update_section("auth", {**auth, "cookies_entries": new_entries})
-            if refreshed_at is not None:
+            return {**auth, "cookies_entries": new_entries}
+
+        try:
+            _store().mutate_section("auth", _m)
+            if refreshed["at"] is not None:
                 self._event_q.put(WorkerEvent(
-                    "cookie_status", (cookie.strip(), "有效", refreshed_at)
+                    "cookie_status", (cookie.strip(), "有效", refreshed["at"])
                 ))
         except Exception:
             pass
@@ -464,13 +483,12 @@ class RunController:
         if not cookie:
             return
         import time as _time
-        try:
-            store = _store()
-            auth = store.get_section("auth")
+        now = _time.time()
+
+        def _m(auth):
             entries = auth.get("cookies_entries") or []
             if not isinstance(entries, list):
-                return
-            now = _time.time()
+                return auth
             new_entries = []
             for e in entries:
                 if not isinstance(e, dict):
@@ -481,7 +499,10 @@ class RunController:
                     new_entries.append({**e, "status": "失效", "last_tested_at": now})
                 else:
                     new_entries.append(e)
-            store.update_section("auth", {**auth, "cookies_entries": new_entries})
+            return {**auth, "cookies_entries": new_entries}
+
+        try:
+            _store().mutate_section("auth", _m)
             # Mirror _refresh_cookie_timestamp: push a live cookie_status event
             # so a cookie disabled mid-run flips to 失效 in the cookies view
             # immediately, not only after the next reload_from_settings.
@@ -542,24 +563,40 @@ class RunController:
             on_success=lambda acc: self._refresh_cookie_timestamp(acc.cookie),
         )
 
-    def _start_step(self, n: int) -> None:
-        try:
-            t = self._build_thread(n)
-        except Exception as err:
-            self._log(f"<p><font color='red'>步驟 {n} 建立執行緒失敗：{err}</font></p>")
-            self._main_view.set_running(False)
-            self._main_view.set_step_state(n - 1, "error")
-            return
-        if t is None:
-            self._main_view.set_running(False)
-            return
-        self._main_view._active_thread = t
-        self._main_view.set_running(True)
-        for i in range(4):
-            self._main_view.set_step_state(i, "idle")
-        self._main_view.set_step_state(n - 1, "running")
-        self._log(f"<p><font color='gray'>--- 步驟 {n} 開始 ---</font></p>")
-        t.start()
+    def _start_step(self, n: int, *, require_idle: bool = False) -> None:
+        # The idle-check and the _active_thread assignment must be one atomic
+        # critical section, else a scheduler tick and a user click both pass the
+        # check and both start a run. require_idle is True only for the entry
+        # points (run_step / run_all); chaining (on_next) passes False because
+        # the previous step's worker is legitimately still finishing.
+        with self._start_lock:
+            if require_idle and self._is_run_active():
+                self._log("<p><font color='gray'>已有任務執行中，忽略本次啟動</font></p>")
+                return
+            try:
+                t = self._build_thread(n)
+            except Exception as err:
+                self._log(f"<p><font color='red'>步驟 {n} 建立執行緒失敗：{err}</font></p>")
+                self._main_view.set_running(False)
+                self._main_view.set_step_state(n - 1, "error")
+                # No worker thread started -> emit a terminal event so a headless
+                # _pump unblocks immediately (exit 1) instead of waiting out its
+                # 600s queue-starvation timeout. on_next(-1) is a no-op in the GUI.
+                self._event_q.put(WorkerEvent("next", -1))
+                return
+            if t is None:
+                self._main_view.set_running(False)
+                # Same terminal event for the "build returned None" path (invalid
+                # cookies / missing User ID / empty following list).
+                self._event_q.put(WorkerEvent("next", -1))
+                return
+            self._main_view._active_thread = t
+            self._main_view.set_running(True)
+            for i in range(4):
+                self._main_view.set_step_state(i, "idle")
+            self._main_view.set_step_state(n - 1, "running")
+            self._log(f"<p><font color='gray'>--- 步驟 {n} 開始 ---</font></p>")
+            t.start()
 
     def _validate_cookies_for_step(self, auth, agent, step_num):
         """Test cookies and return the valid list, or None on failure (with log)."""

@@ -24,7 +24,7 @@ def _log_err(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def _pump(event_q, controller, run_all: bool, initial_step: int = 1) -> int:
+def _pump(event_q, controller, run_all: bool, initial_step: int = 1, base_path: str = "") -> int:
     """Consume events until terminal. Returns process exit code.
 
     Terminal detection (``next == -1`` is overloaded -- it is BOTH a failed
@@ -51,6 +51,11 @@ def _pump(event_q, controller, run_all: bool, initial_step: int = 1) -> int:
             line = _strip_html(data)
             if line:
                 _log_err(line)
+        elif kind == "timechanged":
+            # Persist the advancing download_time cursor (the GUI does this via
+            # handle_timechanged) so repeated headless runs don't restart from
+            # the same timestamp and mass-duplicate filename prefixes.
+            _persist_download_time(base_path, data)
         elif kind == "next":
             if data == -1:
                 return 0 if last_was_finished else 1
@@ -72,13 +77,35 @@ def _pump(event_q, controller, run_all: bool, initial_step: int = 1) -> int:
                 return 0
 
 
+def _persist_download_time(base_path, value) -> None:
+    """Write the advancing per-file download_time cursor back to settings.
+
+    The GUI dispatcher's handle_timechanged does this; without it a headless
+    Step 4 / combined run never persists the cursor, so every subsequent run
+    restarts from the same stored value and mass-duplicates filename prefixes.
+    """
+    if not value:
+        return
+    with contextlib.suppress(Exception):
+        from app.core.settings_store import SettingsStore
+        SettingsStore(base_path).update_fields("download", {"download_time": str(value)})
+
+
 def _build_event_log(base_path):
-    """Best-effort EventLog with crash recovery, mirroring flet_app.main."""
+    """Best-effort EventLog with crash recovery, mirroring flet_app.main.
+
+    Reads the event-log knobs via the Flet-free
+    ``event_log_kwargs_from_settings`` so a Flet-less host still gets crash
+    recovery (the old ``from app.gui.flet_app import _event_log_kwargs`` pulled
+    in ``flet`` and silently fell through to no event log)."""
     try:
-        from app.core.event_log import EventLog, recover_tail
+        from app.core.event_log import (
+            EventLog,
+            event_log_kwargs_from_settings,
+            recover_tail,
+        )
         from app.core.metadata_db import MetadataDB
-        from app.gui.flet_app import _event_log_kwargs
-        el = EventLog(base_path, **_event_log_kwargs())
+        el = EventLog(base_path, **event_log_kwargs_from_settings(base_path))
         if el.last_session_was_unclean:
             db = MetadataDB(base_path)
             try:
@@ -125,7 +152,7 @@ def run_headless(step: str, *, force_rescan: bool = False) -> int:
         else:
             _log_err(f"[headless] unknown step: {step}")
             return 2
-        return _pump(event_q, controller, run_all=run_all, initial_step=initial_step)
+        return _pump(event_q, controller, run_all=run_all, initial_step=initial_step, base_path=base)
     finally:
         if event_log is not None:
             with contextlib.suppress(Exception):

@@ -6,6 +6,7 @@ Exit codes are meaningful (0 ok, non-zero on error).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -110,7 +111,11 @@ def _cmd_cookie_test(args) -> int:
     results = []
     for c in cookies:
         try:
-            count, _ = pixiv_api.Test_cookies([c], agent)
+            # Test_cookies prints exceptions to stdout; redirect to stderr so a
+            # `--json` run keeps stdout a single clean JSON line (the CLI
+            # contract: JSON to stdout, human/diagnostic text to stderr).
+            with contextlib.redirect_stdout(sys.stderr):
+                count, _ = pixiv_api.Test_cookies([c], agent)
             ok = int(count) > 0
         except Exception:
             ok = False
