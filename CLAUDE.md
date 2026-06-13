@@ -65,6 +65,16 @@ The canonical code lives under `app/` in three layers:
   - `safe_io.py` provides atomic write + history-based backup (keeps latest 10 copies in a sibling `history/` directory).
   - `update_selenium.py` — Selenium-based cookie refresh.
 
+  **Mixin split (file-size refactor).** Several oversized worker/DB modules were split into cohesive sibling modules using the mixin pattern — the public class still lives in (and is imported from) its original module, which declares `class X(BaseFirst, _MixinA, _MixinB, ...)`; moved methods access state via `self.` through inheritance. Edit the sibling, not a copy. Map:
+  - `thread_download.py` → `step4_author_order.py` (pure reorder funcs, re-exported), `step4_filters.py` (`_Step4FiltersMixin`), `step4_media.py` (`_Step4MediaMixin`); also the pre-existing `_FilenameMixin` / `_JXLMixin`.
+  - `thread_url_fetch.py` → `step3_filters.py` (`_Step3FiltersMixin`), `step3_meta_migration.py` (`_Step3MigrationMixin`), `step3_persistence.py` (`_Step3PersistenceMixin`).
+  - `thread_pid_scan.py` → `step2_bookmark_scan.py` (`_Step2BookmarkMixin`), `step2_incremental_io.py` (`_Step2IncrementalIOMixin`).
+  - `metadata_db.py` → `metadata_db_pages.py` (`_PagesMixin`), `metadata_db_closed_set.py` (`_ClosedSetMixin`); also the pre-existing `_ArtworkMixin` / `_MigrationMixin`.
+  - `pixiv_api.py` → `pixiv_selenium_login.py` (selenium login surface), `pixiv_legacy_utils.py` (shadowed legacy free-funcs); both star-re-exported back so `from pixiv_api import *` stays byte-identical.
+  - `pixiv_thread_utils.py` → `folder_scan.py`, `json_recovery.py` (re-exported facade).
+  - `event_log.py` → `event_log_io.py` (pure reverse/forward file iteration, re-exported).
+  - GUI: `views/main_view.py` → `views/main_progress.py` (`_MainProgressMixin`), `views/main_mode_row.py` (`_MainModeRowMixin`); `run_actions.py` → `cookie_validation.py` (`_CookieValidationMixin`); `views/settings_view.py` → `views/settings_handlers.py` (`_SettingsHandlersMixin`); `flet_app.py` → `bootstrap_helpers.py` (stateless module-level helpers only — the global-mutating `main(page)` closures stay put).
+
 ### Top-level shim files
 
 A few files at the repository root are thin re-exports that keep legacy absolute imports working — always edit the `app/` version, not the shim:
