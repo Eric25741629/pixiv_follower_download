@@ -30,11 +30,21 @@ owner_note: 此檔是給「下一個 session」直接接手用的。讀完就能
 | 檔案 | 原行數 | 現行數 | 整體風險 | 狀態 |
 |------|--------|--------|----------|------|
 | `app/core/pixiv_thread_utils.py` | 1011 | **750** | low | ✅ 已降到 <1000 |
-| `app/core/metadata_db.py` | 1448 | 1448 | low | ⬜ 待拆 |
-| `app/core/thread_download.py` | 3080 | 3080 | medium | ⬜ 待拆 |
+| `app/core/metadata_db.py` | 1448 | **981** | low | ✅ 已降到 <1000 |
+| `app/core/thread_download.py` | 3080 | **2598** | medium | 🟡 低風險塊已抽(filename+JXL);剩高風險塊待實機驗 |
 | `app/core/thread_url_fetch.py` | 2092 | 2092 | high | ⬜ 待拆 |
 
-已新增:`app/core/pid_utils.py`(104)、`app/core/cookie_utils.py`(215)。
+已新增:`app/core/pid_utils.py`(104)、`app/core/cookie_utils.py`(215)、
+`metadata_db_schema.py`(92)、`metadata_db_cache.py`(48)、
+`metadata_db_migration.py`(154)、`metadata_db_artwork.py`(265)、
+`step4_filename.py`(210)、`step4_jxl_conversion.py`(337)。
+
+**手法確立(metadata_db 驗證過):公開 API 方法群用 mixin 拆。** DB 方法是 34 處
+caller 以 `db.method(...)` 呼叫的公開 API,handoff 原建議的「DI 自由函式」對它行不通
+(留 delegation stub=不減行數;改 caller=高風險)。改用 mixin（`class MetadataDB(_MigrationMixin, _ArtworkMixin)`，
+方法本體逐字搬進 mixin、`self._conn/_lock/_emit/_coerce_pid/_bulk_write` 由具體類別提供）：
+零 caller 改動、真正減行數、行為機械等價。純模組級常數/函式（schema DDL、cache 原語）
+仍用 Move+re-export。**注意:re-export import 要放在檔案頂端(任何陳述式之前),否則 ruff E402。**
 
 ---
 
@@ -51,7 +61,19 @@ owner_note: 此檔是給「下一個 session」直接接手用的。讀完就能
 
 ---
 
-# 3. 待辦:`metadata_db.py`(1448,整體 low,建議先做這支)
+# 3. ✅ 完成:`metadata_db.py`(1448 → 981,整體 low)
+
+**已於 2026-06-14 拆完並全測綠(916 passed)、ruff 全綠。** 4 個 transformation,每步驗證:
+1. `metadata_db_schema.py`(92):`_SCHEMA` DDL 字串純搬移 + 內部 import。
+2. `metadata_db_cache.py`(48):`_db_file_signature`/`_CLOSED_SET_CACHE`/`_CLOSED_SET_CACHE_LOCK` 純搬移 + re-export(test 讀 `mdb._db_file_signature`)。
+3. `metadata_db_migration.py`(154):`_MigrationMixin`（`import_meta_dict`/`_build_artwork_row`/`import_downloaded_set`/`export_meta_dict`）。
+4. `metadata_db_artwork.py`(265):`_ArtworkMixin`（`upsert_artwork`/`upsert_artworks`/`backfill_user_ids`/`get_artwork`/`user_id_map_for_pids`/`mark_artwork_revoked`/`artwork_count`/`pending_artwork_count`/`get_pending_artwork_pids`）。
+
+`class MetadataDB(_MigrationMixin, _ArtworkMixin)`。`_conn`/`_lock`/`_emit`/`_bulk_write`/`_coerce_pid`/連線管理仍留在 metadata_db.py(基礎設施不動)。**剩餘 pages CRUD 群（~270）未抽**(981 已 <1000,收益遞減);若日後要再降,`metadata_db_pages.py`（`_PagesMixin`）是下一個乾淨候選。
+
+---
+
+## 原始規劃(保留供參考)
 
 DB 是 canonical store,最關鍵;但這支整體風險 low、且有 `test_closed_set_cache.py` 等護網。先抽最自足的。
 
@@ -74,7 +96,15 @@ DB 是 canonical store,最關鍵;但這支整體風險 low、且有 `test_closed
 
 ---
 
-# 4. 待辦:`thread_download.py`(3080,medium)
+# 4. 進行中:`thread_download.py`(3080 → 2598,medium)
+
+**✅ 兩個低風險塊已抽(2026-06-14,全測 916 綠 + ruff 綠)。手法:mixin(與 metadata_db 一致)。**
+- `step4_filename.py`(210)→ `_FilenameMixin`:7 個檔名/標籤渲染方法 + 3 個 regex 常數。
+  **雷:** `_DECORATIVE_CHARS_RE` 含不可見字元(zero-width / VS selector)+ emoji 用 raw-string `r"\U0001F000-\U0001FAFF"`(交 `re` 解析,非 Python)。抽完用 `re.compile().pattern` byte 比對驗證三個 regex 與原碼完全相同才繼續(`test_normalize_tag_for_filename.py` 30+ 斷言守住)。
+- `step4_jxl_conversion.py`(337)→ `_JXLMixin`:21 個 JXL 背景轉檔方法(`_init_jxl_config` + 主區塊)+ `_JXL_SUPPORTED_EXTS`。全 `self.*`(無類名自我引用)→ verbatim 零內部修改。用 Python script 依行號機械抽取(避免手打 CJK log 字串誤差)。搬完移除 thread_download 4 個只剩 JXL 用的 import(glob/subprocess/tempfile/shutil)。
+- `download_thread(PauseableThread, _FilenameMixin, _JXLMixin)`。
+
+**⬇️ 以下高風險塊未做——使用者偏好實機驗(GUI/threading/download 綠測不算數)。每塊抽完都要停下讓使用者重啟 Flet 跑一輪 combined 驗無回歸。**
 
 **先做兩個低風險的,把檔案先砍 ~410 行:**
 

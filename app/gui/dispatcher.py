@@ -2,9 +2,11 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from app.core.app_logging import get_logger
+from app.core import diag_log
 from app.core.worker_event import WorkerEvent
 
 _log = get_logger("pixiv.dispatcher")
@@ -32,6 +34,12 @@ class EventDispatcher:
         try:
             while True:
                 ev: WorkerEvent = self._q.get_nowait()
+                # UI-communication trace: record every event the update
+                # component receives, before it touches the UI, so the
+                # ui_events.log can be cross-referenced with worker.log /
+                # download.log (e.g. to see whether a "countdown" event was
+                # ever delivered for a given PID's wait).
+                diag_log.log(diag_log.UI, f"{ev.type}: {diag_log.summary(ev.data)}")
                 handler = self._handlers.get(ev.type)
                 if handler is not None:
                     try:

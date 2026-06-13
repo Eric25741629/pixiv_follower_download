@@ -4,7 +4,7 @@ import os
 from app.core.worker_event import WorkerEvent
 from app.core.pixiv_thread_base import PauseableThread
 from app.core.pixiv_thread_utils import normalize_pid
-from app.core import thread_url_fetch, thread_download
+from app.core import thread_url_fetch, thread_download, diag_log
 import pixiv_api
 
 
@@ -300,9 +300,16 @@ class combined_thread(PauseableThread):
         with contextlib.suppress(Exception):
             verb = "正在查詢" if needs_query else "正在下載"
             self._q.put(WorkerEvent("phase", f"{verb}：PID {pid}"))
-        acc = self._acquire_account()
+        diag_log.log(diag_log.WORKER, f"PID {pid} 開始 (needs_query={needs_query})")
+        # The acquire span's elapsed time IS the visible cooldown wait. When it
+        # logs ~0.00s the account was ready immediately (cooldown absorbed by the
+        # previous PID's download) — that is exactly why no 倒數 shows.
+        with diag_log.span(diag_log.WORKER, f"PID {pid} acquire(cooldown)"):
+            acc = self._acquire_account()
         if acc is None:
+            diag_log.log(diag_log.WORKER, f"PID {pid} acquire -> None (stop/all-disabled)")
             return None  # stop signal / all disabled -> caller breaks
+        diag_log.log(diag_log.WORKER, f"PID {pid} 取得帳號 alias={getattr(acc, 'alias', '?')}")
         sess = pixiv_api.make_session(acc.proxy_url)
         failed = []
         ok = True
@@ -322,13 +329,14 @@ class combined_thread(PauseableThread):
                 prev_fetcher_q = self.fetcher._q
                 self.fetcher._q = _DropOverallProgressQueue(prev_fetcher_q)
                 try:
-                    ok, one, _ = self._run_with_network_retry(
-                        f"PID {pid}",
-                        lambda: self.fetcher.get_download_url(
-                            self.path, self.Agent, 1, pid,
-                            cookie_override=acc.cookie, session=sess,
-                        ),
-                    )
+                    with diag_log.span(diag_log.WORKER, f"PID {pid} query"):
+                        ok, one, _ = self._run_with_network_retry(
+                            f"PID {pid}",
+                            lambda: self.fetcher.get_download_url(
+                                self.path, self.Agent, 1, pid,
+                                cookie_override=acc.cookie, session=sess,
+                            ),
+                        )
                 finally:
                     self.fetcher._q = prev_fetcher_q
                 urls = self.fetcher._normalize_loop_result(one) if ok else []
@@ -343,10 +351,11 @@ class combined_thread(PauseableThread):
                 with contextlib.suppress(Exception):
                     self._q.put(WorkerEvent("phase", f"正在下載：PID {pid}"))
                 self.downloader._set_current_download_account(acc)
-                account_ok, failed, _ = self._run_with_network_retry(
-                    f"PID {pid} 下載",
-                    lambda: self._download_pid_group_with_page_progress(pid, urls),
-                )
+                with diag_log.span(diag_log.WORKER, f"PID {pid} download ({len(urls)} pages)"):
+                    account_ok, failed, _ = self._run_with_network_retry(
+                        f"PID {pid} 下載",
+                        lambda: self._download_pid_group_with_page_progress(pid, urls),
+                    )
                 if not isinstance(failed, list):
                     failed = []
                     download_ok = False

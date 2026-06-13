@@ -31,91 +31,21 @@ import threading
 from collections.abc import Iterable
 import contextlib
 
+# Pieces split into sibling modules (file-size refactor), imported here so
+# the public API and existing ``from app.core.metadata_db import ...`` callers
+# are unchanged. ``_SCHEMA`` feeds ``_conn``'s executescript; the cache
+# primitives back ``closed_artwork_set`` (and the test suite reads
+# ``mdb._db_file_signature``); the mixins carry relocated method groups.
+from app.core.metadata_db_schema import _SCHEMA  # noqa: F401  (internal re-export)
+from app.core.metadata_db_cache import (  # noqa: F401  (public re-export)
+    _CLOSED_SET_CACHE,
+    _CLOSED_SET_CACHE_LOCK,
+    _db_file_signature,
+)
+from app.core.metadata_db_migration import _MigrationMixin
+from app.core.metadata_db_artwork import _ArtworkMixin
+
 DB_FILENAME = "metadata.sqlite3"
-
-
-_SCHEMA = """
--- Phase 8: drop legacy tables on first open (idempotent after that).
-DROP TABLE IF EXISTS pids;
-DROP TABLE IF EXISTS downloaded;
-DROP TABLE IF EXISTS pending_urls;
-DROP TABLE IF EXISTS pending_pids;
-
--- Canonical schema: artworks + pages.
-CREATE TABLE IF NOT EXISTS artworks (
-    pid              TEXT PRIMARY KEY,
-    discovered_at    TEXT NOT NULL,
-    page_count       INTEGER,
-    like_count       INTEGER,
-    tags             TEXT,
-    img_url_template TEXT,
-    requires_cookie  INTEGER,
-    meta_updated_at  TEXT,
-    revoked_at       TEXT,
-    upload_date      TEXT,
-    create_date      TEXT,
-    user_id          TEXT,
-    user_name        TEXT
-);
-CREATE TABLE IF NOT EXISTS pages (
-    pid               TEXT NOT NULL,
-    page_index        INTEGER NOT NULL,
-    status            TEXT NOT NULL,
-    url               TEXT,
-    file_path         TEXT,
-    file_size         INTEGER,
-    downloaded_at     TEXT,
-    last_attempted_at TEXT,
-    attempt_count     INTEGER NOT NULL DEFAULT 0,
-    failure_reason    TEXT,
-    PRIMARY KEY (pid, page_index)
-);
-CREATE INDEX IF NOT EXISTS idx_artworks_meta_updated_at
-    ON artworks(meta_updated_at);
-CREATE INDEX IF NOT EXISTS idx_artworks_revoked_at
-    ON artworks(revoked_at);
-CREATE INDEX IF NOT EXISTS idx_pages_status ON pages(status);
-CREATE INDEX IF NOT EXISTS idx_pages_pid    ON pages(pid);
-
--- Convenience views — empty until migration backfills the tables.
-CREATE VIEW IF NOT EXISTS v_pending_artworks AS
-    SELECT pid FROM artworks
-    WHERE meta_updated_at IS NULL AND revoked_at IS NULL;
-
-CREATE VIEW IF NOT EXISTS v_pending_pages AS
-    SELECT pid, page_index, url FROM pages WHERE status = 'pending';
-
--- A PID is "complete" when the count of downloaded pages reaches
--- artworks.page_count. NULL page_count means we haven't yet fetched meta
--- for it, so completion can't be asserted — those PIDs are excluded.
-CREATE VIEW IF NOT EXISTS v_complete_artworks AS
-    SELECT a.pid
-    FROM artworks a
-    JOIN (
-        SELECT pid, COUNT(*) AS done
-        FROM pages WHERE status = 'downloaded' GROUP BY pid
-    ) c ON c.pid = a.pid
-    WHERE a.page_count IS NOT NULL AND c.done >= a.page_count;
-
--- A PID is "closed for processing" — Step 4 will not try to download it.
--- Three independent ways to land here:
---   1. revoked_at IS NOT NULL  (Pixiv 404'd it OR migration marked it
---                              for any other reason it should be skipped)
---   2. v_complete_artworks      (full meta + every page on disk)
---   3. legacy sentinel + no pending pages
---                              (migration imported from exist_pid.json,
---                              no evidence of work to do)
-CREATE VIEW IF NOT EXISTS v_closed_artworks AS
-    SELECT pid FROM artworks WHERE revoked_at IS NOT NULL
-    UNION
-    SELECT pid FROM v_complete_artworks
-    UNION
-    SELECT a.pid FROM artworks a
-    WHERE a.meta_updated_at = '0001-01-01 00:00:00'
-      AND NOT EXISTS (
-          SELECT 1 FROM pages p WHERE p.pid = a.pid AND p.status = 'pending'
-      );
-"""
 
 # Status constants — keep callers literal-free. Set, not enum, so a typo
 # raises KeyError immediately instead of silently mis-comparing.
@@ -129,45 +59,16 @@ _VALID_PAGE_STATUSES = frozenset({
 })
 
 
-# ── closed-artwork set cache ──────────────────────────────────────────────
-# ``closed_artwork_set`` is the single most expensive call in the whole
-# startup path: on a real-world 1.26M-row DB it returns ~1.1M PIDs and the
-# old ``SELECT pid FROM v_closed_artworks`` spent ~23s building a TEMP
-# B-TREE to dedupe the 3-branch UNION. It is called 5-6 times per Run All
-# (``_build_step2/3``, ``_build_combined``, the folder-sync DB augment,
-# ``download_thread._load_initial_exist_pid_set`` and ``emit_db_stats``'s
-# ``downloaded_count``), so the cost multiplies.
-#
-# This process-global cache keys on a cheap DB file signature — the
-# (size, mtime_ns) of ``metadata.sqlite3`` plus its ``-wal`` sidecar. Any
-# committed write appends frames to the WAL (or rewrites the main file on
-# checkpoint), so a *matching* signature provably means the closed set is
-# unchanged. A mismatch (our own writes, another process, the CLI) recomputes
-# automatically — there is no manual invalidation to get wrong. Different
-# MetadataDB instances pointed at the same file share the cache, so the
-# build-time call and the worker-thread call collapse into one compute.
-_CLOSED_SET_CACHE: dict[str, tuple] = {}
-_CLOSED_SET_CACHE_LOCK = threading.RLock()
+class MetadataDB(_MigrationMixin, _ArtworkMixin):
+    """Thread-safe SQLite cache for Pixiv metadata + downloaded-PID set.
 
-
-def _db_file_signature(db_path: str) -> tuple:
-    """Cheap change signature: (size, mtime_ns) of the DB file + its -wal.
-
-    Two ``os.stat`` calls, no row access. ``None`` for a missing file so a
-    not-yet-created DB and a freshly-deleted one compare distinctly.
+    Method groups are split across mixins (file-size refactor) but the
+    public API is unchanged — every method is still reachable as
+    ``db.<method>``. ``_MigrationMixin`` holds the legacy JSON import/export
+    helpers (``metadata_db_migration.py``); ``_ArtworkMixin`` holds the
+    ``artworks``-table CRUD (``metadata_db_artwork.py``). The connection,
+    lock, bulk-writer and shared helpers they call live on this class.
     """
-    sig = []
-    for suffix in ("", "-wal"):
-        try:
-            st = os.stat(db_path + suffix)
-            sig.append((st.st_size, st.st_mtime_ns))
-        except OSError:
-            sig.append(None)
-    return tuple(sig)
-
-
-class MetadataDB:
-    """Thread-safe SQLite cache for Pixiv metadata + downloaded-PID set."""
 
     def __init__(self, base_path: str, *, event_log=None):
         self._base = str(base_path or "").strip()
@@ -466,137 +367,9 @@ class MetadataDB:
 
     # ── bulk migration helpers ────────────────────────────────────────────
 
-    def import_meta_dict(self, meta: dict) -> int:
-        """Bulk-insert from the legacy all_url_meta.json shape into ``artworks``.
-
-        ``meta_updated_at`` falls back to ``datetime('now')`` when the
-        caller's entry didn't carry a timestamp — calling import_meta_dict
-        always means "we have meta", so a NULL would wrongly hide the row
-        from get_meta() (which filters meta_updated_at IS NOT NULL).
-        Returns the number of rows attempted.
-        """
-        if not isinstance(meta, dict) or not meta:
-            return 0
-        artworks_rows = []
-        for pid, entry in meta.items():
-            pid_key = self._coerce_pid(pid)
-            if not pid_key or not isinstance(entry, dict):
-                continue
-            artworks_rows.append(self._build_artwork_row(pid_key, entry))
-        if not artworks_rows:
-            return 0
-        self._bulk_write(
-            "INSERT INTO artworks (pid, discovered_at, page_count, like_count, "
-            "tags, img_url_template, requires_cookie, meta_updated_at, "
-            "upload_date, create_date, user_id, user_name) "
-            "VALUES (?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, "
-            "COALESCE(?, datetime('now')), ?, ?, ?, ?) "
-            "ON CONFLICT(pid) DO UPDATE SET "
-            "page_count       = COALESCE(excluded.page_count, artworks.page_count), "
-            "like_count       = COALESCE(excluded.like_count, artworks.like_count), "
-            "tags             = COALESCE(excluded.tags, artworks.tags), "
-            "img_url_template = COALESCE(excluded.img_url_template, artworks.img_url_template), "
-            "requires_cookie  = COALESCE(excluded.requires_cookie, artworks.requires_cookie), "
-            "meta_updated_at  = COALESCE(excluded.meta_updated_at, artworks.meta_updated_at), "
-            "upload_date      = COALESCE(excluded.upload_date, artworks.upload_date), "
-            "create_date      = COALESCE(excluded.create_date, artworks.create_date), "
-            "user_id          = COALESCE(excluded.user_id, artworks.user_id), "
-            "user_name        = COALESCE(excluded.user_name, artworks.user_name)",
-            artworks_rows,
-        )
-        return len(artworks_rows)
-
-    @staticmethod
-    def _build_artwork_row(pid_key, entry):
-        """Translate one (pid, entry) into a row tuple for the artworks table.
-
-        Mirrors :meth:`_build_meta_row` but targets the new column names.
-        """
-        tags = entry.get("tag")
-        if tags is None:
-            tags = entry.get("tags", [])
-        tags_blob = json.dumps(
-            list(tags) if isinstance(tags, list) else [],
-            ensure_ascii=False,
-        )
-        rc = entry.get("requires_cookie")
-        rc_int = None if rc is None else (1 if rc else 0)
-        updated = entry.get("updated_at") or entry.get("checked_at")
-        upload = entry.get("upload_date")
-        create = entry.get("create_date")
-        uid = entry.get("user_id")
-        uname = entry.get("user_name")
-        return (
-            pid_key,
-            updated,                                          # discovered_at fallback
-            entry.get("pagecount") or entry.get("page_count"),
-            entry.get("like"),
-            tags_blob,
-            entry.get("img_url"),
-            rc_int,
-            updated,                                          # meta_updated_at
-            None if upload in (None, "") else str(upload),
-            None if create in (None, "") else str(create),
-            None if uid in (None, "") else str(uid),
-            None if uname in (None, "") else str(uname),
-        )
-
-    def import_downloaded_set(self, pids: Iterable) -> int:
-        """Bulk-import a PID set as 'closed' artworks (sentinel rows).
-
-        Each PID becomes an ``artworks`` row with
-        ``meta_updated_at = '0001-01-01 00:00:00'``, which ``v_closed_artworks``
-        treats as a legacy-closed sentinel. Safe to call multiple times —
-        ``INSERT OR IGNORE`` is idempotent.
-        """
-        artwork_rows = []
-        for v in pids or ():
-            pid_key = self._coerce_pid(v)
-            if pid_key:
-                artwork_rows.append((pid_key, "0001-01-01 00:00:00", "0001-01-01 00:00:00"))
-        if not artwork_rows:
-            return 0
-        pids_to_emit = [r[0] for r in artwork_rows]
-        self._emit(
-            "artwork.imported_set",
-            pids=pids_to_emit,
-            discovered_at="0001-01-01 00:00:00",
-            meta_updated_at="0001-01-01 00:00:00",
-        )
-        self._bulk_write(
-            "INSERT OR IGNORE INTO artworks (pid, discovered_at, meta_updated_at) "
-            "VALUES (?, ?, ?)",
-            artwork_rows,
-        )
-        return len(artwork_rows)
-
-    def export_meta_dict(self) -> dict:
-        """Return the canonical dict shape, suitable for writing all_url_meta.json.
-
-        Reads from ``artworks`` (only rows where meta has been fetched,
-        i.e. ``meta_updated_at IS NOT NULL`` and not the sentinel value).
-        """
-        cur = self._conn().execute(
-            "SELECT pid, tags, like_count, page_count, img_url_template, "
-            "requires_cookie, meta_updated_at FROM artworks "
-            "WHERE meta_updated_at IS NOT NULL "
-            "AND meta_updated_at != '0001-01-01 00:00:00'"
-        )
-        out: dict = {}
-        for pid, tags_blob, like, pages, img, rc, updated in cur.fetchall():
-            try:
-                tags = json.loads(tags_blob) if tags_blob else []
-            except Exception:
-                tags = []
-            out[str(pid)] = {
-                "tag": tags,
-                "like": like,
-                "pagecount": pages,
-                "img_url": img,
-                "requires_cookie": None if rc is None else bool(rc),
-                "updated_at": updated,
-            }
-        return out
+    # import_meta_dict / _build_artwork_row / import_downloaded_set /
+    # export_meta_dict moved to metadata_db_migration._MigrationMixin
+    # (file-size refactor). MetadataDB inherits them unchanged.
 
     # ── pending_urls ──────────────────────────────────────────────────────
 
@@ -825,251 +598,11 @@ class MetadataDB:
 
     # ── artworks (new canonical schema) ───────────────────────────────────
 
-    def upsert_artwork(
-        self,
-        pid: str,
-        *,
-        discovered_at: str | None = None,
-        page_count: int | None = None,
-        like_count: int | None = None,
-        tags: list | None = None,
-        img_url_template: str | None = None,
-        requires_cookie: bool | None = None,
-        meta_updated_at: str | None = None,
-        revoked_at: str | None = None,
-        upload_date: str | None = None,
-        create_date: str | None = None,
-        user_id: str | None = None,
-        user_name: str | None = None,
-    ) -> None:
-        """Insert or merge an artwork row. ``COALESCE`` keeps existing
-        columns whenever the caller passes ``None``, so this method is safe
-        to call with partial information (e.g. when first discovering a PID
-        before meta is fetched). ``discovered_at`` defaults to *now* on
-        first insert; subsequent calls keep the original value.
-
-        ``upload_date`` and ``create_date`` are Pixiv's ISO-8601 timestamps
-        (with timezone) for the artwork upload / creation. ``user_id`` /
-        ``user_name`` identify the artist; Step 2 knows ``user_id`` from the
-        profile-scan iteration, Step 3 supplements ``user_name`` from
-        ``/ajax/illust/{id}``. ``meta_updated_at`` doubles as the fetched-at
-        timestamp.
-        """
-        pid_key = self._coerce_pid(pid)
-        if not pid_key:
-            return
-        rc_int = None if requires_cookie is None else (1 if requires_cookie else 0)
-        tags_blob = None if tags is None else json.dumps(list(tags), ensure_ascii=False)
-        self._emit("artwork.upsert", pid=pid_key, discovered_at=discovered_at,
-                   page_count=page_count, like_count=like_count,
-                   tags=list(tags) if tags is not None else None,
-                   img_url_template=img_url_template,
-                   requires_cookie=requires_cookie,
-                   meta_updated_at=meta_updated_at, revoked_at=revoked_at,
-                   upload_date=upload_date, create_date=create_date,
-                   user_id=user_id, user_name=user_name)
-        sql = (
-            "INSERT INTO artworks (pid, discovered_at, page_count, like_count, "
-            "tags, img_url_template, requires_cookie, meta_updated_at, revoked_at, "
-            "upload_date, create_date, user_id, user_name) "
-            "VALUES (?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(pid) DO UPDATE SET "
-            "page_count       = COALESCE(excluded.page_count, artworks.page_count), "
-            "like_count       = COALESCE(excluded.like_count, artworks.like_count), "
-            "tags             = COALESCE(excluded.tags, artworks.tags), "
-            "img_url_template = COALESCE(excluded.img_url_template, artworks.img_url_template), "
-            "requires_cookie  = COALESCE(excluded.requires_cookie, artworks.requires_cookie), "
-            "meta_updated_at  = COALESCE(excluded.meta_updated_at, artworks.meta_updated_at), "
-            "revoked_at       = COALESCE(excluded.revoked_at, artworks.revoked_at), "
-            "upload_date      = COALESCE(excluded.upload_date, artworks.upload_date), "
-            "create_date      = COALESCE(excluded.create_date, artworks.create_date), "
-            "user_id          = COALESCE(excluded.user_id, artworks.user_id), "
-            "user_name        = COALESCE(excluded.user_name, artworks.user_name)"
-        )
-        with self._lock:
-            self._conn().execute(sql, (
-                pid_key, discovered_at, page_count, like_count, tags_blob,
-                img_url_template, rc_int, meta_updated_at, revoked_at,
-                upload_date, create_date, user_id, user_name,
-            ))
-
-    def upsert_artworks(
-        self,
-        pids: Iterable,
-        *,
-        discovered_at: str | None = None,
-        user_id: str | None = None,
-    ) -> int:
-        """Bulk-discover PIDs (no meta yet). Existing rows are untouched.
-
-        Used by migration + Step 2 ingestion. ``discovered_at`` defaults to
-        the current wall-clock time when not supplied. Returns the row count
-        attempted (``INSERT OR IGNORE`` may skip duplicates).
-
-        ``user_id`` is recorded alongside ``discovered_at`` when supplied —
-        Step 2 already knows which artist a PID came from, so writing it at
-        discovery time fills in the author field for PIDs that never reach
-        Step 3 (e.g. interrupted runs).
-        """
-        import datetime
-        ts = discovered_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        uid = None if user_id is None else str(user_id)
-        rows = [(self._coerce_pid(p), ts, uid) for p in (pids or ()) if self._coerce_pid(p)]
-        if not rows:
-            return 0
-        self._emit("artwork.discovered",
-                   pids=[r[0] for r in rows],
-                   discovered_at=ts,
-                   user_id=uid)
-        self._bulk_write(
-            "INSERT OR IGNORE INTO artworks (pid, discovered_at, user_id) "
-            "VALUES (?, ?, ?)",
-            rows,
-        )
-        # Backfill user_id for PIDs that existed before this discovery pass
-        # but had no author recorded. INSERT OR IGNORE leaves those rows
-        # untouched, so we patch them explicitly. Only NULL→value updates run
-        # (never overwrite an existing user_id, even if the caller-passed
-        # uid disagrees — keep first writer wins).
-        if uid is not None:
-            self._bulk_write(
-                "UPDATE artworks SET user_id = ? "
-                "WHERE pid = ? AND user_id IS NULL",
-                [(uid, r[0]) for r in rows],
-            )
-        return len(rows)
-
-    def backfill_user_ids(self, pids: Iterable, user_id: str | None) -> int:
-        """Fill ``user_id`` for EXISTING artworks rows that have no author yet.
-
-        UPDATE-only: never inserts a row, so it cannot create spurious
-        ``v_pending_artworks`` entries or otherwise disturb any work queue.
-        Callers can therefore pass an artist's full PID list (including PIDs
-        the Step 2 incremental scan truncated) to fill the author for
-        already-known PIDs without re-querying them. First-writer-wins: a row
-        that already has a non-empty ``user_id`` is left untouched. Returns
-        the number of PIDs considered (not the number actually changed).
-        """
-        uid = None if user_id is None else str(user_id).strip()
-        if not uid:
-            return 0
-        rows = [self._coerce_pid(p) for p in (pids or ())]
-        rows = [r for r in rows if r]
-        if not rows:
-            return 0
-        self._emit("artwork.user_id_backfill", pids=rows, user_id=uid)
-        self._bulk_write(
-            "UPDATE artworks SET user_id = ? "
-            "WHERE pid = ? AND (user_id IS NULL OR user_id = '')",
-            [(uid, r) for r in rows],
-        )
-        return len(rows)
-
-    def get_artwork(self, pid: str) -> dict | None:
-        """Read one artwork row as a dict, decoding the JSON tag blob.
-
-        ``meta_updated_at`` is also exposed under the ``fetched_at`` alias so
-        callers can use the more user-facing wording without coupling to the
-        column name.
-        """
-        pid_key = self._coerce_pid(pid)
-        if not pid_key:
-            return None
-        cur = self._conn().execute(
-            "SELECT pid, discovered_at, page_count, like_count, tags, "
-            "img_url_template, requires_cookie, meta_updated_at, revoked_at, "
-            "upload_date, create_date, user_id, user_name "
-            "FROM artworks WHERE pid=?",
-            (pid_key,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        try:
-            tags = json.loads(row[4]) if row[4] else []
-        except Exception:
-            tags = []
-        return {
-            "pid": row[0],
-            "discovered_at": row[1],
-            "page_count": row[2],
-            "like_count": row[3],
-            "tags": tags,
-            "img_url_template": row[5],
-            "requires_cookie": None if row[6] is None else bool(row[6]),
-            "meta_updated_at": row[7],
-            "fetched_at": row[7],
-            "revoked_at": row[8],
-            "upload_date": row[9],
-            "create_date": row[10],
-            "user_id": row[11],
-            "user_name": row[12],
-        }
-
-    def user_id_map_for_pids(self, pids: Iterable[str]) -> dict[str, str | None]:
-        """Return ``{original_pid: user_id|None}`` for the given pids.
-
-        Keys are the exact pid strings passed in (not the coerced digit
-        form), so callers can look up by the same values they hold. A pid
-        absent from ``artworks``, or whose ``user_id`` is NULL/empty, maps
-        to ``None``. Coerced pids are batched in chunks of 900 to stay under
-        SQLite's bound-variable limit.
-        """
-        out: dict[str, str | None] = {}
-        coerced_to_orig: dict[str, list[str]] = {}
-        for p in pids:
-            out[p] = None
-            c = self._coerce_pid(p)
-            if c:
-                coerced_to_orig.setdefault(c, []).append(p)
-        if not coerced_to_orig:
-            return out
-        conn = self._conn()
-        keys = list(coerced_to_orig.keys())
-        chunk = 900
-        for i in range(0, len(keys), chunk):
-            part = keys[i:i + chunk]
-            placeholders = ",".join("?" * len(part))
-            cur = conn.execute(
-                f"SELECT pid, user_id FROM artworks WHERE pid IN ({placeholders})",
-                part,
-            )
-            for cpid, uid in cur.fetchall():
-                val = uid if (uid is not None and str(uid).strip() != "") else None
-                for orig in coerced_to_orig.get(str(cpid), []):
-                    out[orig] = val
-        return out
-
-    def mark_artwork_revoked(self, pid: str, *, revoked_at: str | None = None) -> None:
-        """Mark a PID as removed by Pixiv (404 / deletion). Idempotent."""
-        pid_key = self._coerce_pid(pid)
-        if not pid_key:
-            return
-        self._emit("artwork.revoked", pid=pid_key, revoked_at=revoked_at)
-        ts = revoked_at  # None -> use datetime('now')
-        sql = (
-            "UPDATE artworks SET revoked_at = COALESCE(?, datetime('now')) "
-            "WHERE pid=? AND revoked_at IS NULL"
-        )
-        with self._lock:
-            self._conn().execute(sql, (ts, pid_key))
-
-    def artwork_count(self) -> int:
-        return int(self._conn().execute("SELECT COUNT(*) FROM artworks").fetchone()[0])
-
-    def pending_artwork_count(self) -> int:
-        """PIDs where Step 3 hasn't yet fetched meta (and not revoked)."""
-        return int(self._conn().execute("SELECT COUNT(*) FROM v_pending_artworks").fetchone()[0])
-
-    def get_pending_artwork_pids(self, *, limit: int | None = None) -> list:
-        """List PIDs that Step 3 still needs to fetch meta for."""
-        sql = "SELECT pid FROM v_pending_artworks"
-        if limit is not None:
-            sql += " LIMIT ?"
-            cur = self._conn().execute(sql, (int(limit),))
-        else:
-            cur = self._conn().execute(sql)
-        return [r[0] for r in cur.fetchall()]
+    # upsert_artwork / upsert_artworks / backfill_user_ids / get_artwork /
+    # user_id_map_for_pids / mark_artwork_revoked / artwork_count /
+    # pending_artwork_count / get_pending_artwork_pids moved to
+    # metadata_db_artwork._ArtworkMixin (file-size refactor). MetadataDB
+    # inherits them unchanged.
 
     # ── pages (new canonical schema) ──────────────────────────────────────
 

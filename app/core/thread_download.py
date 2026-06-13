@@ -4,16 +4,12 @@ import json
 import os
 import datetime
 import re
-import glob
 import random as pyrandom
 import threading
 import concurrent.futures
 import requests
 import io
 import zipfile
-import shutil
-import subprocess
-import tempfile
 from queue import Queue, Empty
 from PIL import Image
 from pixiv_api import *  # noqa: F403  (intentional: re-exports Pixiv_info/gif_download/etc.)
@@ -41,6 +37,9 @@ from app.core.pixiv_thread_base import (
     _is_ai_artwork_tagged,
     _cookie_usage_label,
 )
+from app.core.step4_filename import _FilenameMixin
+from app.core.step4_jxl_conversion import _JXLMixin
+from app.core import diag_log
 
 def _safe_meta_count(db) -> int:
     try:
@@ -49,64 +48,10 @@ def _safe_meta_count(db) -> int:
         return 0
 
 
-# Tag-cleanup regexes used by _normalize_tag_for_filename. Kept at module level
-# so they compile once on import.
-#
-# _ZERO_WIDTH_RE: zero-width / invisible chars that take up no display width
-# but still consume filename-length budget. Always stripped (no toggle).
-#   U+200B-200D zero-width space / non-joiner / joiner
-#   U+FEFF     byte-order mark / zero-width no-break space
-#   U+00AD     soft hyphen
-_ZERO_WIDTH_RE = re.compile(r"[​-‍﻿­]")
-
-# _BRACKET_CONTENT_RE: matched bracket pairs with their content. Each
-# alternative uses a tight negated char class so we only consume the innermost
-# pair — a second pass over the same string mops up any outer pair that became
-# empty after the inner content vanished. Order: ASCII (), full-width （）,
-# ASCII [], CJK 【】《》〈〉「」『』〔〕〘〙. Unmatched single-side brackets
-# are intentionally left alone so `R-18(警告` stays readable.
-_BRACKET_CONTENT_RE = re.compile(
-    r"(?:"
-    r"\([^()]*\)"
-    r"|（[^（）]*）"
-    r"|\[[^\[\]]*\]"
-    r"|【[^【】]*】"
-    r"|《[^《》]*》"
-    r"|〈[^〈〉]*〉"
-    r"|「[^「」]*」"
-    r"|『[^『』]*』"
-    r"|〔[^〔〕]*〕"
-    r"|〘[^〘〙]*〙"
-    r")"
-)
-
-# _DECORATIVE_CHARS_RE: Unicode-range blocklist for the
-# tag_strip_special_chars toggle. Covers arrows, geometric shapes, misc
-# symbols (★ ♀ ♪ etc.), dingbats, and the full emoji span U+1F000-U+1FAFF.
-# Also strips Variation Selectors U+FE00-U+FE0F — these combine with a base
-# character to switch between text-style and emoji-style rendering (e.g.
-# "♪️"). If we strip the base ♪ but leave the VS16 selector behind,
-# the filename ends up with a stray invisible codepoint, so VS selectors
-# must go alongside the emoji they decorate.
-# Deliberately excludes the CJK Symbols and Punctuation block (U+3000-U+303F)
-# because that overlaps with the bracket characters handled by the brackets
-# toggle; if special_chars is on but brackets is off, we still want brackets
-# preserved. Extend by adding more ranges to this character class.
-_DECORATIVE_CHARS_RE = re.compile(
-    r"["
-    r"←-⇿"   # Arrows
-    r"⌀-⏿"   # Misc Technical
-    r"①-⓿"   # Enclosed Alphanumerics
-    r"─-▟"   # Box Drawing + Block Elements
-    r"■-◿"   # Geometric Shapes (◯ ● ◎ ◇ ◆)
-    r"☀-⛿"   # Misc Symbols (★ ☆ ♀ ♂ ♪ ♫)
-    r"✀-➿"   # Dingbats (✂ ✈ ✏)
-    r"⬀-⯿"   # Misc Symbols and Arrows
-    r"︀-️"  # Variation Selectors (VS1-VS16, esp. ️ U+FE0F)
-    r"\U0001F000-\U0001FAFF"  # All emoji blocks
-    r"※〝〞〽"            # explicit additions outside the range blocks above
-    r"]"
-)
+# Tag-cleanup regexes (_ZERO_WIDTH_RE / _BRACKET_CONTENT_RE /
+# _DECORATIVE_CHARS_RE) and the filename/tag rendering helpers moved to
+# step4_filename._FilenameMixin (file-size refactor). download_thread inherits
+# the mixin, so they remain reachable as self._build_download_filename etc.
 
 
 def _leading_pid_int(pid) -> int | None:
@@ -162,7 +107,7 @@ def compute_author_order(pid_order, pid_to_user_id):
     return flat_order, author_batches
 
 
-class download_thread(PauseableThread):
+class download_thread(PauseableThread, _FilenameMixin, _JXLMixin):
     pid_max=0
     pid_now=0
     path=os.getenv('APPDATA')+r'/pixiv_download/'
@@ -327,33 +272,8 @@ class download_thread(PauseableThread):
         except Exception:
             return 35
 
-    def _init_jxl_config(self, jxl_enable, jxl_cjxl_path, jxl_delete_original, jxl_effort):
-        """Resolve JXL settings + reset per-run JXL counters."""
-        self.jxl_enable = bool(jxl_enable)
-        jxl_path_raw = (
-            str(jxl_cjxl_path).strip()
-            if str(jxl_cjxl_path).strip()
-            else r"C:\Users\Eric\Downloads\jxl-x64-windows\bin\cjxl.exe"
-        )
-        self.jxl_cjxl_path = self._resolve_cjxl_path(jxl_path_raw)
-        self.jxl_delete_original = bool(jxl_delete_original)
-        try:
-            self.jxl_effort = int(jxl_effort)
-        except Exception:
-            self.jxl_effort = 7
-        self.jxl_effort = max(1, min(9, self.jxl_effort))
-        self._jxl_path_warned = False
-        self._jxl_gif_skip_warned = False
-        self._jxl_ok_count = 0
-        self._jxl_fail_count = 0
-        self._jxl_src_total_bytes = 0
-        self._jxl_dst_total_bytes = 0
-        # Background JXL conversion: a single worker thread drains a FIFO
-        # queue so cjxl runs do not block downloads.  All counter mutations
-        # stay on this single worker (no lock needed); the main thread only
-        # reads them after _drain_jxl_queue() in finalize.
-        self._jxl_queue: Queue = Queue()
-        self._jxl_worker_thread: threading.Thread | None = None
+    # _init_jxl_config moved to step4_jxl_conversion._JXLMixin (file-size
+    # refactor). Inherited; still called from __init__ as self._init_jxl_config.
 
     def _init_filter_state(self, like_num, ban_tag, must_tag, special_like_rules,
                            filename_template="", *,
@@ -1150,288 +1070,13 @@ class download_thread(PauseableThread):
         download_thread._apply_legacy_special_like_rules(kwargs, overrides)
         return overrides
 
-    def _resolve_cjxl_path(self, preferred_path):
-        preferred = str(preferred_path or "").strip()
-        if preferred and os.path.isfile(preferred):
-            return preferred
-        candidates = [
-            preferred,
-            r"C:\Users\Eric\Downloads\jxl-x64-windows\bin\cjxl.exe",
-            r"C:\Users\Eric\Downloads\jxl-x64-windows-static\bin\cjxl.exe",
-        ]
-        for c in candidates:
-            if c and os.path.isfile(c):
-                return c
-        try:
-            user_home = os.path.expanduser("~")
-            found = glob.glob(os.path.join(user_home, "Downloads", "jxl*", "bin", "cjxl.exe"))
-            if found:
-                found = sorted(found, key=lambda x: os.path.getmtime(x), reverse=True)
-                return found[0]
-        except Exception:
-            pass
-        return preferred or r"C:\Users\Eric\Downloads\jxl-x64-windows\bin\cjxl.exe"
-
-    def _build_jxl_command(self, src_path, dst_path):
-        ext = os.path.splitext(str(src_path))[1].lower()
-        cmd = [self.jxl_cjxl_path, str(src_path), str(dst_path), "--effort", str(self.jxl_effort)]
-        if ext in {".jpg", ".jpeg"}:
-            cmd.append("--lossless_jpeg=1")
-        else:
-            cmd.append("--distance=0")
-        return cmd
-
-    def _run_cjxl_once(self, src_path, dst_path):
-        cmd = self._build_jxl_command(src_path, dst_path)
-        try:
-            completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(Exception):
-                self._q.put(WorkerEvent("output",
-                    f"<p><font color='orange'>JXL 轉檔逾時（120s），跳過：{os.path.basename(str(src_path))}</font></p>"
-                ))
-            return False, "cjxl timeout (120s)"
-        if completed.returncode == 0 and os.path.isfile(dst_path):
-            return True, ""
-        reason = (completed.stderr or completed.stdout or "").strip()
-        if len(reason) > 200:
-            reason = reason[:197] + "..."
-        if not reason:
-            reason = f"cjxl exit={completed.returncode}"
-        return False, reason
-
-    def _run_cjxl_with_temp_ascii_path(self, src_path, dst_path, temp_name=None):
-        ext = os.path.splitext(str(src_path))[1].lower() or ".bin"
-        workdir = tempfile.mkdtemp(prefix="jxl_retry_")
-        src_name = str(temp_name or ("input" + ext))
-        if "." not in src_name:
-            src_name = src_name + ext
-        tmp_src = os.path.join(workdir, src_name)
-        tmp_dst_name = "1_PID.jxl" if temp_name else "output.jxl"
-        tmp_dst = os.path.join(workdir, tmp_dst_name)
-        try:
-            shutil.copy2(src_path, tmp_src)
-            ok, reason = self._run_cjxl_once(tmp_src, tmp_dst)
-            if ok and os.path.isfile(tmp_dst):
-                shutil.move(tmp_dst, dst_path)
-                return True, ""
-            return False, reason
-        except Exception as err:
-            return False, str(err)
-        finally:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(workdir, ignore_errors=True)
-
-    _JXL_SUPPORTED_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
-
-    def _warn_cjxl_missing_once(self):
-        """Emit the 'cjxl not found' warning at most once per worker run."""
-        if self._jxl_path_warned:
-            return
-        self._jxl_path_warned = True
-        with contextlib.suppress(Exception):
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='orange'>JXL 已啟用，但找不到 cjxl：{self.jxl_cjxl_path}</font></p>"
-            ))
-
-    def _handle_existing_jxl_destination(self, src_path):
-        """Bump ok counter and optionally delete the original when .jxl already exists."""
-        try:
-            self._jxl_ok_count += 1
-            if self.jxl_delete_original and os.path.isfile(src_path):
-                os.remove(src_path)
-        except Exception:
-            pass
-
-    def _jxl_should_convert(self, src_path):
-        """Run all gating checks. Returns (proceed, dst_path, ext).
-
-        proceed=False means the orchestrator should return immediately. Side
-        effects: emits the one-shot cjxl-missing warning and handles the
-        "destination already exists" accounting + optional original deletion.
-        """
-        if not self.jxl_enable or not src_path:
-            return False, None, None
-        src_path = str(src_path)
-        ext = os.path.splitext(src_path)[1].lower()
-        if ext not in self._JXL_SUPPORTED_EXTS:
-            return False, None, None
-        if not os.path.isfile(src_path):
-            return False, None, None
-        if not os.path.isfile(self.jxl_cjxl_path):
-            self._warn_cjxl_missing_once()
-            return False, None, None
-        dst_path = os.path.splitext(src_path)[0] + ".jxl"
-        if os.path.isfile(dst_path):
-            self._handle_existing_jxl_destination(src_path)
-            return False, dst_path, ext
-        return True, dst_path, ext
-
-    def _jxl_run_conversion(self, src_path, dst_path, ext):
-        """Invoke cjxl with extension-aware retry. Returns (ok, reason)."""
-        try:
-            if ext == ".gif":
-                # GIF uses fixed short ASCII filename directly to avoid path/encoding failures.
-                ok, reason = self._run_cjxl_with_temp_ascii_path(
-                    src_path, dst_path, temp_name="1_PID.gif"
-                )
-            else:
-                ok, reason = self._run_cjxl_once(src_path, dst_path)
-        except Exception as err:
-            ok, reason = False, str(err)
-        if (not ok) and ext != ".gif":
-            # Retry with short ASCII temp path to avoid unicode/long-path decode failures.
-            ok, reason2 = self._run_cjxl_with_temp_ascii_path(src_path, dst_path)
-            reason = "" if ok else reason2 or reason
-        # GIF intentionally does not fall back to first-frame static conversion
-        # so animation correctness is preserved.
-        return ok, reason
-
-    def _jxl_tally_sizes(self, src_path, dst_path):
-        """Read src/dst sizes, update running totals, return ``(src_size, dst_size, saved)``.
-
-        Any of the three return values may be ``None`` if a stat call failed.
-        Total/stats updates are best-effort so test stubs that don't preset
-        the running-total attributes don't crash.
-        """
-        try:
-            src_size = os.path.getsize(src_path)
-            dst_size = os.path.getsize(dst_path)
-        except Exception:
-            return None, None, None
-        if src_size < 0 or dst_size < 0:
-            return None, None, None
-        try:
-            self._jxl_src_total_bytes += src_size
-            self._jxl_dst_total_bytes += dst_size
-        except Exception:
-            pass
-        try:
-            if getattr(self, "_stats_collector", None) is not None:
-                self._stats_collector.report_jxl(src_size, dst_size)
-        except Exception:
-            pass
-        return src_size, dst_size, src_size - dst_size
-
-    def _jxl_emit_compare_log(self, src_path, src_size, dst_size, saved):
-        """Print the per-file 'src → dst (saved X, Y%)' log line if sizes are known."""
-        if src_size is None or saved is None or src_size <= 0:
-            return
-        try:
-            saved_ratio = (saved / float(src_size)) * 100.0
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>JXL 對比：{os.path.basename(src_path)} "
-                f"{self._format_size_human(src_size)} → {self._format_size_human(dst_size)}"
-                f"（省下 {self._format_size_human(saved)}, {saved_ratio:.2f}%）</font></p>"
-            ))
-        except Exception:
-            pass
-
-    def _jxl_delete_source_if_configured(self, src_path):
-        """Delete the source file when jxl_delete_original is True (best-effort)."""
-        if not self.jxl_delete_original:
-            return
-        with contextlib.suppress(Exception):
-            os.remove(src_path)
-
-    def _jxl_emit_failure_log(self, src_path, reason):
-        """Print the per-file failure log line; trims very long reasons."""
-        self._jxl_fail_count += 1
-        msg = reason if len(reason) <= 120 else reason[:117] + "..."
-        if not msg:
-            msg = "cjxl conversion failed"
-        with contextlib.suppress(Exception):
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='orange'>JXL 轉檔失敗：{os.path.basename(src_path)} "
-                f"({msg})</font></p>"
-            ))
-
-    def _jxl_record_outcome(self, src_path, dst_path, ok, reason):
-        """Update counters, emit log lines and optionally delete the source."""
-        if ok and os.path.isfile(dst_path):
-            self._jxl_ok_count += 1
-            src_size, dst_size, saved = self._jxl_tally_sizes(src_path, dst_path)
-            self._jxl_emit_compare_log(src_path, src_size, dst_size, saved)
-            self._jxl_delete_source_if_configured(src_path)
-            return
-        self._jxl_emit_failure_log(src_path, reason)
-
-    def _convert_file_to_jxl(self, src_path):
-        proceed, dst_path, ext = self._jxl_should_convert(src_path)
-        if not proceed:
-            return
-        src_path = str(src_path)
-        ok, reason = self._jxl_run_conversion(src_path, dst_path, ext)
-        self._jxl_record_outcome(src_path, dst_path, ok, reason)
-
-    def _start_jxl_worker_if_needed(self):
-        """Lazily spawn the background cjxl worker on first enqueue."""
-        if self._jxl_worker_thread is not None and self._jxl_worker_thread.is_alive():
-            return
-        t = threading.Thread(target=self._jxl_worker_loop, daemon=True, name="jxl-worker")
-        t.start()
-        self._jxl_worker_thread = t
-
-    def _jxl_worker_loop(self):
-        """Process queued source paths one at a time.  Exits cleanly on the
-        ``None`` sentinel pushed by ``_drain_jxl_queue``.  Uses a 1-second
-        polling timeout so the thread can exit if the main thread crashes
-        before pushing the sentinel."""
-        import queue as _queue_mod
-        while not self._stop_event.is_set():
-            try:
-                src_path = self._jxl_queue.get(timeout=1.0)
-            except _queue_mod.Empty:
-                continue
-            if src_path is None:
-                with contextlib.suppress(Exception):
-                    self._jxl_queue.task_done()
-                return
-            try:
-                with contextlib.suppress(Exception):
-                    self._convert_file_to_jxl(src_path)
-            finally:
-                with contextlib.suppress(Exception):
-                    self._jxl_queue.task_done()
-
-    def _enqueue_jxl(self, src_path):
-        """Hand a source file off to the background worker.  Non-blocking;
-        falls through silently when JXL is disabled or the path is empty."""
-        if not self.jxl_enable or not src_path:
-            return
-        self._start_jxl_worker_if_needed()
-        with contextlib.suppress(Exception):
-            self._jxl_queue.put(str(src_path))
-
-    def _discard_pending_jxl_items(self):
-        """Drain queued items without running cjxl (used on user stop so the
-        user is not left waiting on a long backlog).  Does not interrupt
-        the in-flight conversion."""
-        while True:
-            try:
-                self._jxl_queue.get_nowait()
-            except (Empty, Exception):
-                return
-            with contextlib.suppress(Exception):
-                self._jxl_queue.task_done()
-
-    def _drain_jxl_queue(self):
-        """Wait for queued conversions to finish, then shut the worker down.
-
-        On normal completion, blocks until every enqueued file has been
-        processed so the JXL summary is accurate.  On a user-initiated stop,
-        discards pending items first (keeps in-flight conversion only) so
-        the user is not left waiting minutes for a long backlog."""
-        worker = self._jxl_worker_thread
-        if worker is None or not worker.is_alive():
-            return
-        if self._stop_event.is_set():
-            self._discard_pending_jxl_items()
-        with contextlib.suppress(Exception):
-            self._jxl_queue.join()
-        with contextlib.suppress(Exception):
-            self._jxl_queue.put(None)
-            worker.join(timeout=5.0)
+    # The JXL background-conversion subsystem (_resolve_cjxl_path,
+    # _build_jxl_command, _run_cjxl_*, _jxl_*, _convert_file_to_jxl,
+    # _start_jxl_worker_if_needed, _jxl_worker_loop, _enqueue_jxl,
+    # _discard_pending_jxl_items, _drain_jxl_queue + _JXL_SUPPORTED_EXTS)
+    # moved to step4_jxl_conversion._JXLMixin (file-size refactor).
+    # download_thread inherits the mixin, so they stay reachable as
+    # self._enqueue_jxl / self._drain_jxl_queue etc.
 
     def _normalize_ugoira_frames(self, frame_blobs):
         loaded_frames = []
@@ -1495,136 +1140,10 @@ class download_thread(PauseableThread):
             disposal=2,
         )
 
-    def _normalize_tag_for_filename(self, raw_tag):
-        """Clean one tag for inclusion in the {hashtag} filename segment.
-
-        Pipeline (in order):
-          1. Strip zero-width / invisible chars (always on — they have no
-             display value but eat filename budget).
-          2. Optionally strip matched-bracket pairs and their content
-             (``tag_strip_brackets`` toggle). Two passes so newly-empty outer
-             pairs after the inner content disappears also get cleaned.
-          3. Optionally strip decorative symbols and the entire emoji range
-             (``tag_strip_special_chars`` toggle).
-          4. Collapse any remaining empty-bracket pairs that survived steps
-             1-3 (cosmetic — Pixiv sometimes ships ``tag（）`` shapes).
-          5. Unify all whitespace variants (full-width, no-break, etc.) into
-             single ASCII space and trim.
-        """
-        text = str(raw_tag or "").strip()
-        if not text:
-            return ""
-        # 1. Zero-width / invisible chars — drop entirely.
-        text = _ZERO_WIDTH_RE.sub("", text)
-        # 2. Bracket-content stripping (toggle).
-        if getattr(self, "tag_strip_brackets", False):
-            # Two passes: nested brackets like ((a)(b)) → ((a)(b)) loses the
-            # innermost first; the second sub picks up the now-empty outer.
-            text = _BRACKET_CONTENT_RE.sub("", text)
-            text = _BRACKET_CONTENT_RE.sub("", text)
-        # 3. Decorative symbols / emoji (toggle).
-        if getattr(self, "tag_strip_special_chars", False):
-            text = _DECORATIVE_CHARS_RE.sub("", text)
-        # 4. Mop up empty bracket pairs left behind by translation/cleanup.
-        text = re.sub(r"\(\s*\)", "", text)
-        text = re.sub(r"（\s*）", "", text)
-        text = re.sub(r"\[\s*\]", "", text)
-        text = re.sub(r"【\s*】", "", text)
-        # 5. Whitespace unification: \s matches 　 (full-width space) and
-        #   (no-break space) in Python 3, so a single \s+ collapse here
-        # handles all width variants the user encounters in Pixiv tags.
-        text = re.sub(r"\s+", " ", text).strip()
-        text = text.strip(" _-")
-        return text
-
-    def _build_hashtag_text(self, tags, max_len=230):
-        if not isinstance(tags, list):
-            return " "
-        out = []
-        current_len = 0
-        for many in tags:
-            token = self._normalize_tag_for_filename(many)
-            if not token:
-                continue
-            # Keep compatibility with old format: each tag separated by one space.
-            extra = len(token) + (1 if out else 0)
-            if current_len + extra > int(max_len):
-                break
-            out.append(token)
-            current_len += extra
-        if not out:
-            # Keep legacy behavior: preserve one leading space even when no tag.
-            return " "
-        # Keep legacy behavior: two leading spaces before first tag.
-        return "  " + " ".join(out)
-
-    @staticmethod
-    def _split_timetag(timetag, notime):
-        """Return (date, time) parts of a 'YYYYMMDD_HHMMSS' tag, or empty pair when suppressed."""
-        if not timetag or notime or "_" not in timetag:
-            return "", ""
-        date_part, time_part = timetag.split("_", 1)
-        return date_part, time_part
-
-    @staticmethod
-    def _filename_template_fields(pid, page_suffix, ext, hashtag, timetag, notag, notime):
-        """Build the placeholder dict consumed by render_filename_template."""
-        date_part, time_part = download_thread._split_timetag(timetag, notime)
-        return {
-            "pid": str(pid),
-            "page": page_suffix or "",
-            "ext": ext,
-            "hashtag": hashtag if not notag else "",
-            "tag": (hashtag.strip() if hashtag and not notag else ""),
-            "timetag": timetag if not notime else "",
-            "date": date_part,
-            "time": time_part,
-        }
-
-    @staticmethod
-    def _render_template_filename(template, ext, fields):
-        """Render the user template, append ext if missing, sanitize the result."""
-        from app.core.filename_utils import render_filename_template, sanitize_filename
-        rendered = render_filename_template(template, fields)
-        if not rendered.lower().endswith("." + str(ext).lower()):
-            rendered = rendered + "." + ext
-        return sanitize_filename(rendered)
-
-    @staticmethod
-    def _render_default_filename(pid, page_suffix, ext, hashtag, timetag, notag, notime):
-        """Render the default '[timetag_]PID{pid}{page_suffix}[{hashtag}].{ext}' layout."""
-        from app.core.filename_utils import sanitize_filename
-        parts = []
-        if not notime and timetag:
-            parts.append(timetag)
-        core = 'PID' + str(pid) + (page_suffix or '')
-        if not notag:
-            core += hashtag
-        parts.append(core)
-        return sanitize_filename('_'.join(parts) + '.' + ext)
-
-    @staticmethod
-    def _build_download_filename(pid, *, page_suffix, ext, hashtag, timetag, notag, notime,
-                                 template=""):
-        """Compose a download filename and sanitize it for filesystem safety.
-
-        Default layout: "[timetag_]PID{pid}{page_suffix}[{hashtag}].{ext}".
-        When ``template`` is non-empty the user template is rendered instead,
-        with placeholders {pid} {page} {ext} {tag} {hashtag} {timetag} {date} {time}.
-        notag / notime flags still gate the {hashtag} and {timetag} placeholders
-        to preserve user intent.
-
-        The result is always passed through filename_utils.sanitize_filename.
-        """
-        tmpl = str(template or "").strip()
-        if tmpl:
-            fields = download_thread._filename_template_fields(
-                pid, page_suffix, ext, hashtag, timetag, notag, notime,
-            )
-            return download_thread._render_template_filename(tmpl, ext, fields)
-        return download_thread._render_default_filename(
-            pid, page_suffix, ext, hashtag, timetag, notag, notime,
-        )
+    # _normalize_tag_for_filename / _build_hashtag_text / _split_timetag /
+    # _filename_template_fields / _render_template_filename /
+    # _render_default_filename / _build_download_filename moved to
+    # step4_filename._FilenameMixin (file-size refactor). Inherited unchanged.
 
     def _format_size_human(self, value):
         try:
@@ -1673,8 +1192,14 @@ class download_thread(PauseableThread):
 
     def _run_download_countdown(self, pid, min_sec, max_sec, *, label, color, respect_group_stop):
         if not self.single_mode_flag:
+            # Pool/multi mode skips the in-download wait + its 倒數 entirely.
+            # Logged so the trace shows WHY no countdown appears between pages.
+            diag_log.log(diag_log.WORKER,
+                         f"PID {pid} _run_download_countdown[{label}] skipped (pool mode)")
             return
         delay = self._calc_sleep_delay(min_sec, max_sec, pid=pid)
+        diag_log.log(diag_log.WORKER,
+                     f"PID {pid} _run_download_countdown[{label}] {delay}s (single mode)")
         self._emit_countdown_start_log(pid, delay, label, color)
         for remaining in range(int(delay), 0, -1):
             if self._countdown_tick(remaining, respect_group_stop):
@@ -1980,20 +1505,25 @@ class download_thread(PauseableThread):
         else:
             sess = requests.Session()
         try:
-            for idx, u in enumerate(urls):
-                ret = self.gif_or_jpg(u, session=sess)
-                if ret == -1:
-                    # 已存在或被規則略過，不視為失敗
-                    pass
-                elif ret is None:
-                    failed.append([u, "unknown"])
-                elif ret != 0:
-                    failed.append(ret)
-                elif idx < len(urls) - 1:
-                    # 同一 PID 多頁時，頁面間做短暫休眠
-                    self._sleep_within_pid(pid)
-                if self._stop_event.is_set():
-                    break
+            with diag_log.span(diag_log.DOWNLOAD, f"PID {pid} 下載 ({len(urls)} 頁)"):
+                for idx, u in enumerate(urls):
+                    ret = self.gif_or_jpg(u, session=sess)
+                    if ret == -1:
+                        # 已存在或被規則略過，不視為失敗
+                        diag_log.log(diag_log.DOWNLOAD, f"PID {pid} p{idx} 跳過(已存在/規則)")
+                    elif ret is None:
+                        failed.append([u, "unknown"])
+                        diag_log.log(diag_log.DOWNLOAD, f"PID {pid} p{idx} 失敗(unknown)")
+                    elif ret != 0:
+                        failed.append(ret)
+                        diag_log.log(diag_log.DOWNLOAD, f"PID {pid} p{idx} 失敗")
+                    else:
+                        diag_log.log(diag_log.DOWNLOAD, f"PID {pid} p{idx} 完成")
+                        if idx < len(urls) - 1:
+                            # 同一 PID 多頁時，頁面間做短暫休眠
+                            self._sleep_within_pid(pid)
+                    if self._stop_event.is_set():
+                        break
         finally:
             with contextlib.suppress(Exception):
                 sess.close()
