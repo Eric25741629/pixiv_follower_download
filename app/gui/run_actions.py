@@ -355,6 +355,16 @@ class RunController(_CookieValidationMixin):
                 return
             self._main_view._active_thread = t
             self._main_view.set_running(True)
+            # Drive the "本次執行" elapsed timer from the run lifecycle, not from
+            # inside Step 4: a fresh run (require_idle) resets it; a chained
+            # Run-All step resumes the same timer so elapsed spans the whole run
+            # (combined mode + Step 1/2/3-only runs are covered too — they never
+            # reach download_thread.run() where the reset used to live).
+            if self._stats_collector is not None:
+                if require_idle:
+                    self._stats_collector.reset_session()
+                else:
+                    self._stats_collector.resume_session()
             for i in range(4):
                 self._main_view.set_step_state(i, "idle")
             self._main_view.set_step_state(n - 1, "running")

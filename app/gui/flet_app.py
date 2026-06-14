@@ -508,6 +508,11 @@ def main(page: ft.Page) -> None:
         for i, st in enumerate(main_view._step_states):
             if st == "running":
                 main_view.set_step_state(i, "done")
+        # Freeze the "本次執行" elapsed timer. In Run All an intermediate step
+        # emits 'finished' too, but the following 'next N' resumes the timer
+        # (via _start_step) within the same dispatcher drain, so only the final
+        # step's freeze sticks.
+        stats_collector.mark_session_end()
         main_view.set_running(False)
         _PERSISTENT_ACTIVE_THREAD = None
         # Run finished — reset persisted state so a future new main()
@@ -529,6 +534,9 @@ def main(page: ft.Page) -> None:
             for i, st in enumerate(main_view._step_states):
                 if st == "running":
                     main_view.set_step_state(i, "error")
+            # Terminal (step error or combined-mode end): freeze the elapsed
+            # timer. No-op if a preceding 'finished' already froze it.
+            stats_collector.mark_session_end()
             _PERSISTENT_ACTIVE_THREAD = None
             main_view.set_running(False)
             _PERSISTENT_UI_STATE["step_states"] = list(main_view._step_states)

@@ -1781,8 +1781,9 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
 
     def run(self):
         try:
-            if self._stats_collector is not None:
-                self._stats_collector.reset_session()
+            # The "本次執行" elapsed timer is reset/resumed by RunController._start_step
+            # at run launch (covers combined mode + Step 1/2/3-only runs, and avoids
+            # rewinding the whole-run timer when Run All reaches Step 4).
             # Re-check filters in worker thread so Step4 can validate like/tag once
             # without blocking the GUI thread during object construction.
             self._emit_phase("步驟 4：過濾任務清單中...")
