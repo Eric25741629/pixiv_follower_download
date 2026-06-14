@@ -73,6 +73,7 @@ The canonical code lives under `app/` in three layers:
   - `pixiv_api.py` → `pixiv_selenium_login.py` (selenium login surface), `pixiv_legacy_utils.py` (shadowed legacy free-funcs); both star-re-exported back so `from pixiv_api import *` stays byte-identical.
   - `pixiv_thread_utils.py` → `folder_scan.py`, `json_recovery.py` (re-exported facade).
   - `event_log.py` → `event_log_io.py` (pure reverse/forward file iteration, re-exported).
+  - `thread_combined.py` → `combined_progress_queues.py` (the two `_Combined*`/`_Drop*` event-queue adapters, re-exported), `combined_work_lists.py` (`_CombinedWorkListsMixin`: `_build_work_lists` / `_resolve_combined_order` / `_download_only_urls`). `_process_one_pid` / `run` stay in `thread_combined.py`.
   - GUI: `views/main_view.py` → `views/main_progress.py` (`_MainProgressMixin`), `views/main_mode_row.py` (`_MainModeRowMixin`); `run_actions.py` → `cookie_validation.py` (`_CookieValidationMixin`); `views/settings_view.py` → `views/settings_handlers.py` (`_SettingsHandlersMixin`); `flet_app.py` → `bootstrap_helpers.py` (stateless module-level helpers only — the global-mutating `main(page)` closures stay put).
 
 ### Top-level shim files

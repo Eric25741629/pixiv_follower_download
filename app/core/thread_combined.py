@@ -5,79 +5,15 @@ from app.core.worker_event import WorkerEvent
 from app.core.pixiv_thread_base import PauseableThread
 from app.core.pixiv_thread_utils import normalize_pid
 from app.core import thread_url_fetch, thread_download, diag_log
+from app.core.combined_progress_queues import (
+    _CombinedPageProgressQueue,
+    _DropOverallProgressQueue,
+)
+from app.core.combined_work_lists import _CombinedWorkListsMixin
 import pixiv_api
 
 
-class _CombinedPageProgressQueue:
-    """Translate Step 4 page progress while combined mode owns PID progress."""
-
-    def __init__(self, target_q, pid, total):
-        self._target_q = target_q
-        self._pid = str(normalize_pid(pid) or pid)
-        self._total = int(total)
-
-    def put(self, event, *args, **kwargs):
-        if isinstance(event, WorkerEvent) and event.type == "progress":
-            self._target_q.put(
-                WorkerEvent(
-                    "page_progress",
-                    {
-                        "delta": self._coerce_delta(event.data),
-                        "total": self._total,
-                        "pid": self._pid,
-                    },
-                ),
-                *args,
-                **kwargs,
-            )
-            return
-        self._target_q.put(event, *args, **kwargs)
-
-    def reset(self):
-        self._target_q.put(
-            WorkerEvent(
-                "page_progress",
-                {"delta": 0, "total": self._total, "pid": self._pid},
-            )
-        )
-
-    @staticmethod
-    def _coerce_delta(data):
-        try:
-            if isinstance(data, (tuple, list)) and data:
-                return int(data[0])
-            return int(data)
-        except Exception:
-            return 1
-
-
-class _DropOverallProgressQueue:
-    """Forward everything to the real queue EXCEPT overall ``"progress"`` events.
-
-    In combined mode the fetcher's :meth:`get_download_url` calls
-    ``_step3_advance_progress`` once per PID, which emits
-    ``WorkerEvent("progress", (1, fetcher.pid_max))``. The fetcher's ``pid_max``
-    is **0** here — its ``run()`` / ``_load_and_filter_pid_list`` (the only place
-    that sets it) never runs in combined mode — so that event reaches
-    ``MainView.update_progress`` as ``(1, 0)`` and, because ``total <= 0``, blanks
-    (or, after the visible-gating fix, hides) the 整體進度 bar **every time a PID
-    is queried**. That is the "整體進度 shows when a PID finishes but disappears
-    the moment the next PID starts" bug. combined owns overall progress (exactly
-    one tick per PID, emitted from :meth:`combined_thread.run`), so the fetcher's
-    per-PID ``progress`` events are dropped while querying. All other event kinds
-    (output / countdown / page_progress / next / ...) pass straight through.
-    """
-
-    def __init__(self, target_q):
-        self._target_q = target_q
-
-    def put(self, event, *args, **kwargs):
-        if isinstance(event, WorkerEvent) and getattr(event, "type", None) == "progress":
-            return
-        self._target_q.put(event, *args, **kwargs)
-
-
-class combined_thread(PauseableThread):
+class combined_thread(PauseableThread, _CombinedWorkListsMixin):
     """邊查邊下: per PID, query meta (Step 3) then immediately download
     its pages (Step 4) inside one account cooldown window.
 
@@ -194,98 +130,6 @@ class combined_thread(PauseableThread):
         """Propagate the scheduler set by run_actions after construction."""
         self.fetcher._scheduler = self._scheduler
         self.downloader._scheduler = self._scheduler
-
-    def _build_work_lists(self):
-        """Return ``(query_pids, download_only_pids)``.
-
-        query_pids: from pictures_id.txt, minus exist/revoked/dupes — need
-            query then download. (Reuses the fetcher's pure filter helpers,
-            NOT _load_and_filter_pid_list, to avoid its next/progress emits.)
-        download_only_pids: PIDs with pending pages in the DB that are not in
-            query_pids — a partial Step 3 already resolved their meta but never
-            downloaded them. Download-only, no re-query.
-        """
-        raw = self.fetcher.check_exist()
-        if not isinstance(raw, list):
-            raw = []
-        query_pids, *_ = self.fetcher._prepare_pending_pid_tasks(raw)
-        query_set = set(query_pids)
-        # Seed the in-memory pending-PID tracker from query_pids so finalize's
-        # _persist_pending_pid_file does not overwrite pictures_id.txt empty.
-        with contextlib.suppress(Exception):
-            self.fetcher._init_pending_pid_tracker(
-                query_pids, reset_with_fallback=True
-            )
-        # One full scan of v_pending_pages, grouped per PID, reused below
-        # (avoids the previous O(D x P) re-scan per download-only PID).
-        db = self.fetcher._metadata_db
-        self._pending_urls_by_pid = {}
-        try:
-            rows = db.get_pending_pages() if db is not None else []
-        except Exception:
-            rows = []
-        for (p, _idx, u) in rows:
-            if not u:
-                continue
-            key = normalize_pid(p) or str(p)
-            self._pending_urls_by_pid.setdefault(key, []).append(str(u))
-        download_only = [
-            key
-            for key in self._pending_urls_by_pid
-            if key not in query_set
-        ]
-        return query_pids, download_only
-
-    def _resolve_combined_order(self, query_pids, download_only):
-        """Return ``[(pid, needs_query), ...]`` for :meth:`run` to iterate.
-
-        author_order off -> query batch then download-only batch (unchanged,
-            zero regression).
-        author_order on  -> both batches merged, deduped by normalized pid
-            (the query batch is prepended so a query pid wins over a
-            download-only dup), then grouped so each author's works are
-            contiguous via :func:`thread_download.compute_author_order`;
-            author-unknown pids bucket last (mirrors Step 4). combined mode is
-            inherently per-PID sequential (one account per PID), so reordering
-            the flat list is enough — no per-author barrier needed.
-
-        Falls back to the unchanged order when no metadata DB is available or
-        the user_id lookup fails.
-        """
-        pairs = [(p, True) for p in query_pids] + [(p, False) for p in download_only]
-        if not getattr(self, "author_order", False):
-            return pairs
-        db = getattr(getattr(self, "fetcher", None), "_metadata_db", None)
-        if db is None:
-            return pairs
-        needs_by_pid = {}
-        ordered_pids = []
-        seen = set()
-        for pid, needs in pairs:
-            key = normalize_pid(pid) or str(pid)
-            if key in seen:
-                continue
-            seen.add(key)
-            ordered_pids.append(pid)
-            needs_by_pid[pid] = needs
-        try:
-            uid_map = db.user_id_map_for_pids(ordered_pids)
-        except Exception:
-            return pairs
-        flat, _ = thread_download.compute_author_order(ordered_pids, uid_map)
-        unknown = sum(1 for p in ordered_pids if not str(uid_map.get(p) or "").strip())
-        if unknown:
-            self._emit(
-                f"<p><font color='orange'>[作者排序] {unknown} 筆作品作者不明，"
-                f"已排到最後；重跑步驟 2/3 可補作者資料</font></p>"
-            )
-        return [(p, needs_by_pid[p]) for p in flat]
-
-    def _download_only_urls(self, pid):
-        """Per-page pending URLs for a download-only PID (from the cached
-        per-PID grouping built once in :meth:`_build_work_lists`)."""
-        pid_key = normalize_pid(pid) or str(pid)
-        return list(getattr(self, "_pending_urls_by_pid", {}).get(pid_key, []))
 
     def _process_one_pid(self, pid, needs_query):
         """Acquire one account; query (if needed) + download this PID's pages;
