@@ -128,6 +128,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             overrides.get("filename_template", ""),
             tag_strip_brackets=bool(overrides.get("tag_strip_brackets", False)),
             tag_strip_special_chars=bool(overrides.get("tag_strip_special_chars", False)),
+            r18_like_num=overrides.get("r18_like_num", 0),
         )
         self._init_step4_paths_and_state()
 
@@ -230,9 +231,11 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
     def _init_filter_state(self, like_num, ban_tag, must_tag, special_like_rules,
                            filename_template="", *,
                            tag_strip_brackets=False,
-                           tag_strip_special_chars=False):
+                           tag_strip_special_chars=False,
+                           r18_like_num=0):
         """Normalize tag/like filters and seed the per-PID decision cache."""
         self.like_num = like_num if like_num > 0 else 0
+        self.r18_like_num = r18_like_num if r18_like_num > 0 else 0
         self.ban_tag = ban_tag
         self.must_tag = must_tag
         self.special_like_rules = special_like_rules
@@ -732,6 +735,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         ("jxl_delete_original", bool),
         ("jxl_effort", int),
         ("like_num", lambda v: int(v or 0)),
+        ("r18_like_num", lambda v: int(v or 0)),
         ("ai_gen_dir", bool),
         ("filename_template", lambda v: str(v or "").strip() or None),
         ("tag_strip_brackets", bool),

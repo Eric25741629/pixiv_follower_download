@@ -211,7 +211,7 @@ class _Step3FiltersMixin:
 
     def _step3_below_like_threshold(self, artwork_tags, like):
         like_limit, _ = _resolve_like_threshold(
-            self.like_num, artwork_tags, self.special_like_rules,
+            self._r18_aware_like_base(artwork_tags), artwork_tags, self.special_like_rules,
             self._tag_hit, self._to_int,
         )
         like_value = self._to_int(like, None)

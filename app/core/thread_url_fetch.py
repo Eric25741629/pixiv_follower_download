@@ -63,6 +63,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         event_log=None,
         rescrape_within_days=0,
         live=None,
+        r18_like_num=0,
     ):
         super().__init__(q, scheduler=scheduler)
         self._stats_collector = stats_collector
@@ -75,6 +76,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         self._init_basic_options(
             Author_list, Agent, cookies, exist_pid, ban_tag, must_tag,
             like_num, no_to_check, base_path, single_thread_mode, special_like_rules,
+            r18_like_num=r18_like_num,
         )
         self.pid_wait_nocookie_min, self.pid_wait_nocookie_max = (
             self._resolve_nocookie_wait_range(pid_wait_nocookie_min, pid_wait_nocookie_max)
@@ -112,6 +114,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
     def _init_basic_options(
         self, Author_list, Agent, cookies, exist_pid, ban_tag, must_tag,
         like_num, no_to_check, base_path, single_thread_mode, special_like_rules,
+        r18_like_num=0,
     ):
         """Plain attribute assignments + cookie unpacking."""
         self.Author_list = Author_list
@@ -124,6 +127,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         self.ban_tag = ban_tag
         self.must_tag = must_tag
         self.like_num = like_num
+        self.r18_like_num = r18_like_num if r18_like_num and r18_like_num > 0 else 0
         self.special_like_rules = _normalize_special_like_rules(special_like_rules)
         self.no_to_check = no_to_check
         self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)

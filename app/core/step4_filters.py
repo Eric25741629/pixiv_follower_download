@@ -260,7 +260,7 @@ class _Step4FiltersMixin:
     def _filter_below_like_threshold(self, artwork_tags, like_value):
         """True iff a like threshold is configured AND the artwork's like count is below it."""
         like_limit, _matched_rules = _resolve_like_threshold(
-            self.like_num,
+            self._r18_aware_like_base(artwork_tags),
             artwork_tags,
             self.special_like_rules,
             self._tag_hit,

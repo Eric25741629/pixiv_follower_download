@@ -130,6 +130,7 @@ class combined_thread(PauseableThread):
         stats_collector=None,
         event_log=None,
         live=None,
+        r18_like_num=0,
     ):
         super().__init__(q, scheduler=scheduler)
         if isinstance(base_path, str) and base_path.strip():
@@ -151,6 +152,7 @@ class combined_thread(PauseableThread):
             stats_collector=stats_collector, event_log=event_log,
             rescrape_within_days=rescrape_within_days,
             live=live,
+            r18_like_num=r18_like_num,
         )
         self.downloader = thread_download.download_thread(
             q=q, nogif=nogif, notag=notag, notime=notime, create_dir=create_dir,
@@ -160,7 +162,7 @@ class combined_thread(PauseableThread):
             intra_pid_wait_min=intra_pid_wait_min, intra_pid_wait_max=intra_pid_wait_max,
             jxl_enable=jxl_enable, jxl_cjxl_path=jxl_cjxl_path,
             jxl_delete_original=jxl_delete_original, jxl_effort=jxl_effort,
-            like_num=like_num, ban_tag=ban_tag, must_tag=must_tag,
+            like_num=like_num, r18_like_num=r18_like_num, ban_tag=ban_tag, must_tag=must_tag,
             special_like_rules=special_like_rules or [], ai_gen_dir=ai_gen_dir,
             filename_template=filename_template,
             tag_strip_brackets=tag_strip_brackets,

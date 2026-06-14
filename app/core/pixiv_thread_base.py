@@ -334,6 +334,19 @@ class PauseableThread(threading.Thread):
             # this keeps the single release seam that Steps 2/3/4 stub in tests.
             self._release_account(account, ok=ok)
 
+    def _r18_aware_like_base(self, artwork_tags):
+        """Effective minimum-like base: raised to r18_like_num for R-18 works
+        when stricter. artwork_tags are already normalized (lowercased). Default
+        r18_like_num=0 -> always returns like_num (zero behavior change)."""
+        base = int(getattr(self, "like_num", 0) or 0)
+        r18 = int(getattr(self, "r18_like_num", 0) or 0)
+        if r18 <= base:
+            return base
+        tags = artwork_tags or []
+        is_r18g = any("r-18g" in str(t) for t in tags)
+        is_r18 = (not is_r18g) and any(str(t) == "r-18" for t in tags)
+        return r18 if is_r18 else base
+
     def _emit_output(self, html: str) -> None:
         try:
             self._q.put(WorkerEvent("output", html))
