@@ -378,8 +378,11 @@ def main(page: ft.Page) -> None:
     # leaves us with a handle to pause/stop it after the new main()
     # reattaches.
     _orig_start_step = run_controller._start_step
-    def _start_step_with_tracking(n: int) -> None:
-        _orig_start_step(n)
+    def _start_step_with_tracking(n: int, *args, **kwargs) -> None:
+        # Forward *args/**kwargs (e.g. require_idle=) so this wrapper stays
+        # signature-compatible with RunController._start_step — run_step/run_all
+        # call it with require_idle=True.
+        _orig_start_step(n, *args, **kwargs)
         global _PERSISTENT_ACTIVE_THREAD
         _PERSISTENT_ACTIVE_THREAD = main_view._active_thread
         # Snapshot the step-state list right after the new step's "running"

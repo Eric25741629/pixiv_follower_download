@@ -267,3 +267,44 @@ def test_attach_aliases_flow_into_thread_alias_map():
     assert alias_map == {"c1": "Main", "c2": "Backup"}
     assert cookie_usage_label("c1", pool, alias_map) == "Main"
     assert cookie_usage_label("c2", pool, alias_map) == "Backup"
+
+
+class _StubView:
+    def __init__(self):
+        self._active_thread = None
+        self._step_states = ["idle"] * 4
+
+    def set_running(self, _b):
+        pass
+
+    def set_step_state(self, _i, _s):
+        pass
+
+
+def test_run_step_and_run_all_forward_require_idle_through_tracking_wrapper():
+    """flet_app.main wraps run_controller._start_step to capture the active
+    worker into a module global; that wrapper MUST forward kwargs. run_step /
+    run_all call _start_step(n, require_idle=True), so a wrapper that only
+    accepts (n) raises 'TypeError: ... unexpected keyword argument require_idle'
+    on the real GUI thread (unit tests bypass the wrapper, so this was missed).
+    Reproduce the flet_app wrapping and assert require_idle is forwarded."""
+    rc = RunController(_StubView(), Queue())
+    seen = []
+    orig = rc._start_step
+
+    # Mirrors flet_app.main's _start_step_with_tracking signature exactly.
+    def _wrap(n, *args, **kwargs):
+        seen.append((n, kwargs.get("require_idle")))
+        orig(n, *args, **kwargs)
+
+    rc._start_step = _wrap
+    rc._build_thread = lambda _n: None  # no real worker thread
+
+    rc.run_step(3)
+    rc.run_all()
+
+    assert seen, "run_step/run_all must invoke the wrapped _start_step"
+    assert all(ri is True for (_n, ri) in seen), (
+        "run_step/run_all must pass require_idle=True so the tracking wrapper "
+        "(and the TOCTOU idle-guard) receive it"
+    )
