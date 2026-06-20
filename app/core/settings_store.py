@@ -131,6 +131,13 @@ DEFAULTS = {
     "ui": {
         "theme_mode": "SYSTEM",  # "LIGHT" | "DARK" | "SYSTEM"
     },
+    "diagnostics": {
+        # When true, the dispatcher writes the high-frequency per-event UI trace
+        # (ui_events.log). Off by default — it fires once per WorkerEvent (with an
+        # HTML-strip regex on output events) on the UI event-loop thread and only
+        # mirrors events visible elsewhere. worker.log / download.log are always on.
+        "verbose_logs": False,
+    },
     "event_log": {
         "enabled": True,
         "retention_days": 60,

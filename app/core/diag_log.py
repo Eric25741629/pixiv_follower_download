@@ -36,12 +36,33 @@ _LOG_SUBDIR = "logs"
 _loggers: dict[str, logging.Logger] = {}
 _loggers_lock = threading.Lock()
 _enabled = True
+# The UI per-event trace (ui_events.log) fires once per WorkerEvent — the
+# hottest path in the app (every progress/output/countdown tick, with an HTML-
+# strip regex per output) — and only mirrors events already visible elsewhere.
+# It is therefore OPT-IN (default off): without it the dispatcher skips the
+# per-event f-string + summary() + synchronous file write entirely. The
+# worker/download channels stay on by default (per-PID/page, low rate, the
+# debug-critical traces used for the download-hang investigation).
+_ui_trace_enabled = False
 
 
 def configure(enabled: bool) -> None:
     """Globally enable/disable diagnostic logging (call once at startup)."""
     global _enabled
     _enabled = bool(enabled)
+
+
+def configure_ui_trace(enabled: bool) -> None:
+    """Enable the high-frequency per-event UI trace (ui_events.log); off by
+    default. Wire to diagnostics.verbose_logs at startup."""
+    global _ui_trace_enabled
+    _ui_trace_enabled = bool(enabled)
+
+
+def ui_trace_enabled() -> bool:
+    """Cheap guard for the dispatcher hot path: skip building the per-event
+    f-string + summary() unless the UI trace is on."""
+    return _enabled and _ui_trace_enabled
 
 
 def _logs_dir() -> str:
@@ -84,6 +105,8 @@ def _get(channel: str) -> logging.Logger | None:
 
 def log(channel: str, message: str) -> None:
     """Write one line to a diagnostic channel (best-effort, never raises)."""
+    if channel == UI and not _ui_trace_enabled:
+        return  # per-event UI trace is opt-in (see configure_ui_trace)
     lg = _get(channel)
     if lg is None:
         return
