@@ -5,6 +5,48 @@ status: in_progress
 spec: docs/superpowers/specs/2026-06-07-combined-author-order-design.md
 ---
 
+## [2026-06-21] 下載卡死 → 後端凍結 → 關不掉的孤兒行程(進行中)
+
+**根因(日誌+原始碼驗證)**:combined/Step4 圖片 body 串流沒有「總時間上限」也不檢查 stop。
+`requests.get(..., stream=True, timeout=5)` 只是每次 recv 逾時(urllib3 從不設 Timeout.total),
+涓流連線可無限拖、不丟例外 → 既有「丟例外才重試」永不觸發 → 單執行緒 combined 整條凍住 →
+視窗失焦數分鐘後 Flet 0.84 GC session → 前端退回「Working...」死殼 → X 送不到後端 →
+孤兒行程關不掉。ugoira 路徑更糟:`http.get` 連 timeout 都沒有。20:43 凍結那次卡在
+PID 125754061(.jpg),worker.log/download.log 只有 START 無 END、app.log 無例外、無 python APPCRASH。
+
+**設計關鍵(四視角分析)**
+- deadline 中止必須在 jpg/gif_download **內部**收斂成既有 fail-list(不可往上拋,否則 combined
+  `_run_with_network_retry` 不攔 → 炸到 run() 發「邊查邊下失敗 + next -1」殺整個 run)。
+- 使用者停止 ≠ 失敗:沿用 pre-fetch stop sentinel(requeue+return 0 不記完成),PID 留 pending。
+- 部分檔:`.part` 暫存 + 成功才 os.replace;中止刪掉,最終檔名不留截斷檔。
+- 暫停時間不計入 deadline;read timeout 守靜默 socket,總 deadline 守涓流(兩層都要)。
+
+### Stage 1 核心修復(止血)
+- [x] pixiv_thread_base:常數 + `DownloadStopped`/`DownloadDeadlineExceeded` + `_stream_to_sink`
+- [x] step4_media:`_jpg_stream_to_disk`(.part)、`_jpg_attempt`(timeout 元組)、`jpg_download`
+      (deadline→fail-list、stop→raise、sleep 改 `_wait_interruptible`)、`_stream_ugoira_zip_bytes`
+      (補 timeout + `_stream_to_sink`)、`gif_download`(except DownloadStopped: raise)
+- [x] thread_download:`gif_or_jpg` 接 DownloadStopped、`__init__` 設 `_download_deadline_sec`
+### Stage 2 可關閉性加固
+- [x] flet_app:`_arm_shutdown_watchdog` + `_shutdown_and_destroy` 首行 arm + SIGINT/SIGBREAK
+### Stage 3 設定可調
+- [x] DEFAULTS performance `download_deadline_sec:120` + scalar-kw + combined 轉發 + run_actions
+### 複查補洞(對抗式 workflow 確認 3 真缺陷)
+- [x] #1 HIGH:`fetch_with_cookie_retry`(ugoira_meta)無 timeout → 加 timeout 參數 + 呼叫端傳入
+- [x] #3 LOW:信號安裝拆出 `_install_signal_handlers`(測試不再洩漏 SIGINT handler)
+- [x] low:jpg_download 退避期間按停止 → raise DownloadStopped(留 pending)
+- 記錄殘留(不改):`Pixiv_info`/Step1-2 meta GET 仍 per-recv timeout 無總時限(小 JSON,低風險)
+### 測試 / 驗證
+- [x] 17 新測試(deadline/stop/.part/combined 整合/watchdog/signal/fetch timeout)先紅後綠
+- [x] pytest 全套件 954 passed;改動檔 ruff 零新增違規
+- [ ] **交付使用者實機重啟 app + 跑 combined 驗證**(記憶:GUI/threading 綠測不算驗收)
+
+## Review(2026-06-21)
+**根因**:`requests` 的 `timeout` 配 `stream=True` 只是 per-recv,urllib3 從不設 `Timeout.total`,涓流連線可無限拖且不丟例外 → 單執行緒 combined 凍住 → Flet GC session → 「Working...」死殼 → 關不掉的孤兒。20:43 凍結卡在 PID 125754061(.jpg),worker/download.log 只有 START 無 END、app.log 無例外、event log 無 python APPCRASH(只有無關的 Explorer 當掉),且我抓到行程仍活著 Responding=True → 確認是 wedge 非 crash。
+**修法**:總時間上限 + 每塊 stop 檢查(`_stream_to_sink`)、`.part` 原子寫入、read timeout 元組(含複查抓到的 ugoira_meta 無 timeout 漏洞)、deadline→fail-list 收斂在 jpg/gif_download 內(不炸 run)、stop→pending、watchdog + SIGINT/SIGBREAK 保證可關閉。
+**驗證**:四視角分析 workflow → TDD 實作 → 三視角對抗式複查 workflow(7 agents,確認 3 缺陷全修)→ 954 passed、ruff 改動檔零新增違規。
+**待使用者**:重啟 app(Flet 不熱載入)跑 combined 一輪確認不再凍結;真實涓流不易重現,主要靠 deadline 逾時自動跳過 + 必要時 Ctrl+C/Ctrl+Break 或關窗一定關得掉。
+
 ## [2026-06-14] cookie「檢查：時間」整輪凍結 — 真根因是「每輪只刷一次」(承上題)
 
 **使用者再回報**:cookies 頁時間還是停在 21:13~21:51,整輪不動(「沒變化/還是沒有刷新」)。**用實機資料證偽了我前一個假設**:現在 00:21,`settings.json` mtime 00:20(這輪一直在寫 `download_time`),但 10 個 cookie 的 `last_tested_at` 全凍在 21:xx(各自「首次使用時間」)。所以不是 settings 競態被吃掉,是 worker 根本沒再刷。

@@ -1,8 +1,10 @@
 from __future__ import annotations
 import asyncio
 import atexit
+import contextlib
 import os
 import queue
+import signal
 import sqlite3
 import sys
 import threading
@@ -100,6 +102,41 @@ _HOOKS_INSTALLED = False
 _EMERGENCY_FLUSH_LOCK = threading.Lock()
 _EMERGENCY_FLUSH_DONE = False
 
+# ── shutdown watchdog ───────────────────────────────────────────────────────
+# Guaranteed floor for "the app must always be closeable". A worker wedged in a
+# non-interruptible syscall (stalled F: write / recv with no socket timeout) or
+# a flush that hangs can keep the process alive after the user asks to close;
+# and after a Flet 0.84 session GC the window X never re-enters Python (it hits
+# the dead "Working..." shell). This watchdog, armed at the first sign of a
+# close request, os._exit(0)s after a hard deadline regardless of session /
+# event-loop / worker state. It imports nothing from flet and joins nothing, so
+# it cannot itself wedge; workers are daemon=True so os._exit needs no join.
+_SHUTDOWN_WATCHDOG_LOCK = threading.Lock()
+_SHUTDOWN_WATCHDOG_ARMED = False
+
+
+def _arm_shutdown_watchdog(timeout: float = 8.0, reason: str = "window_close") -> None:
+    """Start (at most once) a daemon thread that force-exits after ``timeout`` s.
+
+    The graceful shutdown path arms this first, then runs flush/checkpoint/
+    destroy and reaches its own ``os._exit(0)``; on a healthy disk that wins the
+    race in well under a second and the watchdog never reaches its deadline. The
+    watchdog only matters when a graceful step wedges.
+    """
+    global _SHUTDOWN_WATCHDOG_ARMED
+    with _SHUTDOWN_WATCHDOG_LOCK:
+        if _SHUTDOWN_WATCHDOG_ARMED:
+            return
+        _SHUTDOWN_WATCHDOG_ARMED = True
+
+    def _kill() -> None:
+        time.sleep(max(0.0, float(timeout)))
+        with contextlib.suppress(Exception):
+            _log.warning("shutdown watchdog firing after %ss: %s", timeout, reason)
+        os._exit(0)
+
+    threading.Thread(target=_kill, name="shutdown-watchdog", daemon=True).start()
+
 
 def _emergency_flush(reason: str = "unknown") -> None:
     """Idempotent best-effort flush. Safe to call from any path/thread.
@@ -191,9 +228,41 @@ def _install_crash_hooks() -> None:
     atexit.register(_emergency_flush, "atexit")
 
 
+_SIGNALS_INSTALLED = False
+
+
+def _install_signal_handlers() -> None:
+    """Install console SIGINT/SIGBREAK -> flush + watchdog + os._exit(0).
+
+    Kept SEPARATE from _install_crash_hooks (which several unit tests call
+    directly) so the tests never leak a process-global signal handler that
+    would turn a later interactive Ctrl+C into an abrupt os._exit. Called once
+    from main(). This is the out-of-band kill channel for a dead post-GC
+    "Working..." window whose X no longer reaches Python. Guarded because
+    signal.signal only works on the main thread (main(page) runs there under
+    ft.app, but stay defensive).
+    """
+    global _SIGNALS_INSTALLED
+    if _SIGNALS_INSTALLED:
+        return
+    _SIGNALS_INSTALLED = True
+
+    def _signal_shutdown(signum, _frame):  # pragma: no cover - needs a real signal
+        _emergency_flush(reason=f"signal:{signum}")
+        _arm_shutdown_watchdog(reason=f"signal:{signum}")
+        os._exit(0)
+
+    for _signame in ("SIGINT", "SIGBREAK"):
+        _sig = getattr(signal, _signame, None)
+        if _sig is not None:
+            with contextlib.suppress(Exception):
+                signal.signal(_sig, _signal_shutdown)
+
+
 def main(page: ft.Page) -> None:
     init_logging()
     _install_crash_hooks()
+    _install_signal_handlers()
     _log.info(
         "main(page) session start: web=%s platform=%s",
         getattr(page, "web", "?"),
@@ -742,6 +811,10 @@ def main(page: ft.Page) -> None:
     # request timeouts) blocking interpreter exit via atexit hooks.
     async def _shutdown_and_destroy(reason: str) -> None:
         _log.warning("_shutdown_and_destroy entered: reason=%s", reason)
+        # Arm the guaranteed-exit floor BEFORE any flush/destroy that could
+        # wedge. The graceful os._exit(0) below wins the race on a healthy disk;
+        # the watchdog only fires if a step hangs.
+        _arm_shutdown_watchdog(reason=reason)
         try:
             t = getattr(main_view, "_active_thread", None)
             if t is not None:

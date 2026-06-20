@@ -19,13 +19,18 @@ import io
 import json
 import os
 import random as pyrandom
-import time
 import zipfile
 
 import requests
 from PIL import Image
 
-from app.core.pixiv_thread_base import _cookie_usage_label
+from app.core.pixiv_thread_base import (
+    DOWNLOAD_CONNECT_TIMEOUT,
+    DOWNLOAD_READ_TIMEOUT,
+    DownloadDeadlineExceeded,
+    DownloadStopped,
+    _cookie_usage_label,
+)
 from app.core.pixiv_thread_utils import (
     atomic_write_json,
     fetch_with_cookie_retry,
@@ -155,7 +160,10 @@ class _Step4MediaMixin:
         when streaming succeeds, matching the original inline behavior.
         """
         try:
-            resp = http.get(url, headers=headers, stream=True)
+            resp = http.get(
+                url, headers=headers, stream=True,
+                timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
+            )
         except (requests.exceptions.ProxyError,
                 requests.exceptions.ConnectTimeout,
                 requests.exceptions.ConnectionError):
@@ -163,9 +171,18 @@ class _Step4MediaMixin:
         except Exception:
             return None
         if resp.status_code != 200:
+            with contextlib.suppress(Exception):
+                resp.close()
             return None
-        chunks = [data for data in resp.iter_content(chunk_size=65536) if data]
-        zip_bytes = b"".join(chunks)
+        # Drain via the shared deadline/stop-aware streamer (an explicit sink,
+        # NOT a list-comprehension) so a trickling ugoira zip can be aborted
+        # mid-stream — the old `[data for data in resp.iter_content(...)]` could
+        # never be broken from outside. DownloadStopped / DownloadDeadlineExceeded
+        # propagate to gif_download, which settles the page (stop -> pending,
+        # deadline -> fail-list). _stream_to_sink closes the response.
+        buf = bytearray()
+        self._stream_to_sink(resp, buf.extend, chunk_size=65536)
+        zip_bytes = bytes(buf)
         if self._stats_collector is not None and zip_bytes:
             self._stats_collector.report_bytes(len(zip_bytes))
             label = _cookie_usage_label(pid_cookie, self.cookie_pool, self._cookie_alias_map)
@@ -255,6 +272,7 @@ class _Step4MediaMixin:
             headers=headers,
             cookies=pid_cookie,
             retry_statuses=(403, 404),
+            timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
         )
         if self._maybe_mark_meta_retry_cookie(pid, meta_trace):
             need_cookie = True
@@ -314,8 +332,15 @@ class _Step4MediaMixin:
             # Network/proxy failures must propagate so the scheduler-aware caller
             # can disable the cookie/proxy for this run.
             raise
+        except DownloadStopped:
+            # User Stop mid-stream: propagate so gif_or_jpg leaves the page
+            # pending. Must NOT be swallowed by the broad handler below (which
+            # would mis-record it as a content failure).
+            raise
         except Exception as err:
             # Never print self.cookies — it is a live Pixiv session credential.
+            # (A DownloadDeadlineExceeded lands here too: print + fail-list is
+            # exactly the desired "deadline = page failure, PID stays pending".)
             print(err)
         return [url, my_time.strftime('%Y%m%d_%H%M%S')]
 
@@ -380,14 +405,30 @@ class _Step4MediaMixin:
             pass
 
     def _jpg_stream_to_disk(self, htmlfile, filepath):
-        """Stream the HTTP body to disk in 1 KiB chunks; returns total bytes written."""
-        size = 0
-        chunk_size = 1024
-        with open(filepath, 'wb') as file:
-            for data in htmlfile.iter_content(chunk_size=chunk_size):
-                file.write(data)
-                size += len(data)
-        return size
+        """Stream the HTTP body to a ``.part`` temp then atomically rename.
+
+        Bounded by a total wall-clock deadline + stop check via
+        ``self._stream_to_sink`` (the per-recv read timeout on the request only
+        bounds a fully silent socket; this bounds a trickle). On ANY abort
+        (deadline/stop/error) the partial ``.part`` is removed so no truncated
+        file is ever left under the final name — a truncated file would make the
+        download-folder scan treat the PID as already-downloaded and suppress
+        the retry. Returns total bytes written.
+        """
+        part_path = filepath + '.part'
+        size_box = [0]
+        try:
+            with open(part_path, 'wb') as file:
+                def _write(data):
+                    file.write(data)
+                    size_box[0] += len(data)
+                self._stream_to_sink(htmlfile, _write, chunk_size=65536)
+            os.replace(part_path, filepath)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                os.remove(part_path)
+            raise
+        return size_box[0]
 
     def _jpg_attempt(self, url, session, timetag):
         """One download attempt. Returns 0 on success, None on a recoverable error."""
@@ -407,7 +448,10 @@ class _Step4MediaMixin:
         with contextlib.suppress(Exception):
             self._pid_cookie_used[str(pid)] = bool(need_cookie is True and pid_cookie)
         http = session if session is not None else requests
-        htmlfile = http.get(url, headers=headers, stream=True, timeout=5)
+        htmlfile = http.get(
+            url, headers=headers, stream=True,
+            timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
+        )
         htmlfile.raise_for_status()
         if self._stats_collector is not None:
             label = _cookie_usage_label(pid_cookie, self.cookie_pool, self._cookie_alias_map)
@@ -438,10 +482,27 @@ class _Step4MediaMixin:
                 # against the same proxy will not help. Let the scheduler disable
                 # this cookie via release(ok=False).
                 raise
+            except DownloadStopped:
+                # User pressed Stop mid-stream. NOT a failure: propagate so
+                # gif_or_jpg leaves the page pending (the partial .part was
+                # already removed). Never retry, never report_file(False).
+                raise
+            except DownloadDeadlineExceeded as err:
+                # The connection wedged/trickled past the total deadline.
+                # Retrying the same dead connection won't help — settle as a
+                # page failure now (returns the fail-list below). The cookie is
+                # NOT disabled: a deadline is not the cookie's fault.
+                last_err = err
+                break
             except Exception as err:
                 last_err = err
                 if i < 4:
-                    time.sleep(min(30.0, (2 ** i) + pyrandom.random()))
+                    # Stop-aware backoff: returns False the moment Stop fires.
+                    # A Stop during backoff is NOT a page failure — raise so
+                    # gif_or_jpg leaves the page pending (mirrors mid-stream Stop)
+                    # rather than falling through to the fail-list below.
+                    if not self._wait_interruptible(min(30.0, (2 ** i) + pyrandom.random())):
+                        raise DownloadStopped() from None
                     continue
         print(last_err)
         if self._stats_collector is not None:

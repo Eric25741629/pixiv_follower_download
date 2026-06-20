@@ -1,5 +1,7 @@
+import contextlib
 import random as pyrandom
 import threading
+import time
 import queue as _queue
 
 import requests
@@ -27,6 +29,38 @@ _NETWORK_RETRY_EXCEPTIONS = (
     requests.exceptions.ConnectTimeout,
     requests.exceptions.ConnectionError,
 )
+
+# Per-page download bounds. The requests ``timeout`` tuple is a PER-RECV
+# socket deadline only — urllib3 never sets ``Timeout.total`` from requests,
+# so a trickling/half-open connection (a few bytes inside every read-timeout
+# window) keeps ``iter_content`` looping forever without raising. The CONNECT
+# and READ values below bound a fully-silent socket; the wall-clock
+# DOWNLOAD_DEADLINE_SEC (enforced in Python between chunks by
+# ``_stream_to_sink``) is what bounds the trickle and honours Stop. Both
+# layers are required. See the 2026-06-21 download-hang investigation.
+DOWNLOAD_CONNECT_TIMEOUT = 10
+DOWNLOAD_READ_TIMEOUT = 30
+DOWNLOAD_DEADLINE_SEC = 120.0
+
+
+class DownloadStopped(Exception):
+    """Raised by ``_stream_to_sink`` when stop_event fires mid-transfer.
+
+    A user Stop is NOT a failure: callers must leave the page pending
+    (no err_url, no attempt_count bump, no cookie disable) — mirror the
+    pre-fetch stop path in ``gif_or_jpg``.
+    """
+
+
+class DownloadDeadlineExceeded(Exception):
+    """Raised by ``_stream_to_sink`` when the total wall-clock budget is hit.
+
+    A deadline IS a page failure (the connection wedged/trickled). Callers
+    settle it as the normal fail-list ``[url, timetag]`` so the PID stays
+    pending and is retried next run — but the cookie is NOT disabled (a
+    deadline is not the cookie's fault), so this must never be raised across
+    a scheduler-aware boundary as a network exception.
+    """
 
 
 def _coerce_to_rule_iterable(raw_rules):
@@ -373,6 +407,52 @@ class PauseableThread(threading.Thread):
                 return False
             elapsed += slice_s
         return True
+
+    def _stream_to_sink(self, response, write, *, chunk_size=65536, deadline_sec=None):
+        """Drain a streamed ``requests`` Response into ``write(bytes)`` with a
+        TOTAL wall-clock deadline plus stop/pause awareness.
+
+        The per-recv read timeout on the originating request bounds a fully
+        silent socket; this loop bounds a *trickle* (the confirmed wedge mode)
+        and lets Stop interrupt an in-flight transfer. Paused time does not
+        count toward the deadline (mirrors ``_wait_interruptible``). The
+        response is ALWAYS closed (success, deadline, stop, error) so a
+        mid-stream abort never leaks the pooled socket.
+
+        Raises ``DownloadStopped`` on stop and ``DownloadDeadlineExceeded`` on
+        the wall-clock deadline; both propagate to the caller, which decides how
+        to settle the page (stop -> pending; deadline -> failed). ``write`` is a
+        sink callback, e.g. ``file.write`` or ``bytearray.extend``.
+        """
+        if deadline_sec is None:
+            deadline_sec = getattr(self, "_download_deadline_sec", DOWNLOAD_DEADLINE_SEC)
+        deadline = time.monotonic() + float(deadline_sec)
+        # Control events always exist on a real PauseableThread; tolerate their
+        # absence (e.g. a unit test instantiating via __new__) by degrading to a
+        # plain deadline-only stream.
+        pause_event = getattr(self, "_pause_event", None)
+        stop_event = getattr(self, "_stop_event", None)
+        try:
+            for data in response.iter_content(chunk_size=chunk_size):
+                # Refund paused time so a long human pause never trips the
+                # deadline. _pause_event is SET while running, CLEAR while paused.
+                while pause_event is not None and not pause_event.is_set():
+                    if stop_event is not None and stop_event.is_set():
+                        raise DownloadStopped()
+                    waited_from = time.monotonic()
+                    pause_event.wait(timeout=0.5)
+                    deadline += time.monotonic() - waited_from
+                if stop_event is not None and stop_event.is_set():
+                    raise DownloadStopped()
+                if time.monotonic() >= deadline:
+                    raise DownloadDeadlineExceeded(
+                        f"download exceeded {float(deadline_sec):.0f}s total deadline"
+                    )
+                if data:
+                    write(data)
+        finally:
+            with contextlib.suppress(Exception):
+                response.close()
 
     def _run_with_network_retry(self, work_label: str, fn):
         """Run ``fn()`` with up to NETWORK_RETRY_ATTEMPTS attempts on the

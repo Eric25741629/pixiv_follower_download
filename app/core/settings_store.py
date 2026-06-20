@@ -102,6 +102,12 @@ DEFAULTS = {
         "pid_wait_nocookie_max": 8,
         "intra_pid_wait_min": 5,
         "intra_pid_wait_max": 15,
+        # Total per-page download wall-clock budget (seconds). _stream_to_sink
+        # aborts a trickling/wedged transfer past this so a single stalled image
+        # can never freeze the whole pipeline (the 2026-06-21 hang). Generous by
+        # default so legitimately large/slow images are not aborted; the per-recv
+        # read timeout (30s) separately bounds a fully-silent socket.
+        "download_deadline_sec": 120,
     },
     "jxl": {
         "enable": False,

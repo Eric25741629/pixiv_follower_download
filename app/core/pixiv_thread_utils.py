@@ -442,14 +442,22 @@ from app.core.cookie_utils import (  # noqa: F401  (public re-export)
 )
 
 
-def fetch_with_cookie_retry(http_get, url, headers, cookies, retry_statuses=(403, 404)):
+def fetch_with_cookie_retry(http_get, url, headers, cookies, retry_statuses=(403, 404),
+                            timeout=(10, 30)):
     """
     Request once, then retry once with Cookie when status is in retry_statuses
     and the first request didn't include Cookie.
     Returns (final_response, trace_info, first_response_or_none).
+
+    ``timeout`` is a (connect, read) tuple passed to ``http_get``. It MUST be
+    set: this is the ugoira_meta fetch that precedes every ugoira download, and
+    an unbounded request here can hang the worker forever (the 2026-06-21 wedge,
+    same class as the image-body hang). The body is read non-streamed by the
+    caller (``json.loads(resp.content)``), so the read timeout bounds a silent
+    socket while the small JSON makes a trickle window negligible.
     """
     first_headers = dict(headers or {})
-    first_response = http_get(url, headers=first_headers, stream=True)
+    first_response = http_get(url, headers=first_headers, stream=True, timeout=timeout)
     first_status = getattr(first_response, "status_code", None)
     trace = {
         "first_try_status": first_status,
@@ -461,7 +469,7 @@ def fetch_with_cookie_retry(http_get, url, headers, cookies, retry_statuses=(403
     if first_status in set(retry_statuses or ()) and (not has_cookie_in_first) and str(cookies or "").strip():
         retry_headers = dict(first_headers)
         retry_headers["Cookie"] = str(cookies).strip()
-        retry_response = http_get(url, headers=retry_headers, stream=True)
+        retry_response = http_get(url, headers=retry_headers, stream=True, timeout=timeout)
         retry_status = getattr(retry_response, "status_code", None)
         trace["retry_used"] = True
         trace["retry_with_cookie_status"] = retry_status

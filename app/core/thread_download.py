@@ -24,6 +24,8 @@ from app.core.pixiv_thread_utils import (
 )
 from app.core.metadata_db import emit_db_stats, mirror_exist_pid_set, open_metadata_db
 from app.core.pixiv_thread_base import (
+    DOWNLOAD_DEADLINE_SEC,
+    DownloadStopped,
     PauseableThread,
     _normalize_special_like_rules,
 )
@@ -114,6 +116,13 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         self.ai_gen_dir = overrides.get("ai_gen_dir", self.ai_gen_dir)
         self.author_order = bool(overrides.get("author_order", False))
         self.set_file_mtime = bool(overrides.get("set_file_mtime", True))
+        # Total per-page wall-clock download budget (seconds). _stream_to_sink
+        # aborts a trickling/wedged transfer past this so the worker can never
+        # hang forever (the 2026-06-21 freeze). Set before the defer_step4_scan
+        # early-return so combined mode's downloader gets it too.
+        self._download_deadline_sec = float(
+            overrides.get("download_deadline_sec") or DOWNLOAD_DEADLINE_SEC
+        )
         self._init_jxl_config(
             overrides.get("jxl_enable", jxl_enable),
             overrides.get("jxl_cjxl_path", jxl_cjxl_path),
@@ -742,6 +751,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         ("tag_strip_special_chars", bool),
         ("author_order", bool),
         ("set_file_mtime", bool),
+        ("download_deadline_sec", lambda v: float(v) if v else None),
     ]
 
     @staticmethod
@@ -1922,7 +1932,16 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             self.q.put(original_url)
             return 0
         is_ugoira = 'ugoira' in resolved_url
-        ret = self._dispatch_download(original_url, resolved_url, session, is_ugoira)
+        try:
+            ret = self._dispatch_download(original_url, resolved_url, session, is_ugoira)
+        except DownloadStopped:
+            # Stop fired mid-stream (inside the body transfer). Settle it
+            # exactly like the pre-fetch stop above: requeue and return the 0
+            # sentinel WITHOUT _record_completed, so the page stays pending and
+            # is retried next run — never recorded done, never marked failed.
+            # (The partial .part was already removed by _jpg_stream_to_disk.)
+            self.q.put(original_url)
+            return 0
         # ret == 0  -> genuine download success; ret == -1 -> already on disk.
         # Both mean the page is present, so they (and only they) count as done.
         # ret is None / a fail list -> not recorded, stays pending for retry.
