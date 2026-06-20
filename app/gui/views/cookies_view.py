@@ -7,6 +7,7 @@ from app.core.app_logging import get_logger
 from app.core.settings_store import SettingsStore
 from app.core.pixiv_thread_utils import normalize_cookie_entries
 from app.core.worker_event import WorkerEvent
+from app.gui import components as c
 from app.gui.glass import current_theme, glass_dialog, glass_panel, glass_pill
 
 _log = get_logger("pixiv.cookies_view")
@@ -140,7 +141,7 @@ class CookiesView:
             width=180,
             text_size=11,
             content_padding=ft.Padding.symmetric(horizontal=8, vertical=4),
-            on_select=lambda e, c=cookie: self._on_proxy_change(c, e.control.value),
+            on_select=lambda e, ck=cookie: self._on_proxy_change(ck, e.control.value),
         )
 
     def _build_status_badge(self, status, status_color):
@@ -169,12 +170,13 @@ class CookiesView:
             controls=[
                 ft.Checkbox(
                     value=cookie in self._selected,
-                    on_change=lambda e, c=cookie: self._on_toggle_row(c, e.control.value),
+                    on_change=lambda e, ck=cookie: self._on_toggle_row(ck, e.control.value),
                 ),
-                ft.Switch(
+                c.switch(
+                    theme, label=None,
                     value=enabled,
                     tooltip="關閉後本次任務不使用此 Cookie",
-                    on_change=lambda e, c=cookie: self._on_toggle_enabled(c, e.control.value),
+                    on_change=lambda e, ck=cookie: self._on_toggle_enabled(ck, e.control.value),
                 ),
             ],
             spacing=0,
@@ -225,18 +227,19 @@ class CookiesView:
         )
 
         # Right cluster: proxy binding + edit/delete actions.
+        btn_delete = c.icon_action(
+            ft.Icons.DELETE, tooltip="刪除",
+            on_click=lambda e, i=idx: self._remove_entry(i),
+        )
+        btn_delete.icon_color = theme.error
         controls_right = ft.Row(
             controls=[
                 self._build_proxy_dropdown(cookie),
-                ft.IconButton(
-                    icon=ft.Icons.EDIT, tooltip="編輯",
+                c.icon_action(
+                    ft.Icons.EDIT, tooltip="編輯",
                     on_click=lambda e, i=idx: self._open_edit_dialog(i),
                 ),
-                ft.IconButton(
-                    icon=ft.Icons.DELETE, tooltip="刪除",
-                    icon_color=theme.error,
-                    on_click=lambda e, i=idx: self._remove_entry(i),
-                ),
+                btn_delete,
             ],
             spacing=2,
             tight=True,
@@ -357,12 +360,16 @@ class CookiesView:
             pass
 
     def _open_edit_dialog(self, idx: int | None) -> None:
+        theme = current_theme(self._page)
         entry = self._entries[idx] if idx is not None else {}
-        tf_alias = ft.TextField(label="別名（例：主帳號）", value=entry.get("alias", ""), width=300)
-        tf_cookie = ft.TextField(
-            label="Cookie 字串", value=entry.get("cookie", ""),
-            multiline=True, min_lines=3, max_lines=6, width=500,
+        tf_alias = c.text_field(
+            theme, label="別名（例：主帳號）", value=entry.get("alias", ""), width=300,
         )
+        tf_cookie = c.multiline_field(
+            theme, label="Cookie 字串", value=entry.get("cookie", ""),
+            min_lines=3, max_lines=6, expand=False,
+        )
+        tf_cookie.width = 500
 
         def save_dialog(e: ft.ControlEvent) -> None:
             new_cookie = tf_cookie.value.strip()
@@ -391,12 +398,12 @@ class CookiesView:
             self._page.pop_dialog()
 
         dialog = glass_dialog(
-            current_theme(self._page),
+            theme,
             "編輯 Cookie" if idx is not None else "新增 Cookie",
             ft.Column([tf_alias, tf_cookie], tight=True, spacing=12),
             actions=[
                 ft.TextButton("取消", on_click=cancel_dialog),
-                ft.FilledButton("儲存", on_click=save_dialog),
+                c.primary_button("儲存", on_click=save_dialog),
             ],
         )
         self._page.show_dialog(dialog)
@@ -525,7 +532,7 @@ class CookiesView:
 
     def build(self) -> ft.Column:
         header = ft.Row([
-            ft.Text("Cookies", size=20, weight=ft.FontWeight.BOLD),
+            c.page_title(current_theme(self._page), "Cookies"),
             self._count_text,
             glass_pill("+ 新增", current_theme(self._page), primary=True, width=120,
                        on_click=lambda e: self._open_edit_dialog(None)),
