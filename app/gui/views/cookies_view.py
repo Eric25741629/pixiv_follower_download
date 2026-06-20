@@ -132,13 +132,10 @@ class CookiesView:
     def _build_proxy_dropdown(self, cookie):
         """Build the per-row proxy dropdown control."""
         current_proxy = self._cookie_proxy_map.get(cookie) or ""
-        options = [ft.dropdown.Option(key="", text="（本機 IP）")] + [
-            ft.dropdown.Option(key=p, text=p[:40]) for p in self._proxy_pool
-        ]
-        return ft.Dropdown(
-            options=options,
-            value=current_proxy if (current_proxy == "" or current_proxy in self._proxy_pool) else "",
-            width=180,
+        opts = [("", "（本機 IP）")] + [(p, p[:40]) for p in self._proxy_pool]
+        value = current_proxy if (current_proxy == "" or current_proxy in self._proxy_pool) else ""
+        return c.dropdown(
+            current_theme(self._page), label=None, value=value, options=opts, width=180,
             text_size=11,
             content_padding=ft.Padding.symmetric(horizontal=8, vertical=4),
             on_select=lambda e, ck=cookie: self._on_proxy_change(ck, e.control.value),
