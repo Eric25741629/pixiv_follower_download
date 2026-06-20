@@ -139,6 +139,95 @@ def _cmd_following_export(args) -> int:
     return 0
 
 
+def _fmt_from_path_or_url(file_path, url) -> str:
+    """Pick an image format from the file path extension, falling back to the URL."""
+    for cand in (file_path, url):
+        if not cand:
+            continue
+        ext = os.path.splitext(str(cand))[1].lstrip(".").lower()
+        if ext:
+            return ext
+    return ""
+
+
+def _build_page_path_index(download_path):
+    """Walk ``download_path`` once, mapping ``(pid, page_index) -> abs path``.
+
+    Reuses the canonical filename parser so it understands every on-disk
+    naming form. Returns an empty dict when the folder is missing.
+    """
+    from app.core.pid_filesystem import extract_pid_pages
+    index: dict[tuple[str, int], str] = {}
+    if not download_path or not os.path.isdir(download_path):
+        return index
+    for dirpath, _dirs, files in os.walk(download_path):
+        for fn in files:
+            for pid, page in extract_pid_pages(fn):
+                index.setdefault((str(pid), int(page)), os.path.join(dirpath, fn))
+    return index
+
+
+def _resolve_page_file(pid, page_index, url, file_path, path_index):
+    """Resolve the on-disk path for a (pid, page): DB file_path first, else scan."""
+    if file_path and os.path.isfile(file_path):
+        return file_path
+    return path_index.get((str(pid), int(page_index)))
+
+
+def _cmd_verify_files(args) -> int:
+    from app.core.image_integrity import validate_image_file
+    from app.core.metadata_db import MetadataDB
+    base = _base_path()
+    download_path = str(_store().get_section("download").get("path") or "").strip()
+    db = MetadataDB(base)
+    try:
+        pages = db.get_downloaded_pages()
+        path_index = _build_page_path_index(download_path)
+        ok = truncated = missing = 0
+        bad_pages: list[tuple[str, int]] = []
+        for pid, page_index, url, file_path in pages:
+            resolved = _resolve_page_file(pid, page_index, url, file_path, path_index)
+            if not resolved or not os.path.isfile(resolved):
+                missing += 1
+                bad_pages.append((str(pid), int(page_index)))
+                continue
+            fmt = _fmt_from_path_or_url(resolved, url)
+            valid, _reason = validate_image_file(resolved, fmt)
+            if valid:
+                ok += 1
+            else:
+                truncated += 1
+                bad_pages.append((str(pid), int(page_index)))
+                if args.fix:
+                    with contextlib.suppress(Exception):
+                        os.remove(resolved)
+        reset = 0
+        if args.fix and bad_pages:
+            for pid, page_index in bad_pages:
+                db.mark_page_pending(pid, page_index)
+            reset = len(bad_pages)
+    finally:
+        db.close()
+    payload = {
+        "downloaded_pages": len(pages),
+        "ok": ok,
+        "truncated": truncated,
+        "missing": missing,
+        "reset": reset,
+        "download_path": download_path,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(
+            f"已下載頁數={payload['downloaded_pages']} 完整(ok)={ok} "
+            f"截斷(truncated)={truncated} 遺失(missing)={missing} "
+            f"已重設待下載(reset)={reset}",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def _cmd_run(args) -> int:
     from app.cli.headless_runner import run_headless
     return run_headless(args.step, force_rescan=bool(getattr(args, "force_rescan", False)))
@@ -172,6 +261,14 @@ def build_parser() -> argparse.ArgumentParser:
     pkt = ksub.add_parser("test", help="test configured cookies")
     pkt.add_argument("--json", action="store_true")
     pkt.set_defaults(func=_cmd_cookie_test)
+
+    pv = sub.add_parser("verify-files",
+                        help="scan downloaded pages for truncated/missing files")
+    pv.add_argument("--fix", action="store_true",
+                    help="re-queue truncated/missing pages (mark pending) and "
+                         "delete truncated files")
+    pv.add_argument("--json", action="store_true")
+    pv.set_defaults(func=_cmd_verify_files)
 
     pf = sub.add_parser("following", help="following utilities")
     fsub = pf.add_subparsers(dest="following_cmd", required=True)
