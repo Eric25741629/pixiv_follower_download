@@ -561,6 +561,7 @@ class RunController(_CookieValidationMixin):
             tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
             tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
             author_order=bool(dl.get("author_order", False)),
+            combined_workers=_coerce_int(dl.get("combined_workers", 1), 1),
             set_file_mtime=bool(dl.get("set_file_mtime", True)),
             download_deadline_sec=float(perf.get("download_deadline_sec", 120) or 120),
             rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
