@@ -27,7 +27,17 @@ _THROUGHPUT_JITTER = 0.10  # ±10% on inter-request gap (anti-detection)
 
 
 class AccountScheduler:
-    """Round-robin per-account cooldown scheduler with a throughput gate.
+    """Idle-weighted per-account cooldown scheduler with a throughput gate.
+
+    Selection among the currently-ready accounts is a *weighted random*
+    pick favouring the account that has been idle longest (see
+    ``_pick_weighted_by_idle``). This spreads load across the whole pool —
+    request counts land in a balanced spread around the mean instead of a
+    steep front-of-list skew — while guaranteeing no account starves: an
+    account that keeps getting skipped accumulates idle time, so its pick
+    weight keeps rising until it wins. (The earlier implementation picked
+    ``available[0]`` in fixed list order, which under any demand slack let
+    the front of the list satisfy every request and left the tail at zero.)
 
     Per-account cooldown is the deterministic setting value itself
     (``pid_cooldown_avg`` seconds, fixed regardless of account count —
@@ -128,10 +138,29 @@ class AccountScheduler:
         throughput = self._throughput_seconds(active)
         jitter = 1.0 + random.uniform(-_THROUGHPUT_JITTER, _THROUGHPUT_JITTER)
         self._next_emit_at = now + max(0.5, throughput * jitter)
-        picked = available[0]
+        picked = self._pick_weighted_by_idle(available, now, throughput)
         picked.held = True
         self._emit_countdown(0)
         return picked
+
+    def _pick_weighted_by_idle(self, available, now, throughput):
+        """Weighted-random choice among ready accounts, favouring the one
+        idle longest.
+
+        Weight = ``(now - cooldown_until) + base`` where ``base`` is one
+        throughput interval (floored at 0.5 s). ``now - cooldown_until`` is
+        the time the account has sat ready (``>= 0``; the caller already
+        filtered to ``cooldown_until <= now``), so a long-neglected account
+        gets a proportionally larger share and can never be starved, while
+        the base keeps a just-ready account pickable and guarantees the
+        total weight is positive. Counts therefore form a balanced spread
+        around the mean rather than the old fixed-list-order skew.
+        """
+        if len(available) == 1:
+            return available[0]
+        base = max(0.5, throughput)
+        weights = [(now - a.cooldown_until) + base for a in available]
+        return random.choices(available, weights=weights, k=1)[0]
 
     def _compute_wait(self, active, now) -> float:
         """How long to sleep before the next acquire attempt; 0 means ready now."""

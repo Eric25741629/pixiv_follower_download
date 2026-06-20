@@ -72,13 +72,42 @@ def test_compute_wait_takes_max_of_two():
 
 # ── _try_pickup_ready_account ───────────────────────────────────────────────
 
-def test_pickup_returns_first_ready_account():
+def test_pickup_returns_a_ready_account_and_marks_held():
     sched = _make_scheduler([])
     sched._next_emit_at = 0.0
     now = 100.0
     a, b = _make_account_at("c1", 100.0), _make_account_at("c2", 100.0)
     picked = sched._try_pickup_ready_account([a, b], now)
-    assert picked is a
+    # Selection among equally-idle ready accounts is weighted-random, so the
+    # contract is "returns one of the ready accounts and marks it held" —
+    # not the old fixed list-order `available[0]`.
+    assert picked in (a, b)
+    assert picked.held is True
+
+
+def test_pick_weighted_favors_longer_idle_but_never_starves():
+    """Among ready accounts the longer-idle one wins more often, yet the
+    just-ready one still gets a turn (no starvation)."""
+    import random as _r
+
+    _r.seed(12345)
+    sched = _make_scheduler([])
+    now = 1000.0
+    long_idle = _make_account_at("c1", 970.0)   # ready 30s ago
+    just_ready = _make_account_at("c2", 1000.0)  # ready right now
+    counts = {"c1": 0, "c2": 0}
+    for _ in range(600):
+        picked = sched._pick_weighted_by_idle([long_idle, just_ready], now, throughput=15.0)
+        counts[picked.cookie] += 1
+    assert counts["c1"] > counts["c2"]   # longer-idle favored
+    assert counts["c2"] > 0              # but never starved
+
+
+def test_pick_weighted_single_available_is_deterministic():
+    sched = _make_scheduler([])
+    now = 100.0
+    only = _make_account_at("c1", 100.0)
+    assert sched._pick_weighted_by_idle([only], now, throughput=15.0) is only
 
 
 def test_pickup_returns_none_when_no_account_ready():

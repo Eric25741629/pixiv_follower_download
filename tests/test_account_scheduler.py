@@ -224,3 +224,43 @@ def test_throughput_gate_bounds_inter_request_gap(monkeypatch):
     # And in steady state ≥ 0.9 × throughput so the gate is enforced.
     steady = gaps[7:]
     assert min(steady) >= throughput * 0.9 - 0.5
+
+
+def test_no_account_starves_under_demand_slack(monkeypatch):
+    """Regression for the steep request-count skew / never-selected tail.
+
+    Under demand slack (a unit of work takes longer than one throughput
+    interval, the normal case for slow downloads) several accounts are
+    ready at once. The old `available[0]` pick always took the lowest list
+    index, so the front of the pool satisfied every request and the tail
+    accounts were never selected. Idle-weighted selection must use the
+    whole pool: every account picked at least once and the spread bounded.
+    """
+    import random as _r
+
+    _r.seed(2024)
+    clock = [100.0]
+
+    def fake_sleep(d):
+        clock[0] += max(0.0, float(d))
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+
+    accs = [AccountState(cookie=f"c{i}", alias=f"A{i}") for i in range(8)]
+    sched, _, _ = _make_scheduler(accs, avg=30.0)  # throughput 30/8 = 3.75s
+
+    counts = {a.cookie: 0 for a in accs}
+    WORK = 10.0  # each unit of work > throughput -> several accounts pile up ready
+    for _ in range(240):
+        acc = sched.acquire()
+        assert acc is not None
+        counts[acc.cookie] += 1
+        clock[0] += WORK            # simulate a slow download/query
+        sched.release(acc, ok=True)
+
+    # No account starves (the old code left tail accounts at 0).
+    assert min(counts.values()) > 0
+    # Busiest is not wildly more than quietest — a balanced spread, not a
+    # 598-vs-0 cliff.
+    assert max(counts.values()) <= 3 * min(counts.values())
