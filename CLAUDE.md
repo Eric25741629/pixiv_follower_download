@@ -228,8 +228,15 @@ Settings keys driving this:
 
 Deprecated: `cookie_speed_divisor` and `apply_cookie_pool_speedup` in `pixiv_thread_utils.py` are superseded by `AccountScheduler` and kept only for import compat.
 
+## UI design system (`app/gui/components`)
+
+All Flet UI is built from the **`app/gui/components`** factory library (themed on top of `app/gui/glass.py`'s `GlassTheme` tokens + `glass_panel` / `glass_dialog`), so styling and behavior live in one place instead of being hand-rolled per view. Import as `from app.gui import components as c`. Layers: `inputs` (`number_field`, `text_field`, `multiline_field`, `dropdown`, `switch`, `slider` — each bakes in the border/focus/active/inactive glass styling that views used to retrofit via `_apply_input_theme`), `layout` (`page_title`, `subhead`, `note`, `status_note`, `inline_label`, `section` — the unified `_tile`), `buttons` (`primary_button`, `secondary_button`, `icon_action`), `dialogs` (`confirm_dialog`). Factories take the `GlassTheme` (from `current_theme(page)`) first where they style.
+
+**New UI must route through this library, not raw `ft.*` themed controls.** The guardrail `tests/test_ui_no_raw_controls.py` fails if any view file constructs a raw `ft.TextField/Switch/Slider/Dropdown/FilledButton/OutlinedButton` (it passes with zero allowlist today). Pure layout (`ft.Row/Column/Container`), `ft.Text` display cells, `ft.Checkbox`, and the custom `glass_pill` action buttons stay raw. Note: Flet 0.84 `ft.Dropdown`'s change handler is **`on_select`**, not `on_change`. To add UI: extend the library (factory + test in `tests/test_ui_components.py` + `__init__.py` re-export), then use it. When reviewing/writing UI, use the **`ui-design-system-review`** skill. Tests: `tests/test_ui_components.py`, `tests/test_ui_no_raw_controls.py`.
+
 ## Conventions worth knowing
 
 - User-facing strings and log/output messages are Traditional Chinese; keep that style when touching UI.
+- All UI is built from the `app/gui/components` design-system factories, not raw `ft.*` themed controls (see the UI design system section; guardrail `tests/test_ui_no_raw_controls.py`).
 - Workers extend `PauseableThread` (which extends `threading.Thread`); never call network code on the GUI thread. Workers push `WorkerEvent(type=..., data=...)` (field is `type`, not `kind`) onto the shared `queue.Queue`; `EventDispatcher` routes them to the correct handler on the Flet event loop.
 - Writes to shared state files go through `safe_io.atomic_write_*` or `pixiv_thread_utils.atomic_write_*`, not raw `open(..., "w")`, to survive interrupted runs.
