@@ -3,7 +3,8 @@ import os
 import threading
 import flet as ft
 from app.core.settings_store import SettingsStore
-from app.gui.glass import current_theme, glass_dialog, glass_panel, glass_snackbar
+from app.gui import components as c
+from app.gui.glass import current_theme, glass_snackbar
 from app.gui.views.settings_handlers import _SettingsHandlersMixin
 import contextlib
 
@@ -50,159 +51,181 @@ class SettingsView(_SettingsHandlersMixin):
         directory = store.get_section("directory")
         self._n_cookies: int = max(1, len(auth.get("cookies_pool", []) or []))
 
-        self._tf_account = ft.TextField(label="帳號", value=auth.get("account", ""), width=300)
-        self._tf_password = ft.TextField(label="密碼", value=auth.get("password", ""), width=300, password=True, can_reveal_password=True)
-        self._tf_userid = ft.TextField(label="User ID", value=str(auth.get("userid", "")), width=200)
-        self._tf_path = ft.TextField(label="下載路徑", value=dl.get("path", ""), expand=True, read_only=True)
+        theme = current_theme(page)
 
-        self._sw_hidefollow = ft.Switch(label="隱藏追蹤", value=bool(flt.get("hidefollow", False)))
-        self._sw_nogif = ft.Switch(label="過濾 GIF", value=bool(flt.get("nogif", False)))
-        self._sw_notag = ft.Switch(label="無 tag 不下載", value=bool(flt.get("notag", False)))
-        self._sw_notime = ft.Switch(label="無時間不下載", value=bool(flt.get("notime", False)))
-        self._tf_like_num = ft.TextField(label="最低讚數（一般）", value=str(dl.get("like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
-        self._tf_r18_like_num = ft.TextField(label="最低讚數（R18）", value=str(dl.get("r18_like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
-        self._tf_rescrape_within_days = ft.TextField(
+        self._tf_account = c.text_field(theme, label="帳號", value=auth.get("account", ""), width=300)
+        self._tf_password = c.text_field(theme, label="密碼", value=auth.get("password", ""), width=300, password=True)
+        self._tf_userid = c.text_field(theme, label="User ID", value=str(auth.get("userid", "")), width=200)
+        self._tf_path = c.text_field(theme, label="下載路徑", value=dl.get("path", ""), expand=True, read_only=True)
+
+        self._sw_hidefollow = c.switch(theme, label="隱藏追蹤", value=bool(flt.get("hidefollow", False)))
+        self._sw_nogif = c.switch(theme, label="過濾 GIF", value=bool(flt.get("nogif", False)))
+        self._sw_notag = c.switch(theme, label="無 tag 不下載", value=bool(flt.get("notag", False)))
+        self._sw_notime = c.switch(theme, label="無時間不下載", value=bool(flt.get("notime", False)))
+        self._tf_like_num = c.number_field(theme, label="最低讚數（一般）", value=dl.get("like_num", 0), width=150)
+        self._tf_r18_like_num = c.number_field(theme, label="最低讚數（R18）", value=dl.get("r18_like_num", 0), width=150)
+        self._tf_rescrape_within_days = c.number_field(
+            theme,
             label="重抓上限（天數，0=關閉）",
-            value=str(dl.get("rescrape_within_days", 365)),
+            value=dl.get("rescrape_within_days", 365),
             width=200,
-            keyboard_type=ft.KeyboardType.NUMBER,
             tooltip="作品距上傳時間小於此天數時，Step 3 會重新抓取 meta 以更新讚數，避免新作品因初始讚數不足被永久過濾。0 表示停用。已下載的作品永遠不會重抓。",
         )
-        self._tf_filename_template = ft.TextField(
+        self._tf_filename_template = c.text_field(
+            theme,
             label="檔名範本（留空＝使用預設）",
             value=str(dl.get("filename_template", "") or ""),
             hint_text="例：{timetag}_PID{pid}{page}{hashtag}.{ext}",
             expand=True,
         )
-        self._tf_download_time = ft.TextField(
+        self._tf_download_time = c.text_field(
+            theme,
             label="下載時間戳起點 (YYYY-MM-DD HH:MM:SS)",
             value=str(dl.get("download_time", "") or ""),
             hint_text="例：2026-01-01 00:00:00",
             width=320,
             tooltip="下載檔名/檔案時間使用的時間戳起點。每下載一張 +1 秒並自動回寫此欄位。",
         )
-        self._sw_set_file_mtime = ft.Switch(
+        self._sw_set_file_mtime = c.switch(
+            theme,
             label="下載檔案時間設為時間戳 (mtime)",
             value=bool(dl.get("set_file_mtime", True)),
             tooltip="將下載完成的檔案修改時間設成與檔名相同的時間戳",
         )
-        self._sw_tag_strip_brackets = ft.Switch(
+        self._sw_tag_strip_brackets = c.switch(
+            theme,
             label="Tag 過濾括號內容",
             value=bool(dl.get("tag_strip_brackets", False)),
             tooltip="開啟後，tag 中成對括號（含 () （） [] 【】 《》 〈〉 「」 『』 〔〕 〘〙）與內容會從檔名移除",
         )
-        self._sw_tag_strip_special_chars = ft.Switch(
+        self._sw_tag_strip_special_chars = c.switch(
+            theme,
             label="Tag 過濾裝飾符號與 emoji",
             value=bool(dl.get("tag_strip_special_chars", False)),
             tooltip="開啟後，箭頭、★☆♀♂♪♫、◯●◎、各式 emoji 等裝飾性符號會從 tag 中移除",
         )
-        self._sw_author_order = ft.Switch(
+        self._sw_author_order = c.switch(
+            theme,
             label="依作者順序下載（同作者連續）",
             value=bool(dl.get("author_order", False)),
             tooltip="開啟後，步驟 4 會把同一作者的作品連續下載完（PID 由大到小）再換下一位；作者不明的作品排到最後",
         )
-        self._sw_combined_mode = ft.Switch(
+        self._sw_combined_mode = c.switch(
+            theme,
             label="邊查邊下（查到即下載，合併步驟三、四）",
             value=bool(dl.get("combined_mode", False)),
             tooltip="開啟後，步驟 3 會逐一查詢 PID 並立即下載該 PID 的頁面（查詢與下載共用同一次帳號冷卻）；同時自動吸收上次未完成的下載",
         )
-        self._sw_force_rescan = ft.Switch(
+        self._sw_force_rescan = c.switch(
+            theme,
             label="強制重新掃描全部畫家（忽略30天，一次性）",
             value=bool(dl.get("force_full_rescan", False)),
             tooltip="開啟後，下次步驟2 會忽略「30天內已掃過」的跳過、重新掃描全部畫家，把每位作者的全部作品 user_id 補齊（供依作者分組）。執行步驟2 後會自動關閉。",
         )
-        self._dd_source_mode = ft.Dropdown(
+        self._dd_source_mode = c.dropdown(
+            theme,
             label="作品來源",
             value=str(dl.get("source_mode", "following") or "following"),
             options=[
-                ft.dropdown.Option("following", "抓追隨畫師"),
-                ft.dropdown.Option("bookmarks", "抓我的收藏"),
+                ("following", "抓追隨畫師"),
+                ("bookmarks", "抓我的收藏"),
             ],
             width=220,
         )
-        self._dd_following_scope = ft.Dropdown(
+        self._dd_following_scope = c.dropdown(
+            theme,
             label="追隨範圍",
             value=str(dl.get("following_scope", "all") or "all"),
             options=[
-                ft.dropdown.Option("public", "公開追隨"),
-                ft.dropdown.Option("private", "非公開追隨"),
-                ft.dropdown.Option("all", "全部追隨"),
+                ("public", "公開追隨"),
+                ("private", "非公開追隨"),
+                ("all", "全部追隨"),
             ],
             width=220,
         )
-        self._dd_bookmark_scope = ft.Dropdown(
+        self._dd_bookmark_scope = c.dropdown(
+            theme,
             label="收藏範圍",
             value=str(dl.get("bookmark_scope", "all") or "all"),
             options=[
-                ft.dropdown.Option("public", "公開收藏"),
-                ft.dropdown.Option("private", "非公開收藏"),
-                ft.dropdown.Option("all", "全部收藏"),
+                ("public", "公開收藏"),
+                ("private", "非公開收藏"),
+                ("all", "全部收藏"),
             ],
             width=220,
         )
 
         sch = store.get_section("schedule")
-        self._sw_schedule_enabled = ft.Switch(
+        self._sw_schedule_enabled = c.switch(
+            theme,
             label="啟用排程（定時自動 Run All）",
             value=bool(sch.get("enabled", False)),
         )
-        self._dd_schedule_mode = ft.Dropdown(
+        self._dd_schedule_mode = c.dropdown(
+            theme,
             label="排程方式",
             value=str(sch.get("mode", "daily")),
-            options=[ft.dropdown.Option("daily", "每日固定時間"),
-                     ft.dropdown.Option("interval", "固定間隔")],
+            options=[("daily", "每日固定時間"),
+                     ("interval", "固定間隔")],
             width=200,
         )
-        self._tf_schedule_time = ft.TextField(
-            label="每日時間 (HH:MM)", value=str(sch.get("time", "03:00")), width=160,
+        self._tf_schedule_time = c.text_field(
+            theme, label="每日時間 (HH:MM)", value=str(sch.get("time", "03:00")), width=160,
         )
-        self._tf_schedule_interval = ft.TextField(
-            label="間隔 (小時)", value=str(sch.get("interval_hours", 6)), width=160,
+        self._tf_schedule_interval = c.text_field(
+            theme, label="間隔 (小時)", value=str(sch.get("interval_hours", 6)), width=160,
         )
 
         self._ban_tags: list[str] = list(dl.get("ban_tag", []))
         self._must_tags: list[str] = list(dl.get("must_tag", []))
         self._ban_tag_row = ft.Row(wrap=True, spacing=4)
         self._must_tag_row = ft.Row(wrap=True, spacing=4)
-        self._tf_ban_input = ft.TextField(label="新增禁止 tag", width=200, on_submit=self._add_ban_tag)
-        self._tf_must_input = ft.TextField(label="新增必須 tag", width=200, on_submit=self._add_must_tag)
+        self._tf_ban_input = c.text_field(theme, label="新增禁止 tag", width=200)
+        self._tf_ban_input.on_submit = self._add_ban_tag
+        self._tf_must_input = c.text_field(theme, label="新增必須 tag", width=200)
+        self._tf_must_input.on_submit = self._add_must_tag
         self._refresh_tag_rows()
 
-        self._sw_create_dir = ft.Switch(
+        self._sw_create_dir = c.switch(
+            theme,
             label="依作者 ID 建立子資料夾",
             value=bool(directory.get("create_dir", False)),
         )
-        self._sw_r18_dir = ft.Switch(
+        self._sw_r18_dir = c.switch(
+            theme,
             label="R-18 作品分類資料夾",
             value=not bool(directory.get("no_R18_dir", False)),
         )
-        self._sw_r18g_dir = ft.Switch(
+        self._sw_r18g_dir = c.switch(
+            theme,
             label="R-18G 作品分類資料夾",
             value=not bool(directory.get("no_R18G_dir", False)),
         )
-        self._sw_ai_dir = ft.Switch(
+        self._sw_ai_dir = c.switch(
+            theme,
             label="AI 生成作品分類資料夾（關閉後下載到一般路徑）",
             value=bool(directory.get("ai_gen_dir", False)),
         )
 
-        self._sw_jxl = ft.Switch(label="啟用 JXL 轉檔", value=bool(jxl.get("enable", False)))
-        self._tf_jxl_path = ft.TextField(label="cjxl.exe 路徑", value=jxl.get("cjxl_path", ""), expand=True, read_only=True)
-        self._sw_jxl_delete = ft.Switch(label="刪除原檔", value=bool(jxl.get("delete_original", False)))
+        self._sw_jxl = c.switch(theme, label="啟用 JXL 轉檔", value=bool(jxl.get("enable", False)))
+        self._tf_jxl_path = c.text_field(theme, label="cjxl.exe 路徑", value=jxl.get("cjxl_path", ""), expand=True, read_only=True)
+        self._sw_jxl_delete = c.switch(theme, label="刪除原檔", value=bool(jxl.get("delete_original", False)))
         effort_val = max(1, min(9, int(jxl.get("effort", 7))))
-        self._sl_jxl_effort = ft.Slider(min=1, max=9, divisions=8, value=effort_val, label="{value}", width=200)
+        self._sl_jxl_effort = c.slider(theme, min=1, max=9, divisions=8, value=effort_val, label="{value}", width=200)
 
         # Cooldown controls — replace old pid_wait_min / pid_wait_max text fields
         cooldown_avg = int(perf.get("pid_cooldown_avg", 35))
-        self._sl_cooldown = ft.Slider(
+        self._sl_cooldown = c.slider(
+            theme,
             min=0, max=300, divisions=60, value=float(cooldown_avg),
             label="{value}", width=240,
             on_change=self._on_cooldown_slider_change,
         )
-        self._tf_cooldown = ft.TextField(
+        self._tf_cooldown = c.number_field(
+            theme,
             label="單帳號冷卻秒數",
-            value=str(cooldown_avg),
+            value=cooldown_avg,
             width=170,
-            keyboard_type=ft.KeyboardType.NUMBER,
             on_change=self._on_cooldown_tf_change,
         )
         self._label_cooldown_hint = ft.Text(
@@ -210,75 +233,47 @@ class SettingsView(_SettingsHandlersMixin):
             size=11,
             color=self._cooldown_hint_color(cooldown_avg),
         )
-        self._sw_single_thread = ft.Switch(label="單執行緒 PID 模式", value=bool(perf.get("single_thread_mode", False)))
+        self._sw_single_thread = c.switch(theme, label="單執行緒 PID 模式", value=bool(perf.get("single_thread_mode", False)))
 
         # Proxy controls
         proxy_pool = auth.get("proxy_pool") or []
-        self._tf_proxy_pool = ft.TextField(
+        self._tf_proxy_pool = c.multiline_field(
+            theme,
             label="Proxy 列表（每行一個）",
             hint_text="# 一行一個 proxy\nhttp://1.2.3.4:8080\nsocks5://user:pass@host:1080",
             value="\n".join(proxy_pool),
-            multiline=True,
             min_lines=4,
             max_lines=15,
-            expand=True,
         )
         self._proxy_test_results = ft.Column([], spacing=4)
 
         # Wait time controls
         intra_min = int(perf.get("intra_pid_wait_min", 5))
         intra_max = int(perf.get("intra_pid_wait_max", 15))
-        self._tf_intra_min = ft.TextField(
-            value=str(intra_min), width=80, keyboard_type=ft.KeyboardType.NUMBER,
-        )
-        self._tf_intra_max = ft.TextField(
-            value=str(intra_max), width=80, keyboard_type=ft.KeyboardType.NUMBER,
-        )
+        self._tf_intra_min = c.number_field(theme, label=None, value=intra_min, width=80)
+        self._tf_intra_max = c.number_field(theme, label=None, value=intra_max, width=80)
         nocookie_min = int(perf.get("pid_wait_nocookie_min", 3))
         nocookie_max = int(perf.get("pid_wait_nocookie_max", 8))
-        self._tf_nocookie_min = ft.TextField(
-            value=str(nocookie_min), width=80, keyboard_type=ft.KeyboardType.NUMBER,
-        )
-        self._tf_nocookie_max = ft.TextField(
-            value=str(nocookie_max), width=80, keyboard_type=ft.KeyboardType.NUMBER,
-        )
+        self._tf_nocookie_min = c.number_field(theme, label=None, value=nocookie_min, width=80)
+        self._tf_nocookie_max = c.number_field(theme, label=None, value=nocookie_max, width=80)
 
         # User-Agent controls
-        self._tf_agent = ft.TextField(
+        self._tf_agent = c.text_field(
+            theme,
+            label=None,
             value=auth.get("agent", ""),
             hint_text="未設定，將使用內建隨機 UA",
             expand=True,
         )
-        self._btn_detect_ua = ft.OutlinedButton(
+        self._btn_detect_ua = c.secondary_button(
             "重新偵測 Chrome", on_click=self._on_detect_chrome,
         )
-        self._label_ua_status = ft.Text("", size=11, color=current_theme(page).text_secondary)
+        self._label_ua_status = ft.Text("", size=11, color=theme.text_secondary)
 
         # Flipping any Switch persists that one field immediately (主動紀錄),
         # so a toggle sticks without the user having to click 「儲存設定」.
         # Text fields / sliders still rely on the explicit save button.
         self._wire_switch_autosave()
-
-        # Liquid-glass input theming (visuals only — handlers untouched).
-        self._apply_input_theme()
-
-    # ------------------------------------------------------------------
-    # Liquid-glass theming helpers
-    # ------------------------------------------------------------------
-
-    def _apply_input_theme(self) -> None:
-        """Apply glass theme tokens to every input control on this view."""
-        theme = current_theme(self._page)
-        for ctl in vars(self).values():
-            if isinstance(ctl, (ft.TextField, ft.Dropdown)):
-                ctl.border_color = theme.panel_border
-                ctl.focused_border_color = theme.accent
-            elif isinstance(ctl, (ft.Slider, ft.Switch)):
-                ctl.active_color = theme.accent
-                # M3 預設的 inactive 軌道色在玻璃淺色背景上幾乎隱形（只剩
-                # 拇指可見 — 「滑桿顯示有問題」bug）；用面板邊框色讓軌道現形。
-                if isinstance(ctl, ft.Slider):
-                    ctl.inactive_color = theme.panel_border
 
     # _cooldown_hint_color / the per-switch autosave wiring
     # (_switch_autosave_map / _wire_switch_autosave / _make_autosave_handler)
@@ -507,17 +502,16 @@ class SettingsView(_SettingsHandlersMixin):
                     self._page.pop_dialog()
 
             try:
-                self._page.show_dialog(glass_dialog(
+                self._page.show_dialog(c.confirm_dialog(
                     theme,
-                    "冷卻時間偏短",
-                    ft.Text(
+                    title="冷卻時間偏短",
+                    content=ft.Text(
                         f"平均冷卻 {avg_val} 秒低於建議值 30 秒，\n可能被 Pixiv 風控偵測。確定要套用？",
                         color=theme.text_secondary,
                     ),
-                    actions=[
-                        ft.TextButton("取消", on_click=_cancel),
-                        ft.FilledButton("確定套用", on_click=_confirm),
-                    ],
+                    on_confirm=_confirm,
+                    confirm_text="確定套用",
+                    on_cancel=_cancel,
                 ))
             except Exception:
                 # If dialog fails for any reason, fall back to direct save
@@ -534,97 +528,78 @@ class SettingsView(_SettingsHandlersMixin):
     def build(self) -> ft.Column:
         theme = current_theme(self._page)
 
-        def _tile(title: str, controls: list) -> ft.Container:
-            tile = ft.ExpansionTile(
-                title=ft.Text(title, color=theme.text_primary),
-                controls=[ft.Container(
-                    content=ft.Column(controls, spacing=8),
-                    padding=ft.Padding.only(left=16, top=10, bottom=12),
-                )],
-                bgcolor="#00000000",
-                collapsed_bgcolor="#00000000",
-                text_color=theme.text_primary,
-                collapsed_text_color=theme.text_primary,
-                icon_color=theme.accent,
-                collapsed_icon_color=theme.text_secondary,
-                shape=ft.RoundedRectangleBorder(radius=theme.radius),
-                collapsed_shape=ft.RoundedRectangleBorder(radius=theme.radius),
-            )
-            return glass_panel(tile, theme, padding=ft.Padding(4, 4, 4, 4))
-
-        save_btn = ft.FilledButton("儲存設定", icon=ft.Icons.SAVE, on_click=self._save_and_notify)
-        note = lambda text: ft.Text(text, size=11, color=theme.text_secondary)
-        subhead = lambda text: ft.Text(text, size=12, weight=ft.FontWeight.BOLD, color=theme.text_primary)
+        save_btn = c.primary_button("儲存設定", icon=ft.Icons.SAVE, on_click=self._save_and_notify)
 
         return ft.Column(
             controls=[
-                ft.Text("設定", size=20, weight=ft.FontWeight.BOLD, color=theme.text_primary),
-                _tile("帳號與連線", [
-                    subhead("Pixiv 帳號"),
+                c.page_title(theme, "設定"),
+                c.section(theme, "帳號與連線", [
+                    c.subhead(theme, "Pixiv 帳號"),
                     self._tf_account,
                     self._tf_password,
                     self._tf_userid,
-                    subhead("User-Agent"),
+                    c.subhead(theme, "User-Agent"),
                     ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
                     self._label_ua_status,
-                    subhead("Proxy"),
+                    c.subhead(theme, "Proxy"),
                     self._tf_proxy_pool,
                     ft.Row([
-                        ft.OutlinedButton("測試全部 Proxy", on_click=self._on_test_proxies),
+                        c.secondary_button("測試全部 Proxy", on_click=self._on_test_proxies),
                     ]),
                     self._proxy_test_results,
                 ]),
-                _tile("下載輸出", [
-                    subhead("下載位置"),
-                    ft.Row([self._tf_path, ft.IconButton(
-                        icon=ft.Icons.FOLDER_OPEN,
+                c.section(theme, "下載輸出", [
+                    c.subhead(theme, "下載位置"),
+                    ft.Row([self._tf_path, c.icon_action(
+                        ft.Icons.FOLDER_OPEN,
                         on_click=self._pick_folder,
                     )]),
-                    subhead("資料夾分類"),
-                    note("啟用後將在下載目錄底下，依作品屬性建立子資料夾。"),
+                    c.subhead(theme, "資料夾分類"),
+                    c.note(theme, "啟用後將在下載目錄底下，依作品屬性建立子資料夾。"),
                     self._sw_create_dir,
                     self._sw_r18_dir,
                     self._sw_r18g_dir,
                     self._sw_ai_dir,
-                    subhead("檔名範本"),
-                    note(
+                    c.subhead(theme, "檔名範本"),
+                    c.note(
+                        theme,
                         "可用佔位符：{pid} {page} {ext} {tag} {hashtag} {timetag} {date} {time}\n"
                         "留空時使用預設規則。檔名會自動清掉 Windows 不允許的字元。"
                     ),
                     self._tf_filename_template,
-                    subhead("時間戳"),
-                    note("時間戳起點供 {timetag} 檔名與檔案時間使用；每下載一張 +1 秒並自動回寫。格式錯誤時自動回退到 1970-01-01。"),
+                    c.subhead(theme, "時間戳"),
+                    c.note(theme, "時間戳起點供 {timetag} 檔名與檔案時間使用；每下載一張 +1 秒並自動回寫。格式錯誤時自動回退到 1970-01-01。"),
                     self._tf_download_time,
                     self._sw_set_file_mtime,
-                    subhead("檔名內容"),
+                    c.subhead(theme, "檔名內容"),
                     ft.Row([self._sw_notag, self._sw_notime], wrap=True),
-                    subhead("Tag 整理（套用於 {hashtag} 佔位符）"),
+                    c.subhead(theme, "Tag 整理（套用於 {hashtag} 佔位符）"),
                     ft.Row(
                         [self._sw_tag_strip_brackets, self._sw_tag_strip_special_chars],
                         wrap=True,
                     ),
-                    subhead("JXL 轉檔"),
+                    c.subhead(theme, "JXL 轉檔"),
                     self._sw_jxl,
-                    ft.Row([self._tf_jxl_path, ft.IconButton(
-                        icon=ft.Icons.FILE_OPEN,
+                    ft.Row([self._tf_jxl_path, c.icon_action(
+                        ft.Icons.FILE_OPEN,
                         on_click=self._pick_jxl_exe,
                     )]),
                     self._sw_jxl_delete,
                     ft.Row([ft.Text("Effort（1-9）", color=theme.text_primary), self._sl_jxl_effort]),
                 ]),
-                _tile("作品篩選", [
+                c.section(theme, "作品篩選", [
                     ft.Row([self._sw_hidefollow, self._sw_nogif], wrap=True),
                     ft.Row([self._tf_like_num, self._tf_r18_like_num, self._tf_rescrape_within_days], spacing=16, wrap=True),
-                    subhead("禁止 tag"),
+                    c.subhead(theme, "禁止 tag"),
                     self._ban_tag_row,
-                    ft.Row([self._tf_ban_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_ban_tag)]),
-                    subhead("必須 tag"),
+                    ft.Row([self._tf_ban_input, c.icon_action(ft.Icons.ADD, on_click=self._add_ban_tag)]),
+                    c.subhead(theme, "必須 tag"),
                     self._must_tag_row,
-                    ft.Row([self._tf_must_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_must_tag)]),
+                    ft.Row([self._tf_must_input, c.icon_action(ft.Icons.ADD, on_click=self._add_must_tag)]),
                 ]),
-                _tile("執行流程", [
-                    subhead("作品來源"),
-                    note("抓追隨會先抓畫師清單；抓我的收藏會在步驟 2 掃描你按過愛心的作品 PID。"),
+                c.section(theme, "執行流程", [
+                    c.subhead(theme, "作品來源"),
+                    c.note(theme, "抓追隨會先抓畫師清單；抓我的收藏會在步驟 2 掃描你按過愛心的作品 PID。"),
                     ft.Row(
                         [self._dd_source_mode, self._dd_following_scope, self._dd_bookmark_scope],
                         spacing=16,
@@ -634,22 +609,22 @@ class SettingsView(_SettingsHandlersMixin):
                     self._sw_author_order,
                     self._sw_force_rescan,
                 ]),
-                _tile("速度與自動化", [
-                    subhead("冷卻與等待"),
+                c.section(theme, "速度與自動化", [
+                    c.subhead(theme, "冷卻與等待"),
                     ft.Row([self._tf_cooldown, self._label_cooldown_hint], spacing=12),
                     self._sl_cooldown,
                     ft.Row(
-                        [ft.Text("同 PID 頁間等待（秒）", size=13, color=theme.text_primary),
+                        [c.inline_label(theme, "同 PID 頁間等待（秒）"),
                          self._tf_intra_min, ft.Text("~", color=theme.text_secondary), self._tf_intra_max],
                         spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     ft.Row(
-                        [ft.Text("免 Cookie 請求等待（秒）", size=13, color=theme.text_primary),
+                        [c.inline_label(theme, "免 Cookie 請求等待（秒）"),
                          self._tf_nocookie_min, ft.Text("~", color=theme.text_secondary), self._tf_nocookie_max],
                         spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     self._sw_single_thread,
-                    subhead("排程"),
+                    c.subhead(theme, "排程"),
                     self._sw_schedule_enabled,
                     self._dd_schedule_mode,
                     self._tf_schedule_time,
