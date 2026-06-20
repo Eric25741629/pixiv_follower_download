@@ -505,9 +505,18 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                     )
                     stop_now = False
                     for fut in finished:
-                        result = None
-                        with contextlib.suppress(Exception):
+                        try:
                             result = fut.result()
+                        except Exception as exc:
+                            # A worker raised an unexpected non-network error
+                            # (e.g. disk-full on os.replace). Surface it instead
+                            # of silently treating it as a clean stop — the
+                            # sequential path emits via run()'s except. The PID
+                            # stays pending (no _handle_worker_result ran for it).
+                            from app.core.pixiv_thread_utils import output_err
+                            self._emit(output_err(exc))
+                            stop_now = True
+                            continue
                         if result is None:
                             # acquire -> None (stop / all disabled): stop refilling.
                             stop_now = True

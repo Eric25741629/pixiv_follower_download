@@ -225,6 +225,27 @@ def test_run_end_to_end_concurrent_emits_terminal(monkeypatch):
     assert any(e.type == "next" and e.data == -1 for e in evs)
 
 
+def test_run_concurrent_surfaces_worker_exception(monkeypatch):
+    """An unexpected non-network error in a worker is logged (not silently
+    swallowed), and the affected PID is never retired (stays pending)."""
+    t = _thread(workers=2)
+
+    def core(pid, nq, **kw):
+        if pid == "boom":
+            raise ValueError("disk full")
+        return [], True
+
+    monkeypatch.setattr(t, "_process_one_pid_core", core)
+    marked = []
+    monkeypatch.setattr(t.fetcher, "_mark_pid_processed", lambda pid: marked.append(pid))
+    monkeypatch.setattr(t.downloader, "_emit_timechanged", lambda: None)
+    order = [("boom", True), ("a", True), ("b", True)]
+    t._run_concurrent(order, len(order), 2)
+    outputs = [e for e in _drain(t._q) if e.type == "output"]
+    assert any("disk full" in str(e.data) for e in outputs)  # error surfaced
+    assert "boom" not in marked  # the failed PID was not retired
+
+
 def test_run_sequential_when_single_worker(monkeypatch):
     """combined_workers=1 keeps the sequential loop even with many accounts."""
     t = _thread(workers=1)
