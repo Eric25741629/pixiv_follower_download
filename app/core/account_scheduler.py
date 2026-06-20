@@ -301,6 +301,11 @@ class AccountScheduler:
         with self._lock:
             return self._all_disabled()
 
+    def active_account_count(self) -> int:
+        """How many accounts are not disabled (usable for concurrent pickup)."""
+        with self._lock:
+            return sum(1 for a in self._accounts if a.disabled_reason is None)
+
     def average_cooldown(self) -> float:
         """Average inter-request throughput in seconds — i.e., the
         expected gap until the next request fires across all accounts.

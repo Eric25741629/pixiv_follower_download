@@ -59,6 +59,11 @@ DEFAULTS = {
         # When true, Step 3 runs in 邊查邊下 (combined) mode: each PID is
         # downloaded immediately after its meta is fetched (merges Step 3+4).
         "combined_mode": False,
+        # Concurrency for 邊查邊下: how many PIDs to query+download at once.
+        # 1 = sequential (zero regression). Effective workers are capped by the
+        # active account count and pending work, so K accounts -> up to K PIDs
+        # in flight, each on its own cookie/proxy inside one cooldown window.
+        "combined_workers": 1,
         # One-shot: when true, the next Step 2 run ignores the 30-day
         # "already scanned" skip and re-scans every artist, to backfill
         # user_id (author) for artists already inside the skip window.

@@ -192,6 +192,12 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
          self._cookie_alias_map, self.cookies) = init_cookie_fields(cookies)
         self._pid_cookie_selection = {}
         self._current_account_local = threading.local()
+        # Per-thread reserved timetag block (combined concurrent mode). When a
+        # worker reserves a contiguous block before a PID's pages, _jpg_advance_
+        # timetag hands out base+0, base+1, ... so one PID's pages keep
+        # contiguous (non-interleaved) timetags even while other PIDs download
+        # concurrently. Unset -> the legacy global +1s path (sequential modes).
+        self._timetag_block_local = threading.local()
         self.agent = agent
         self.download_time = (download_time if isinstance(download_time, datetime.datetime)
                               else datetime.datetime(1970, 1, 1))

@@ -54,6 +54,29 @@ class _CombinedPageProgressQueue:
             return 1
 
 
+class _DropProgressQueue:
+    """Forward everything EXCEPT ``progress`` / ``page_progress`` events.
+
+    Installed on both engines' ``_q`` for the whole concurrent 邊查邊下 phase so
+    the K workers' per-PID page/overall progress can never flood the single
+    :class:`~app.gui.dispatcher.EventDispatcher` (the freeze cause in the
+    reverted Phase 1). The combined coordinator owns overall progress (one tick
+    per finished PID) and the lightweight aggregate phase line; per-page bars
+    are meaningless across K concurrent PIDs so they are dropped. Output /
+    countdown / phase / finished / next pass straight through.
+    """
+
+    _DROP = {"progress", "page_progress"}
+
+    def __init__(self, target_q):
+        self._target_q = target_q
+
+    def put(self, event, *args, **kwargs):
+        if isinstance(event, WorkerEvent) and getattr(event, "type", None) in self._DROP:
+            return
+        self._target_q.put(event, *args, **kwargs)
+
+
 class _DropOverallProgressQueue:
     """Forward everything to the real queue EXCEPT overall ``"progress"`` events.
 
