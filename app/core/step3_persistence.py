@@ -80,14 +80,56 @@ class _Step3PersistenceMixin:
         """Print a one-liner with current SQLite cache size."""
         emit_db_stats(getattr(self, "_metadata_db", None), self._q, stage=stage)
 
-    def _mirror_url_meta_to_db(self):
-        """Best-effort bulk-mirror of self.url_meta into the SQLite cache."""
-        mirror_meta_dict_to_db(getattr(self, "_metadata_db", None), self.url_meta)
+    def _mirror_url_meta_to_db(self, *, full=False):
+        """Best-effort bulk-mirror of self.url_meta into the SQLite cache.
 
-    def _flush_url_meta_snapshot(self):
-        self._mirror_url_meta_to_db()
+        ``full=True`` (terminal/backstop flushes) re-imports the entire dict;
+        periodic flushes import only the PIDs not yet mirrored this run
+        (tracked in ``self._flushed_meta_pids``). This mirrors the ``_flushed_urls``
+        delta guard in :meth:`_write_all_url_snapshot`: ``self.url_meta`` only
+        grows, so re-importing it whole on every batch is O(N^2). import_meta_dict
+        is ON CONFLICT DO UPDATE / COALESCE, so the terminal full backstop
+        re-writes nothing new — the persisted end state is byte-identical.
+        """
+        db = getattr(self, "_metadata_db", None)
+        if db is None:
+            return
+        flushed = getattr(self, "_flushed_meta_pids", None)
+        if flushed is None:
+            flushed = set()
+            self._flushed_meta_pids = flushed
+        if full:
+            mirror_meta_dict_to_db(db, self.url_meta)
+            flushed.update(self.url_meta.keys())
+            return
+        sub = {p: self.url_meta[p] for p in self.url_meta if p not in flushed}
+        if not sub:
+            return
+        mirror_meta_dict_to_db(db, sub)
+        flushed.update(sub.keys())
 
-    def _persist_url_meta_with_fallback(self):
+    def _flush_url_meta_snapshot(self, *, full=False):
+        self._mirror_url_meta_to_db(full=full)
+
+    def _persist_url_meta_with_fallback(self, pid_key=None):
+        """Flush metadata to the DB.
+
+        When ``pid_key`` is given (the per-GIF cookie-usage path), import just
+        that single re-stamped PID's row; otherwise fall back to the periodic
+        delta flush. The row is force-imported (and re-added to the flushed set)
+        so a cookie_used update on an already-flushed PID is not skipped.
+        """
+        if pid_key is not None and pid_key in self.url_meta:
+            db = getattr(self, "_metadata_db", None)
+            if db is None:
+                return
+            flushed = getattr(self, "_flushed_meta_pids", None)
+            if flushed is None:
+                flushed = set()
+                self._flushed_meta_pids = flushed
+            mirror_meta_dict_to_db(db, {pid_key: self.url_meta[pid_key]})
+            flushed.add(pid_key)
+            return
         self._mirror_url_meta_to_db()
 
     def _write_all_url_file(self, urls, reason="unknown"):
@@ -314,7 +356,8 @@ class _Step3PersistenceMixin:
             return False
 
     def _persist_step3_url_meta(self):
-        self._mirror_url_meta_to_db()
+        # Terminal Step-3-complete flush: full-dict backstop.
+        self._mirror_url_meta_to_db(full=True)
 
     def _drain_queue_to_text_file(self, queue, file_name, mode_append=True):
         """Drain a Queue and append/write its items to a text file.
