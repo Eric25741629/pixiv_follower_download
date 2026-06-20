@@ -202,6 +202,43 @@ def test_timetag_blocks_disjoint_and_contiguous_across_threads():
     assert set(results["X"]).isdisjoint(set(results["Y"]))        # no interleave
 
 
+def test_run_end_to_end_concurrent_emits_terminal(monkeypatch):
+    """run() with combined_workers>1 + >=2 accounts drives the concurrent
+    coordinator end to end and still emits the terminal finished + next=-1."""
+    t = _thread(workers=2)
+    a, b = AccountState("c1", "A"), AccountState("c2", "B")
+    t._pause_event.set()
+    t._scheduler = AccountScheduler([a, b], lambda: 0, t._pause_event, t._stop_event)
+    monkeypatch.setattr(t, "_build_work_lists", lambda: (["1", "2", "3", "4"], []))
+    processed, plock = [], threading.Lock()
+
+    def core(pid, nq, **kw):
+        with plock:
+            processed.append(pid)
+        return [], True
+
+    monkeypatch.setattr(t, "_process_one_pid_core", core)
+    t.run()
+    assert sorted(processed) == ["1", "2", "3", "4"]
+    evs = _drain(t._q)
+    assert any(e.type == "finished" for e in evs)
+    assert any(e.type == "next" and e.data == -1 for e in evs)
+
+
+def test_run_sequential_when_single_worker(monkeypatch):
+    """combined_workers=1 keeps the sequential loop even with many accounts."""
+    t = _thread(workers=1)
+    a, b = AccountState("c1", "A"), AccountState("c2", "B")
+    t._pause_event.set()
+    t._scheduler = AccountScheduler([a, b], lambda: 0, t._pause_event, t._stop_event)
+    monkeypatch.setattr(t, "_build_work_lists", lambda: (["1", "2"], []))
+    calls = []
+    monkeypatch.setattr(t, "_run_sequential", lambda order, total: calls.append("seq") or [])
+    monkeypatch.setattr(t, "_run_concurrent", lambda *a, **k: calls.append("conc") or [])
+    t.run()
+    assert calls == ["seq"]
+
+
 def test_sequential_path_unaffected_by_block_mechanism():
     """Without a reserved block, _jpg_advance_timetag keeps advancing the global
     counter by 1 s (legacy behaviour, zero regression)."""
