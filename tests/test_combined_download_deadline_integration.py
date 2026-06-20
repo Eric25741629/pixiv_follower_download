@@ -43,7 +43,7 @@ def test_deadline_inside_pid_group_returns_faillist_not_raise():
     d = _downloader()
     url = "https://i.pximg.net/img/55501_p0.jpg"
 
-    def boom(u, session, timetag):
+    def boom(u, session, timetag, meta_cache=None):
         raise DownloadDeadlineExceeded("wedged")
 
     d._jpg_attempt = boom
@@ -67,7 +67,7 @@ def test_stop_inside_pid_group_leaves_pending_not_failed():
         d.q = Queue()
     url = "https://i.pximg.net/img/55502_p0.jpg"
 
-    def stopped(u, session, timetag):
+    def stopped(u, session, timetag, meta_cache=None):
         raise DownloadStopped()
 
     d._jpg_attempt = stopped

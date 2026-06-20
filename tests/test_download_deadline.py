@@ -134,7 +134,7 @@ def test_jpg_download_deadline_returns_faillist_without_retry():
     w = _mk()
     calls = []
 
-    def fake_attempt(url, session, timetag):
+    def fake_attempt(url, session, timetag, meta_cache=None):
         calls.append(1)
         raise DownloadDeadlineExceeded("wedged")
 
@@ -148,7 +148,7 @@ def test_jpg_download_deadline_returns_faillist_without_retry():
 def test_jpg_download_stop_propagates_not_faillist():
     w = _mk()
 
-    def fake_attempt(url, session, timetag):
+    def fake_attempt(url, session, timetag, meta_cache=None):
         raise DownloadStopped()
 
     w._jpg_attempt = fake_attempt

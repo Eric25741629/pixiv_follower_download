@@ -430,10 +430,45 @@ class _Step4MediaMixin:
             raise
         return size_box[0]
 
-    def _jpg_attempt(self, url, session, timetag):
-        """One download attempt. Returns 0 on success, None on a recoverable error."""
+    def _jpg_resolve_meta(self, url, meta_cache=None):
+        """Resolve PID / cookie / need_cookie / artwork meta for one page.
+
+        The read-only meta lookups — the ``_get_meta`` inside
+        ``_resolve_pid_and_cookie`` plus the ``_load_artwork_metadata`` SELECT
+        (~2× ``get_meta`` per page) — are the expensive part and are MEMOISED in
+        ``meta_cache`` (a 1-slot mutable list) so they run exactly once per page
+        across all of ``jpg_download``'s up-to-5 retry attempts instead of once
+        per attempt. The cheap, per-attempt SIDE EFFECT formerly inside
+        ``_resolve_pid_and_cookie`` — the ``_record_cookie_usage`` counter bump —
+        is replayed on every call so its per-attempt timing is byte-for-byte
+        preserved (it is PID-deduped per stage, so replay is idempotent).
+
+        ``meta_cache is None`` (e.g. a direct unit-test call to ``_jpg_attempt``)
+        resolves fresh every call, exactly like the original inline code.
+
+        Returns ``(pid, pid_cookie, need_cookie, normalized)``.
+        """
+        if meta_cache is not None and meta_cache:
+            pid, pid_cookie, need_cookie, normalized = meta_cache[0]
+            # Per-attempt side effect that previously lived in
+            # _resolve_pid_and_cookie — re-run only the cookie-usage counter
+            # bump (no meta re-read). Idempotent (PID-deduped per stage).
+            self._record_cookie_usage("step4", pid, pid_cookie)
+            return pid, pid_cookie, need_cookie, normalized
         pid, pid_cookie, need_cookie = self._resolve_pid_and_cookie(url, source="step4")
         normalized = self._load_artwork_metadata(pid, pid_cookie)
+        if meta_cache is not None:
+            meta_cache.append((pid, pid_cookie, need_cookie, normalized))
+        return pid, pid_cookie, need_cookie, normalized
+
+    def _jpg_attempt(self, url, session, timetag, meta_cache=None):
+        """One download attempt. Returns 0 on success, None on a recoverable error.
+
+        ``meta_cache`` is an optional 1-slot list (supplied by ``jpg_download``)
+        that memoises the read-only meta resolution across retry attempts; when
+        absent the resolution is computed fresh, identical to the original.
+        """
+        pid, pid_cookie, need_cookie, normalized = self._jpg_resolve_meta(url, meta_cache)
         if not normalized:
             raise ValueError("Pixiv_info 回傳格式異常")
         tag, like, pagecount, img_url = normalized
@@ -472,9 +507,15 @@ class _Step4MediaMixin:
     def jpg_download(self, url, session=None):
         timetag = self._jpg_advance_timetag()
         last_err = None
+        # 1-slot cache: the read-only meta resolution (dict + SQLite SELECT,
+        # ~2× get_meta per page) runs on the FIRST attempt and is reused on
+        # retries, instead of repeating on every one of the up-to-5 attempts.
+        # Resolution stays lazy/inside _jpg_attempt so a stubbed attempt that
+        # raises up front still raises before any meta read (order preserved).
+        meta_cache = []
         for i in range(0, 5):  # 最多重試 5 次，失敗就回傳錯誤
             try:
-                return self._jpg_attempt(url, session, timetag)
+                return self._jpg_attempt(url, session, timetag, meta_cache)
             except (requests.exceptions.ProxyError,
                     requests.exceptions.ConnectTimeout,
                     requests.exceptions.ConnectionError):
