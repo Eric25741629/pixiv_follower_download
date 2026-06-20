@@ -151,20 +151,26 @@ def _fmt_from_path_or_url(file_path, url) -> str:
 
 
 def _build_page_path_index(download_path):
-    """Walk ``download_path`` once, mapping ``(pid, page_index) -> abs path``.
+    """Walk ``download_path`` once, mapping ``(pid, page_index) -> abs path`` and
+    collecting stale ``.part`` temp files left by a force-killed atomic write.
 
-    Reuses the canonical filename parser so it understands every on-disk
-    naming form. Returns an empty dict when the folder is missing.
+    Reuses the canonical filename parser so it understands every on-disk naming
+    form. Returns ``(index, part_files)``; both empty when the folder is missing.
+    One walk serves both so a 200k-file folder is scanned only once.
     """
     from app.core.pid_filesystem import extract_pid_pages
     index: dict[tuple[str, int], str] = {}
+    part_files: list[str] = []
     if not download_path or not os.path.isdir(download_path):
-        return index
+        return index, part_files
     for dirpath, _dirs, files in os.walk(download_path):
         for fn in files:
+            if fn.endswith(".part"):
+                part_files.append(os.path.join(dirpath, fn))
+                continue
             for pid, page in extract_pid_pages(fn):
                 index.setdefault((str(pid), int(page)), os.path.join(dirpath, fn))
-    return index
+    return index, part_files
 
 
 def _resolve_page_file(pid, page_index, url, file_path, path_index):
@@ -182,7 +188,7 @@ def _cmd_verify_files(args) -> int:
     db = MetadataDB(base)
     try:
         pages = db.get_downloaded_pages()
-        path_index = _build_page_path_index(download_path)
+        path_index, part_files = _build_page_path_index(download_path)
         ok = truncated = missing = 0
         bad_pages: list[tuple[str, int]] = []
         for pid, page_index, url, file_path in pages:
@@ -206,6 +212,14 @@ def _cmd_verify_files(args) -> int:
             for pid, page_index in bad_pages:
                 db.mark_page_pending(pid, page_index)
             reset = len(bad_pages)
+        # Stale .part temp files (force-kill mid-stream leaves the atomic-write
+        # temp behind; each run uses a new timetag name so they accumulate).
+        removed_part_files = 0
+        if args.fix:
+            for pf in part_files:
+                with contextlib.suppress(Exception):
+                    os.remove(pf)
+                    removed_part_files += 1
     finally:
         db.close()
     payload = {
@@ -214,6 +228,8 @@ def _cmd_verify_files(args) -> int:
         "truncated": truncated,
         "missing": missing,
         "reset": reset,
+        "part_files": len(part_files),
+        "removed_part_files": removed_part_files,
         "download_path": download_path,
     }
     if args.json:
@@ -222,7 +238,8 @@ def _cmd_verify_files(args) -> int:
         print(
             f"已下載頁數={payload['downloaded_pages']} 完整(ok)={ok} "
             f"截斷(truncated)={truncated} 遺失(missing)={missing} "
-            f"已重設待下載(reset)={reset}",
+            f"已重設待下載(reset)={reset} "
+            f"殘留.part={len(part_files)} 已清除.part={removed_part_files}",
             file=sys.stderr,
         )
     return 0

@@ -24,6 +24,8 @@ import zipfile
 import requests
 from PIL import Image
 
+from app.core.image_integrity import validate_image_file
+
 from app.core.pixiv_thread_base import (
     DOWNLOAD_CONNECT_TIMEOUT,
     DOWNLOAD_READ_TIMEOUT,
@@ -462,6 +464,16 @@ class _Step4MediaMixin:
         target_dir = self._resolve_download_target_dir(str(tag), pid)
         filepath = os.path.join(target_dir, name)
         size = self._jpg_stream_to_disk(htmlfile, filepath)
+        # Integrity gate: a header-OK / footer-missing file is the truncated-
+        # download signature (a server that closes cleanly after a short body —
+        # the .part->os.replace already prevents partial *writes*). Remove it and
+        # raise so jpg_download's existing 5-attempt loop retries; on exhaustion
+        # the page settles to the fail-list and stays pending for the next run.
+        ok_valid, reason = validate_image_file(filepath, picture_format)
+        if not ok_valid:
+            with contextlib.suppress(Exception):
+                os.remove(filepath)
+            raise ValueError(f"下載檔不完整：{reason}")
         self._apply_download_mtime(filepath, timetag)
         if self._stats_collector is not None:
             self._stats_collector.report_bytes(size)

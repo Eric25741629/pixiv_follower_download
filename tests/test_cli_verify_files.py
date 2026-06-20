@@ -111,6 +111,50 @@ def test_verify_files_uses_db_file_path_when_present(monkeypatch, tmp_path):
     assert payload["missing"] == 0
 
 
+def test_verify_files_reports_stale_part_without_fix(monkeypatch, tmp_path):
+    """A force-kill mid-stream leaves a `.part`; report it but don't delete
+    without --fix."""
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    base, dl, db = _seed(tmp_path)
+    _set_download_path(base, dl)
+    db.close()
+    part = os.path.join(dl, "_PID9999p0_x.jpg.part")
+    with open(part, "wb") as f:
+        f.write(b"\xff\xd8\xff\xe0partial")
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = commands.main(["verify-files", "--json"])
+    assert rc == 0
+    payload = json.loads(out.getvalue())
+    assert payload["part_files"] == 1
+    assert payload["removed_part_files"] == 0
+    assert os.path.isfile(part)  # not deleted without --fix
+
+
+def test_verify_files_fix_removes_stale_part(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    base, dl, db = _seed(tmp_path)
+    _set_download_path(base, dl)
+    db.close()
+    sub = os.path.join(dl, "nested")
+    os.makedirs(sub, exist_ok=True)
+    p1 = os.path.join(dl, "a.jpg.part")
+    p2 = os.path.join(sub, "b.png.part")
+    for p in (p1, p2):
+        with open(p, "wb") as f:
+            f.write(b"partial")
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = commands.main(["verify-files", "--fix", "--json"])
+    assert rc == 0
+    payload = json.loads(out.getvalue())
+    assert payload["part_files"] == 2
+    assert payload["removed_part_files"] == 2
+    assert not os.path.isfile(p1) and not os.path.isfile(p2)
+
+
 def test_verify_files_human_output_to_stderr(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("APPDATA", str(tmp_path))
     base, dl, db = _seed(tmp_path)
