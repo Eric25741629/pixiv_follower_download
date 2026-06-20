@@ -42,12 +42,17 @@ def test_multiline_field():
 
 
 def test_dropdown_builds_options_from_tuples():
+    handler = lambda e: None
     d = c.dropdown(T, label="來源", value="following",
-                   options=[("following", "追隨"), ("bookmarks", "收藏")], width=220)
+                   options=[("following", "追隨"), ("bookmarks", "收藏")], width=220,
+                   on_select=handler, text_size=11)
     assert isinstance(d, ft.Dropdown)
     assert d.value == "following" and d.width == 220
     assert [o.key for o in d.options] == ["following", "bookmarks"]
     assert d.border_color == T.panel_border and d.focused_border_color == T.accent
+    # Flet 0.84 Dropdown's change handler is on_select, NOT on_change.
+    assert d.on_select is handler
+    assert d.text_size == 11
 
 
 def test_switch():

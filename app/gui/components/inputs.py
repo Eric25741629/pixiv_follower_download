@@ -48,13 +48,20 @@ def multiline_field(theme: GlassTheme, *, label, value="", min_lines=4,
 
 
 def dropdown(theme: GlassTheme, *, label, value, options, width=220,
-             on_change=None) -> ft.Dropdown:
-    """``options`` is a list of ``(key, label)`` tuples."""
+             on_select=None, text_size=None, content_padding=None) -> ft.Dropdown:
+    """``options`` is a list of ``(key, label)`` tuples.
+
+    Flet 0.84's Dropdown change handler is ``on_select`` (it has NO ``on_change``
+    attribute — setting one is a silent no-op), so callers pass ``on_select``.
+    """
     opts = [ft.dropdown.Option(key, text) for (key, text) in options]
-    # Flet 0.84's Dropdown rejects on_change in __init__ — set it post-construct.
     ctl = ft.Dropdown(label=label, value=str(value), options=opts, width=width)
-    if on_change is not None:
-        ctl.on_change = on_change
+    if on_select is not None:
+        ctl.on_select = on_select
+    if text_size is not None:
+        ctl.text_size = text_size
+    if content_padding is not None:
+        ctl.content_padding = content_padding
     ctl.border_color = theme.panel_border
     ctl.focused_border_color = theme.accent
     return ctl
