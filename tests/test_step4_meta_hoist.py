@@ -25,6 +25,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.core.thread_download import download_thread
 
+# A minimal VALID JPEG (header + padding + footer, >= MIN_IMAGE_BYTES=64) so the
+# download-integrity validator (validate_image_file, merged from
+# feat/download-integrity) accepts the body. These tests assert meta-resolution
+# COUNT, not body content — they only need a body that isn't rejected as a
+# truncated/invalid image.
+_VALID_JPEG = b"\xff\xd8\xff" + b"\x00" * 70 + b"\xff\xd9"
+
 
 class _CountingDB:
     """Stand-in for ``self._metadata_db`` that counts ``get_meta`` SELECTs."""
@@ -44,7 +51,7 @@ class _CountingDB:
 class _FakeResp:
     """A streamable 200 response yielding a fixed body."""
 
-    def __init__(self, body=b"IMGDATA"):
+    def __init__(self, body=_VALID_JPEG):
         self._body = body
         self.status_code = 200
         self.closed = False
@@ -62,7 +69,7 @@ class _FakeResp:
 class _FakeSession:
     """``get`` raises a retryable error ``fail_times`` times, then returns 200."""
 
-    def __init__(self, fail_times=0, body=b"IMGDATA"):
+    def __init__(self, fail_times=0, body=_VALID_JPEG):
         self.fail_times = fail_times
         self._body = body
         self.get_calls = 0
@@ -145,7 +152,7 @@ def test_clean_single_attempt_resolves_meta_once_and_downloads(tmp_path):
     """A clean first-attempt download resolves meta once and writes the file."""
     db = _CountingDB(_DB_META)
     w = _make_worker(db, tmp_path)
-    session = _FakeSession(fail_times=0, body=b"PIXELS")
+    session = _FakeSession(fail_times=0, body=_VALID_JPEG)
 
     result = w.jpg_download(_URL, session=session)
 
@@ -157,7 +164,7 @@ def test_clean_single_attempt_resolves_meta_once_and_downloads(tmp_path):
     # The file landed under the resolved target dir with the page/ext preserved.
     written = list(tmp_path.glob("*.jpg"))
     assert len(written) == 1, "exactly one jpg written"
-    assert written[0].read_bytes() == b"PIXELS"
+    assert written[0].read_bytes() == _VALID_JPEG
 
 
 def test_micro_benchmark_get_meta_calls_constant_vs_attempts(tmp_path):
