@@ -192,6 +192,16 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
          self._cookie_alias_map, self.cookies) = init_cookie_fields(cookies)
         self._pid_cookie_selection = {}
         self._current_account_local = threading.local()
+        # Per-thread reserved timetag block (combined concurrent mode). When a
+        # worker reserves a contiguous block before a PID's pages, _jpg_advance_
+        # timetag hands out base+0, base+1, ... so one PID's pages keep
+        # contiguous (non-interleaved) timetags even while other PIDs download
+        # concurrently. Unset -> the legacy global +1s path (sequential modes).
+        self._timetag_block_local = threading.local()
+        # Serializes _apply_live_settings_if_changed's multi-attribute write so
+        # K concurrent download workers (Step 4 pool mode AND combined parallel)
+        # can't tear it when the user saves settings mid-run.
+        self._live_apply_lock = threading.Lock()
         self.agent = agent
         self.download_time = (download_time if isinstance(download_time, datetime.datetime)
                               else datetime.datetime(1970, 1, 1))
@@ -281,8 +291,27 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         if live is None:
             return
         sig = live.signature()
+        # Cheap early-out (GIL-atomic read) — the common no-mid-run-save case,
+        # so the lock below is uncontended on the hot path.
         if sig == getattr(self, "_live_sig", None):
             return
+        # Serialize the multi-attribute apply: Step 4 pool mode AND combined
+        # concurrent mode call this from K worker threads. Without the lock two
+        # workers could both pass the signature check on a mid-run 「儲存設定」 and
+        # tear the ~25 shared-attr writes / race _pid_filter_decision.clear().
+        # Lazy fallback for __new__-constructed instances (tests) that skip
+        # __init__; production always sets it in __init__ before any worker runs.
+        lock = getattr(self, "_live_apply_lock", None)
+        if lock is None:
+            lock = self._live_apply_lock = threading.Lock()
+        with lock:
+            if sig == getattr(self, "_live_sig", None):
+                return  # another worker already applied this signature
+            self._apply_live_settings_locked(live, sig)
+
+    def _apply_live_settings_locked(self, live, sig):
+        """Apply the new live settings; caller holds ``_live_apply_lock`` and has
+        double-checked the signature."""
         s = live.sections()
         self._live_sig = sig
         dl = s.get("download", {}) or {}

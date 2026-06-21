@@ -106,6 +106,13 @@ class SettingsView(_SettingsHandlersMixin):
             value=bool(dl.get("combined_mode", False)),
             tooltip="開啟後，步驟 3 會逐一查詢 PID 並立即下載該 PID 的頁面（查詢與下載共用同一次帳號冷卻）；同時自動吸收上次未完成的下載",
         )
+        self._tf_combined_workers = ft.TextField(
+            label="邊查邊下並發數（1=循序）",
+            value=str(dl.get("combined_workers", 1)),
+            width=200,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            tooltip="邊查邊下時同時處理幾個 PID。1=循序（零回歸）。實際並發數受有效 Cookie 數與待處理量限制（每條並發各用一個 Cookie/Proxy），上限 16。多 Cookie 時調高可成倍加速。",
+        )
         self._sw_force_rescan = ft.Switch(
             label="強制重新掃描全部畫家（忽略30天，一次性）",
             value=bool(dl.get("force_full_rescan", False)),
@@ -439,6 +446,7 @@ class SettingsView(_SettingsHandlersMixin):
             "tag_strip_special_chars": bool(self._sw_tag_strip_special_chars.value),
             "author_order": bool(self._sw_author_order.value),
             "combined_mode": bool(self._sw_combined_mode.value),
+            "combined_workers": max(1, _safe_int(self._tf_combined_workers.value, 1)),
             "source_mode": str(self._dd_source_mode.value or "following"),
             "following_scope": str(self._dd_following_scope.value or "all"),
             "bookmark_scope": str(self._dd_bookmark_scope.value or "all"),
@@ -631,6 +639,7 @@ class SettingsView(_SettingsHandlersMixin):
                         wrap=True,
                     ),
                     self._sw_combined_mode,
+                    ft.Row([self._tf_combined_workers], spacing=16, wrap=True),
                     self._sw_author_order,
                     self._sw_force_rescan,
                 ]),

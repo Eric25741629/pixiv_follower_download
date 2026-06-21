@@ -312,9 +312,7 @@ class _Step4MediaMixin:
             url = download_url
             http = session if session is not None else requests
             headers = self._build_artwork_headers(pid, pid_cookie, need_cookie, honour_pid_used=True)
-            with self.timelock:
-                my_time = self.download_time
-                self.download_time = self.download_time + datetime.timedelta(seconds=1)
+            my_time = self._reserve_one_timetag()
             zip_bytes = self._stream_ugoira_zip_bytes(url, headers, http, pid_cookie)
             if not zip_bytes:
                 return [url, my_time.strftime('%Y%m%d_%H%M%S')]
@@ -351,12 +349,52 @@ class _Step4MediaMixin:
         '(KHTML, like Gecko) Chrome/99.0.4844.82 Safari/537.36'
     )
 
-    def _jpg_advance_timetag(self):
-        """Reserve and return a unique timetag for this download (timelock-guarded)."""
+    def _begin_pid_timetag_block(self, n):
+        """Reserve a contiguous block of ``n`` timetags for the calling thread.
+
+        Combined concurrent mode calls this before a PID's pages so the pages
+        get base+0..base+n-1 (contiguous, non-interleaved) even while other
+        PIDs download on other threads. The global ``download_time`` jumps past
+        the whole block under ``timelock``, so concurrent reservations are
+        mutually exclusive and the persisted high-water never rewinds.
+        """
+        try:
+            count = max(0, int(n))
+        except Exception:
+            count = 0
         with self.timelock:
-            timetag = self.download_time.strftime('%Y%m%d_%H%M%S')
+            base = self.download_time
+            self.download_time = self.download_time + datetime.timedelta(seconds=count or 1)
+        self._timetag_block_local.base = base
+        self._timetag_block_local.next = 0
+
+    def _end_pid_timetag_block(self):
+        """Drop the calling thread's reserved block (revert to the global path)."""
+        with contextlib.suppress(AttributeError):
+            del self._timetag_block_local.base
+        with contextlib.suppress(AttributeError):
+            del self._timetag_block_local.next
+
+    def _reserve_one_timetag(self):
+        """Next datetime to stamp this file with.
+
+        Block reserved on this thread -> hand out base+offset (no global
+        advance, contiguous per PID). Otherwise advance the global counter by
+        1 s under ``timelock`` (legacy sequential behaviour, byte-identical)."""
+        local = getattr(self, "_timetag_block_local", None)
+        base = getattr(local, "base", None) if local is not None else None
+        if base is not None:
+            off = getattr(local, "next", 0)
+            local.next = off + 1
+            return base + datetime.timedelta(seconds=off)
+        with self.timelock:
+            my_time = self.download_time
             self.download_time += datetime.timedelta(seconds=1)
-        return timetag
+        return my_time
+
+    def _jpg_advance_timetag(self):
+        """Reserve and return a unique timetag for this download."""
+        return self._reserve_one_timetag().strftime('%Y%m%d_%H%M%S')
 
     @staticmethod
     def _jpg_extract_page_and_format(url):
