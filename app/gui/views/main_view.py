@@ -5,6 +5,7 @@ import threading
 import flet as ft
 
 from app.core.worker_event import WorkerEvent
+from app.gui import components as c
 from app.gui.glass import (
     current_theme,
     glass_dialog,
@@ -572,10 +573,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         log_area = glass_panel(
             ft.Column(
                 controls=[
-                    ft.Text(
-                        "即時 Log", size=12, weight=ft.FontWeight.BOLD,
-                        color=theme.text_primary,
-                    ),
+                    c.subhead(theme, "即時 Log"),
                     self._log_panel.control,
                 ],
                 expand=True,

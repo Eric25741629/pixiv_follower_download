@@ -7,6 +7,7 @@ from typing import Any
 import flet as ft
 
 from app.core.stats_collector import StatsCollector
+from app.gui import components as c
 from app.gui.glass import current_theme, glass_panel
 
 _MAX_BAR_PX = 300
@@ -44,10 +45,10 @@ class StatsView:
         # Flet 0.84's Tabs requires TabBar+TabBarView with separate content
         # bodies. Both modes here share one body, so a plain button toggle
         # is cleaner than forcing the new Tabs structure.
-        self._btn_session = ft.FilledButton(
+        self._btn_session = c.primary_button(
             "本次執行", on_click=lambda e: self._switch_mode("session"),
         )
-        self._btn_lifetime = ft.OutlinedButton(
+        self._btn_lifetime = c.secondary_button(
             "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
         )
         self._mode_toggle = ft.Row(
@@ -62,14 +63,14 @@ class StatsView:
         # Swap which side is FilledButton (active). Flet 0.84 doesn't let
         # us morph button types, so we just toggle them as filled/outlined
         # via Row controls reassignment.
-        self._btn_session = ft.FilledButton(
+        self._btn_session = c.primary_button(
             "本次執行", on_click=lambda e: self._switch_mode("session"),
-        ) if is_session else ft.OutlinedButton(
+        ) if is_session else c.secondary_button(
             "本次執行", on_click=lambda e: self._switch_mode("session"),
         )
-        self._btn_lifetime = ft.OutlinedButton(
+        self._btn_lifetime = c.secondary_button(
             "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
-        ) if is_session else ft.FilledButton(
+        ) if is_session else c.primary_button(
             "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
         )
         self._mode_toggle.controls = [self._btn_session, self._btn_lifetime]
@@ -80,6 +81,7 @@ class StatsView:
         self._refresh_now()
 
     def build(self) -> ft.Container:
+        theme = current_theme(self._page)
         cards = self._build_cards()
         chart_section = ft.Column(
             controls=[
@@ -91,7 +93,7 @@ class StatsView:
         return ft.Container(
             content=ft.Column(
                 controls=[
-                    ft.Text("統計資料", size=20, weight=ft.FontWeight.BOLD),
+                    c.page_title(theme, "統計資料"),
                     self._mode_toggle,
                     cards,
                     ft.Divider(),
