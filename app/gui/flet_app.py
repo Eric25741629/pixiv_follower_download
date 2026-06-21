@@ -263,6 +263,13 @@ def main(page: ft.Page) -> None:
     init_logging()
     _install_crash_hooks()
     _install_signal_handlers()
+    # Per-event UI trace (ui_events.log) is opt-in: skip its per-event regex +
+    # synchronous file write on the dispatcher hot path unless explicitly enabled.
+    with contextlib.suppress(Exception):
+        from app.core import diag_log
+        diag_log.configure_ui_trace(
+            bool(_settings_store().get_section("diagnostics").get("verbose_logs", False))
+        )
     _log.info(
         "main(page) session start: web=%s platform=%s",
         getattr(page, "web", "?"),

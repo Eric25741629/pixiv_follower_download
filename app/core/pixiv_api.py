@@ -25,8 +25,58 @@ def make_session(proxy_url: "str | None" = None) -> requests.Session:
 
 # 子執行緒的工作函數
 import re
+import threading
 
 from app.core.pixiv_thread_utils import safe_read_json
+
+
+# ── pixiv_cookie_requirement.json process cache ───────────────────────────────
+# ``get_pixiv_cookie_requirement`` is called per-page on the combined-mode
+# download leg (``thread_download._resolve_pid_and_cookie``) whenever a PID's
+# cached meta has no ``requires_cookie`` value, and can repeat inside the JPEG
+# retry loop. Each call previously ``safe_read_json``'d the ENTIRE file. This
+# process-global cache mirrors the ``closed_artwork_set`` pattern in
+# ``metadata_db_closed_set.py``: it keys on a cheap (size, mtime_ns) file
+# signature and re-reads/parses only when the signature changes. A missing
+# file maps to an empty dict, and the signature distinguishes
+# deletion/creation/modification so the cache invalidates automatically with
+# no manual reset to get wrong.
+_COOKIE_REQUIREMENT_CACHE: "dict[str, tuple]" = {}
+_COOKIE_REQUIREMENT_CACHE_LOCK = threading.RLock()
+
+
+def _cookie_requirement_file_signature(path):
+    """Cheap change signature: (size, mtime_ns) of the JSON file.
+
+    One ``os.stat`` call, no file read. ``None`` for a missing file so a
+    not-yet-created and a freshly-deleted file compare distinctly.
+    """
+    try:
+        st = os.stat(path)
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _load_cookie_requirement_map(path):
+    """Return the parsed ``pixiv_cookie_requirement.json`` dict, process-cached.
+
+    Re-reads + parses only when the file signature changes; otherwise serves
+    the previously parsed dict. The returned dict is shared (read-only by
+    callers); a non-dict / missing file yields an empty dict.
+    """
+    key = os.path.normcase(os.path.normpath(path))
+    sig = _cookie_requirement_file_signature(path)
+    with _COOKIE_REQUIREMENT_CACHE_LOCK:
+        cached = _COOKIE_REQUIREMENT_CACHE.get(key)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+    data = safe_read_json(path, None)
+    if not isinstance(data, dict):
+        data = {}
+    with _COOKIE_REQUIREMENT_CACHE_LOCK:
+        _COOKIE_REQUIREMENT_CACHE[key] = (sig, data)
+    return data
 
 
 def _extract_artwork_body(payload):
@@ -461,8 +511,8 @@ def get_pixiv_cookie_requirement(pid):
     """回傳指定 PID 最近一次是否需要 cookie，找不到時回傳 None。"""
     try:
         trace_path = os.path.join(os.getenv('APPDATA')+r'/pixiv_download/', 'pixiv_cookie_requirement.json')
-        data = safe_read_json(trace_path, None)
-        if not isinstance(data, dict):
+        data = _load_cookie_requirement_map(trace_path)
+        if not data:
             return None
         pid_key = _normalize_artwork_id(pid)
         entry = data.get(str(pid_key))

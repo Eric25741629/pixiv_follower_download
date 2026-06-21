@@ -204,6 +204,13 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         self._step3_wait_applied_count = 0
         self._step3_query_notice_every = 200
         self.url_meta = {}
+        # PIDs whose url_meta row has already been mirrored to the SQLite cache
+        # this run. Mirrors the _flushed_urls delta guard in _write_all_url_snapshot:
+        # periodic/per-GIF flushes import only the un-flushed delta instead of the
+        # whole (only-growing) dict, collapsing the O(N^2) re-import into O(N).
+        # import_meta_dict is ON CONFLICT DO UPDATE / COALESCE, so the terminal
+        # full-dict backstops re-write nothing new and the end state is identical.
+        self._flushed_meta_pids = set()
         self.url_meta_path = os.path.join(self.path, "all_url_meta.json")
         self._pid_cache_hit = {}
         self._log_step3_cache_detail = False
@@ -429,19 +436,19 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         if not used_flag:
             return
         self._stamp_gif_cookie_usage_in_meta(pid_key, source)
-        self._persist_url_meta_with_fallback()
+        self._persist_url_meta_with_fallback(pid_key=pid_key)
         self._emit_gif_cookie_usage_signal(pid_key, source)
 
     def _on_pause_hook(self):
         self._flush_url_meta_snapshot()
 
     def _on_stop_hook(self):
-        self._flush_url_meta_snapshot()
+        self._flush_url_meta_snapshot(full=True)
 
     def flush_for_shutdown(self):
         """Synchronously persist in-flight metadata and close SQLite for window-close."""
         try:
-            self._flush_url_meta_snapshot()
+            self._flush_url_meta_snapshot(full=True)
         except Exception:
             pass
         db = getattr(self, "_metadata_db", None)
@@ -986,7 +993,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         try:
             flat_results = [x for item in results if isinstance(item, list) for x in item]
             old_urls, new_urls, merged = self._write_all_url_snapshot(flat_results, full=True)
-            self._flush_url_meta_snapshot()
+            self._flush_url_meta_snapshot(full=True)
             self._persist_pending_pid_file()  # Phase 36: ensure pending list is saved on stop
             self._flush_revoked_pid_file()
             self._emit_step3_filter_skip_final_summary()

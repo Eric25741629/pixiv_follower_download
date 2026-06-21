@@ -359,7 +359,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
     def _finalize(self, failed_nested):
         # Fetcher side: persist meta + revoked + pending list.
         with contextlib.suppress(Exception):
-            self.fetcher._flush_url_meta_snapshot()
+            self.fetcher._flush_url_meta_snapshot(full=True)
             self.fetcher._persist_pending_pid_file()
             self.fetcher._flush_revoked_pid_file()
         # Downloader side: failures only. We do NOT call
@@ -383,7 +383,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
 
     def flush_for_shutdown(self):
         with contextlib.suppress(Exception):
-            self.fetcher._flush_url_meta_snapshot()
+            self.fetcher._flush_url_meta_snapshot(full=True)
         db = getattr(self.fetcher, "_metadata_db", None)
         if db is not None:
             with contextlib.suppress(Exception):
