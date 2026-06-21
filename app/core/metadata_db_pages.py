@@ -386,6 +386,18 @@ class _PagesMixin:
         except Exception:
             return []
 
+    def get_downloaded_pages(self) -> list:
+        """Return [(pid, page_index, url, file_path), ...] for downloaded pages.
+
+        Used by the one-time integrity scan (``verify-files`` CLI) to check each
+        downloaded page's on-disk file. ``url`` / ``file_path`` may be ``None``.
+        """
+        cur = self._conn().execute(
+            "SELECT pid, page_index, url, file_path FROM pages "
+            "WHERE status='downloaded'"
+        )
+        return cur.fetchall()
+
     def get_retriable_failed_pages(
         self, *, max_attempts: int = 5, cooldown_hours: int = 24,
     ) -> list:
