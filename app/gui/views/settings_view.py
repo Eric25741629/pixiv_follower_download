@@ -10,6 +10,12 @@ from app import i18n
 import contextlib
 
 
+# Locale display names are endonyms (shown in their own language), not translated
+# per current UI locale. Codes come from i18n.available_locales(); unknown codes
+# fall back to the raw code so a newly-dropped-in locale still appears.
+_LOCALE_DISPLAY_NAMES = {"zh-TW": "中文（繁體）", "en": "English"}
+
+
 def _store() -> SettingsStore:
     path = os.getenv("APPDATA") + r"/pixiv_download/"
     os.makedirs(path, exist_ok=True)
@@ -61,7 +67,10 @@ class SettingsView(_SettingsHandlersMixin):
             theme,
             label=i18n.t("settings.lang.label"),
             value=str(ui.get("language", i18n.BASE_LOCALE) or i18n.BASE_LOCALE),
-            options=[("zh-TW", "中文（繁體）"), ("en", "English")],
+            options=[
+                (code, _LOCALE_DISPLAY_NAMES.get(code, code))
+                for code in i18n.available_locales()
+            ],
             width=220,
             on_select=self._on_language_select,
         )
