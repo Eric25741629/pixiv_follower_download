@@ -1,8 +1,14 @@
-# GUI 用語一致化與輕量視覺整理規格
+# GUI 用語一致化、多語系框架與輕量視覺整理規格
 
 日期：2026-06-26
 狀態：已與使用者確認方向，本文為實作前 spec
 取代：`docs/superpowers/specs/2026-06-26-settings-taxonomy-redesign-design.md`
+
+> 2026-06-26 增修：使用者要求把 i18n 多語系框架納入本次工作，作為實作順序第 2 步。
+> 本文原將「i18n 系統抽離」與「改 SettingsStore schema」列為非目標，現針對 i18n 翻案：
+> 採完整多語系框架（locale 檔 + `t()` 查找 + 語言設定 + fallback 鏈），完整填滿繁中、英文先留 fallback 空檔，
+> 並僅為此新增 `ui.language` 一個設定 key。生效時機為 apply-on-restart（不做 live 切換）。
+> 其餘範圍（不重做 glass、不改事件模型、不改下載 / 排程 / 統計邏輯）不變。詳見「i18n 多語系框架」章節。
 
 ## 目標
 
@@ -14,6 +20,7 @@
 
 這次工作包含：
 
+- i18n 多語系框架（完整框架 + 完整繁中 locale + 英文 fallback 空檔，作為全 GUI 文案的單一事實來源）
 - 四個主頁面的固定文案
 - 設定頁分類與欄位文案
 - 對話框 / 確認框 / Snackbar / 狀態提示
@@ -30,6 +37,10 @@
 4. 視覺改動等級為 **小幅 UI polish**：
    - 可以調整間距、資訊權重、面板內容排列、按鈕文字與狀態顯眼度
    - 不改主導航、不重做 glass theme、不改頁面架構
+5. **i18n 多語系框架納入本次範圍**（翻案決策）：
+   - 完整框架（locale 檔 + `t()` + 語言設定 + fallback 鏈），不是只做字串字典
+   - 完整填滿繁中 locale；英文先留 fallback 空檔（或僅少數示範 key）
+   - 僅新增 `ui.language` 一個設定 key；生效時機 apply-on-restart，不做 live 切換
 
 ## 現況問題
 
@@ -64,11 +75,11 @@
 ## 非目標
 
 - 不重做 liquid glass 視覺系統
-- 不新增新的導航層級或設定分頁
-- 不改 `SettingsStore` schema
+- 不新增新的導航層級或設定分頁（設定頁內新增一列「介面」不算新分頁）
+- 不改 `SettingsStore` schema（僅新增 `ui.language` 一個 key 例外，非破壞性，`_merge_defaults` 自動補舊檔）
 - 不改 `WorkerEvent` 事件模型
-- 不做 i18n 系統抽離
-- 不要求所有 core thread 訊息都抽成統一 message factory
+- （2026-06-26 翻案）i18n 多語系框架改列為**目標**，見「i18n 多語系框架」章節；但本次採 apply-on-restart，不做 live 切換、不做瀏覽器 / 系統語言自動偵測
+- 不要求所有 core thread 訊息都抽成統一 message factory（但 spec 列舉的使用者可見文案要走 `t()`）
 - 不改任何實際下載、排程、Cookie 配對、統計計算邏輯
 
 ## 全域文案規則
@@ -277,6 +288,50 @@
 - `禁用選取` -> `停用選取項目`
 - `自動配對` -> `自動配對 Proxy`
 
+## i18n 多語系框架
+
+本次新增，作為實作順序第 2 步。i18n 模組成為**所有使用者可見文案的單一事實來源**：本 spec 的用詞字典、各頁固定文案、執行記錄句型，全部以 locale dict 的值存在，view 與 core thread 一律從 `t()` 取字串，不再就地硬編碼。
+
+### 模組
+
+- 位置：`app/i18n.py`（放 app 套件根）。core thread 的執行記錄訊息與 gui view 都要翻譯，但 core 不可 import gui（層級方向），故不放 `app/gui/`；放套件根讓兩層都能 `from app.i18n import t`。
+- 相依：僅 stdlib（`json` + `pathlib`），約 30-40 行。
+- API（4 個函式）：
+  - `t(key, **kwargs) -> str`：查 current locale -> fallback `zh-TW` -> fallback key 本身；有 kwargs 時對命中的字串做 `str.format(**kwargs)`（狀態句模板用），format 失敗（缺參數）回傳未格式化字串，**絕不 raise**。
+  - `set_locale(code)`：設定 process-global 當前語言；`None` / 未知 code -> 退回 base。
+  - `get_locale() -> str`
+  - `available_locales() -> list[str]`：掃 `app/locales/*.json` 的檔名（stem）。
+
+### Locale 檔
+
+- `app/locales/zh-TW.json`：base locale，完整填滿本 spec 列舉的所有文案。
+- `app/locales/en.json`：fallback 空檔（`{}` 或僅少數示範 key，如導航、`執行全部步驟`），用來證明切換鏈與 fallback 可運作。
+- key 命名：dotted，依 surface 分群，例：`nav.home`、`nav.cookies`、`main.btn.run_all`、`settings.section.account`、`log.start.following`、`log.skip.like`。
+- 值內含模板參數時用 `{name}` 佔位（`str.format` 風格），例：`"log.skip.like": "略過 PID {pid}：未達最低讚數（{cur} / {need}）"`。
+
+### Fallback 鏈
+
+current -> `zh-TW`（base）-> key 本身。未翻譯的 en key 自動顯示繁中；缺 key 顯示 key 字串，永不 crash、永不空白。
+
+### 語言設定
+
+- `DEFAULTS["ui"]` 新增 `"language": "zh-TW"`（與既有 `theme_mode` 同屬 `ui` 區）。`_merge_defaults` 既有的 per-section `{**default, **raw}` 合併會自動補進舊 settings.json，無需 migration。
+- 設定頁最上方新增一個小「介面」列（獨立於 8 個內容區之外，屬 app 層級設定，概念上與 theme 同類），放語言下拉（`components.dropdown`，選項來自 `available_locales()` 對應顯示名：`中文（繁體）` / `English`），下拉旁顯示「重啟後生效」說明。
+- 不新增導航層級或設定分頁（此為區塊內一列，非新分頁，符合非目標）。
+
+### 生效時機：apply-on-restart
+
+- 改語言 -> 經 `settings_handlers` 存入 `ui.language` -> 顯示「重啟後生效」-> 下次啟動生效。
+- 不做 live 切換：4 個 view 在 `main()` 只建一次，live 切換需重建整棵 view 樹並重接 page，在 Flet 0.84 重排路徑風險高（可能觸發 session GC 殺掉執行中下載），且違背本次「不改頁面架構」範圍。theme 之所以能 live，是因為只重繪 chrome、不重建 view，層級不同。
+
+### 啟動接線
+
+`flet_app.main()` 在建立 `MainView` 之前呼叫 `i18n.set_locale(settings["ui"]["language"])`，使所有 view 在 build 時即取得正確語言。headless CLI（`app/cli/`）若有使用者可見輸出，同樣在進入點 set_locale。
+
+### 測試
+
+`tests/test_i18n.py`：fallback 鏈（current 命中 / 退 base / 退 key）、`str.format` 帶參數與缺參數、`available_locales()` 掃描、缺 key 回傳 key、`set_locale(None)` 退 base。
+
 ## 各頁規格
 
 ### A. 主頁（MainView）
@@ -322,6 +377,8 @@
 6. `標籤整理與缺值處理`
 7. `作品篩選條件`
 8. `格式轉換、效能與自動化`
+
+此外，設定頁最上方新增一個獨立的「介面」列（不計入上述 8 個內容區），放語言下拉 + 「重啟後生效」說明，詳見「i18n 多語系框架」章節。
 
 #### 設定頁重點文案調整
 
@@ -532,6 +589,16 @@
 
 ## 實作範圍對應檔案
 
+i18n 框架（新增 / 接線）：
+
+- `app/i18n.py`（新）
+- `app/locales/zh-TW.json`（新）
+- `app/locales/en.json`（新）
+- `tests/test_i18n.py`（新）
+- `app/core/settings_store.py`（`DEFAULTS["ui"]` 加 `language`）
+- `app/gui/flet_app.py`（啟動 `set_locale` + 導航文案路由）
+- `app/gui/views/settings_view.py` / `settings_handlers.py`（「介面」語言下拉 + 存檔）
+
 固定 UI 文案與版面整理，主要會落在：
 
 - `app/gui/views/main_view.py`
@@ -570,7 +637,10 @@
 4. 對話框、Snackbar、狀態標籤和執行記錄的語氣一致，皆採「技術詞保留，但更白話」。
 5. 執行記錄至少在「開始 / 略過 / 失敗 / 完成」四類訊息上採固定句型，不再是鬆散的工程輸出。
 6. 視覺調整只限於輕量 polish，不改整體畫面架構或功能流程。
-7. 這次整理不改設定 key、事件模型、下載流程與統計邏輯。
+7. 這次整理不改事件模型、下載流程與統計邏輯；設定 key 僅新增 `ui.language`（i18n 用），其餘不動。
+8. i18n 框架可運作：`t(key)` 命中 `zh-TW`、未翻譯 key fallback 回繁中、缺 key 回傳 key 本身；`tests/test_i18n.py` 綠燈。
+9. 設定頁有語言下拉，改語言存入 `ui.language` 並顯示「重啟後生效」；重啟後 GUI 文案隨 locale 切換。
+10. 使用者可見文案（spec 列舉範圍 + 動態執行記錄）透過 `t()` 取得，不再就地硬編碼。
 
 ## 與先前設定頁 spec 的關係
 
@@ -582,14 +652,11 @@
 
 ## 實作建議順序
 
-如果後續要實作，建議順序如下：
+i18n 模組是所有文案的單一事實來源，因此「就地改字串」一律改為「字串收進 locale dict，view / thread 從 `t()` 取」。建議順序：
 
-1. 先改全域高可見度名稱：
-   - 頁面標題
-   - 主要按鈕
-   - 區塊標題
-2. 再改設定頁 8 區結構與欄位文案
-3. 再改 Cookie / 統計 / 主頁的輕量排列與資訊權重
-4. 最後整理執行記錄訊息，優先清掉混語系與過短 debug 式輸出
+1. 鎖定並收斂全域高可見度名稱（§全域名稱對照、各頁固定文案）——這些名稱直接寫進 `zh-TW.json`，不在 view 裡改兩次。
+2. **建 i18n 框架**：`app/i18n.py` + `app/locales/{zh-TW,en}.json` + `ui.language` 設定 + 設定頁「介面」語言下拉 + `tests/test_i18n.py`；`main()` 接線；把主頁 / Cookie / 統計 / 導航的高可見度文案路由過 `t()`。
+3. 設定頁 8 區重構 + Cookie / 統計 / 主頁的輕量排列與資訊權重，文案一律走 `t()`。
+4. 最後整理執行記錄訊息（core threads）走 `t()` 並套狀態句模板，優先清掉混語系與過短 debug 式輸出。
 
-這樣可以把風險留在最低，並且讓測試與人工驗收都容易分段進行。
+這樣風險最低，並且讓測試與人工驗收都容易分段進行。
