@@ -135,6 +135,7 @@ DEFAULTS = {
     },
     "ui": {
         "theme_mode": "SYSTEM",  # "LIGHT" | "DARK" | "SYSTEM"
+        "language": "zh-TW",     # GUI locale; apply-on-restart. See app/i18n.py
     },
     "diagnostics": {
         # When true, the dispatcher writes the high-frequency per-event UI trace
