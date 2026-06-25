@@ -1,0 +1,14 @@
+{
+  "nav.home": "主頁",
+  "nav.settings": "設定",
+  "nav.cookies": "Cookie 管理",
+  "nav.stats": "執行統計",
+  "appbar.title": "Pixiv 下載器",
+  "theme.toggle_tooltip": "切換深淺色",
+  "settings.title": "設定",
+  "settings.section.interface": "介面",
+  "settings.lang.label": "顯示語言",
+  "settings.lang.restart_hint": "重啟後生效",
+  "main.btn.run_all": "執行全部步驟",
+  "log.skip.like": "略過 PID {pid}：未達最低讚數（{cur} / {need}）"
+}

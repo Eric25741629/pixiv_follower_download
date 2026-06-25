@@ -1,0 +1,12 @@
+{
+  "nav.home": "Home",
+  "nav.settings": "Settings",
+  "nav.cookies": "Cookies",
+  "nav.stats": "Statistics",
+  "appbar.title": "Pixiv Downloader",
+  "theme.toggle_tooltip": "Toggle light/dark",
+  "settings.title": "Settings",
+  "settings.section.interface": "Interface",
+  "settings.lang.label": "Display language",
+  "main.btn.run_all": "Run all steps"
+}
