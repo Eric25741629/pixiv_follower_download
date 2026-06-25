@@ -27,7 +27,7 @@ def _tile_titles(column):
     return titles
 
 
-def test_settings_view_uses_five_major_sections(tmp_path, monkeypatch):
+def test_settings_view_major_section_titles(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
     from app.gui.views.settings_view import SettingsView
 
@@ -35,7 +35,10 @@ def test_settings_view_uses_five_major_sections(tmp_path, monkeypatch):
 
     titles = _tile_titles(view.build())
 
+    # The i18n "介面" (language) row leads; the content sections follow.
+    # (The spec's 8-section restructure is a separate follow-on step.)
     assert titles == [
+        "介面",
         "帳號與連線",
         "下載輸出",
         "作品篩選",
