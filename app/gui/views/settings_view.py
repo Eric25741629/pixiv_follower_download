@@ -6,6 +6,7 @@ from app.core.settings_store import SettingsStore
 from app.gui import components as c
 from app.gui.glass import current_theme, glass_snackbar
 from app.gui.views.settings_handlers import _SettingsHandlersMixin
+from app import i18n
 import contextlib
 
 
@@ -49,9 +50,21 @@ class SettingsView(_SettingsHandlersMixin):
         perf = store.get_section("performance")
         jxl = store.get_section("jxl")
         directory = store.get_section("directory")
+        ui = store.get_section("ui")
         self._n_cookies: int = max(1, len(auth.get("cookies_pool", []) or []))
 
         theme = current_theme(page)
+
+        # 介面語言（apply-on-restart）。語言名稱顯示為各自的語言（endonym），
+        # 不隨目前 UI 語言翻譯。
+        self._dd_language = c.dropdown(
+            theme,
+            label=i18n.t("settings.lang.label"),
+            value=str(ui.get("language", i18n.BASE_LOCALE) or i18n.BASE_LOCALE),
+            options=[("zh-TW", "中文（繁體）"), ("en", "English")],
+            width=220,
+            on_select=self._on_language_select,
+        )
 
         self._tf_account = c.text_field(theme, label="帳號", value=auth.get("account", ""), width=300)
         self._tf_password = c.text_field(theme, label="密碼", value=auth.get("password", ""), width=300, password=True)
@@ -414,6 +427,18 @@ class SettingsView(_SettingsHandlersMixin):
     # Save
     # ------------------------------------------------------------------
 
+    def _persist_language(self, code: str) -> None:
+        """Persist ui.language, preserving the rest of the ui section."""
+        _store().update_fields("ui", {"language": str(code or i18n.BASE_LOCALE)})
+
+    def _on_language_select(self, e: ft.ControlEvent) -> None:
+        # File I/O off the event loop (matches the theme-save pattern). Language
+        # is apply-on-restart, so there is nothing to re-render now.
+        code = str(self._dd_language.value or i18n.BASE_LOCALE)
+        threading.Thread(
+            target=self._persist_language, args=(code,), daemon=True,
+        ).start()
+
     def save(self) -> None:
         store = _store()
         from app.core.proxy_utils import parse_proxy_list
@@ -540,7 +565,11 @@ class SettingsView(_SettingsHandlersMixin):
 
         return ft.Column(
             controls=[
-                c.page_title(theme, "設定"),
+                c.page_title(theme, i18n.t("settings.title")),
+                c.section(theme, i18n.t("settings.section.interface"), [
+                    self._dd_language,
+                    c.note(theme, i18n.t("settings.lang.restart_hint")),
+                ]),
                 c.section(theme, "帳號與連線", [
                     c.subhead(theme, "Pixiv 帳號"),
                     self._tf_account,
