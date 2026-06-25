@@ -1,7 +1,7 @@
 # 設定頁分類與文案重整規格
 
 日期：2026-06-26
-狀態：已與使用者確認方向，本文為實作前 spec
+狀態：已被 `docs/superpowers/specs/2026-06-26-gui-copy-and-light-polish-design.md` 取代
 
 ## 目標
 
