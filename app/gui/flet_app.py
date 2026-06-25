@@ -26,6 +26,7 @@ from app.gui.views.cookies_view import CookiesView
 from app.gui.views.stats_view import StatsView
 from app.core.stats_collector import StatsCollector
 from app.core.worker_event import WorkerEvent
+from app import i18n
 # Stateless bootstrap helpers (settings/theme persistence + the two small view
 # helpers) moved to app.gui.bootstrap_helpers (file-size refactor) and
 # re-imported here so call sites in main() and the tests that access
@@ -263,6 +264,10 @@ def main(page: ft.Page) -> None:
     init_logging()
     _install_crash_hooks()
     _install_signal_handlers()
+    # GUI locale (apply-on-restart): set BEFORE any view is built so every
+    # control reads the right language at build time. Unknown/missing -> zh-TW.
+    with contextlib.suppress(Exception):
+        i18n.set_locale(_settings_store().get_section("ui").get("language"))
     # Per-event UI trace (ui_events.log) is opt-in: skip its per-event regex +
     # synchronous file write on the dispatcher hot path unless explicitly enabled.
     with contextlib.suppress(Exception):
@@ -275,7 +280,7 @@ def main(page: ft.Page) -> None:
         getattr(page, "web", "?"),
         getattr(page, "platform", "?"),
     )
-    page.title = "Pixiv 下載器"
+    page.title = i18n.t("appbar.title")
     page.theme_mode = _load_theme_mode()
     # 全域字型：repo 附帶的思源黑體（assets/fonts/NotoSansTC.ttf，經
     # app/entry/main.py 的 assets_dir 提供）。檔案不在（例如以其他進入點
@@ -524,10 +529,10 @@ def main(page: ft.Page) -> None:
 
     # ── floating glass nav (replaces ft.NavigationRail) ──────────────────
     _nav_items = [
-        (ft.Icons.HOME_OUTLINED, "主頁"),
-        (ft.Icons.SETTINGS_OUTLINED, "設定"),
-        (ft.Icons.COOKIE_OUTLINED, "Cookie"),
-        (ft.Icons.BAR_CHART_OUTLINED, "統計"),
+        (ft.Icons.HOME_OUTLINED, i18n.t("nav.home")),
+        (ft.Icons.SETTINGS_OUTLINED, i18n.t("nav.settings")),
+        (ft.Icons.COOKIE_OUTLINED, i18n.t("nav.cookies")),
+        (ft.Icons.BAR_CHART_OUTLINED, i18n.t("nav.stats")),
     ]
     _nav_selected = [0]
     nav_holder = ft.Container()
@@ -707,11 +712,11 @@ def main(page: ft.Page) -> None:
     # theme toggle can recolor them in place without rebuilding the tree.
     _orb1, _orb2 = aurora.content.controls[0], aurora.content.controls[1]
 
-    _appbar_title = ft.Text("Pixiv 下載器", color=theme.text_primary)
+    _appbar_title = ft.Text(i18n.t("appbar.title"), color=theme.text_primary)
     _theme_button = ft.IconButton(
         icon=ft.Icons.LIGHT_MODE,
         icon_color=theme.text_primary,
-        tooltip="切換深淺色",
+        tooltip=i18n.t("theme.toggle_tooltip"),
         on_click=lambda e: toggle_theme(e),
     )
 
