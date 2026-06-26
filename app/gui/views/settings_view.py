@@ -587,15 +587,12 @@ class SettingsView(_SettingsHandlersMixin):
                     self._dd_language,
                     c.note(theme, i18n.t("settings.lang.restart_hint")),
                 ]),
-                # 1. 帳號與登入
+                # 1. 帳號與連線（帳號 + User-Agent + Proxy）
                 _sec("account", [
                     c.subhead(theme, i18n.t("settings.sub.pixiv_account")),
                     self._tf_account,
                     self._tf_password,
                     self._tf_userid,
-                ]),
-                # 2. 連線與瀏覽識別
-                _sec("connection", [
                     c.subhead(theme, i18n.t("settings.sub.user_agent")),
                     ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
                     self._label_ua_status,
@@ -606,7 +603,7 @@ class SettingsView(_SettingsHandlersMixin):
                     ]),
                     self._proxy_test_results,
                 ]),
-                # 3. 作品來源與抓取策略
+                # 2. 作品來源與抓取策略
                 _sec("source", [
                     c.subhead(theme, i18n.t("settings.source.mode")),
                     c.note(theme, i18n.t("settings.note.source_modes")),
@@ -620,7 +617,20 @@ class SettingsView(_SettingsHandlersMixin):
                     self._sw_author_order,
                     self._sw_force_rescan,
                 ]),
-                # 4. 下載位置與資料夾分類
+                # 3. 作品篩選（篩選條件 + 缺值處理）
+                _sec("filter", [
+                    ft.Row([self._sw_hidefollow, self._sw_nogif], wrap=True),
+                    ft.Row([self._tf_like_num, self._tf_r18_like_num, self._tf_rescrape_within_days], spacing=16, wrap=True),
+                    c.subhead(theme, i18n.t("settings.sub.missing_value")),
+                    ft.Row([self._sw_notag, self._sw_notime], wrap=True),
+                    c.subhead(theme, i18n.t("settings.sub.ban_tag")),
+                    self._ban_tag_row,
+                    ft.Row([self._tf_ban_input, c.icon_action(ft.Icons.ADD, on_click=self._add_ban_tag)]),
+                    c.subhead(theme, i18n.t("settings.sub.must_tag")),
+                    self._must_tag_row,
+                    ft.Row([self._tf_must_input, c.icon_action(ft.Icons.ADD, on_click=self._add_must_tag)]),
+                ]),
+                # 4. 下載與檔名（位置 + 資料夾分類 + 檔名 + 時間戳 + tag 整理）
                 _sec("download", [
                     c.subhead(theme, i18n.t("settings.sub.download_path")),
                     ft.Row([self._tf_path, c.icon_action(
@@ -633,9 +643,6 @@ class SettingsView(_SettingsHandlersMixin):
                     self._sw_r18_dir,
                     self._sw_r18g_dir,
                     self._sw_ai_dir,
-                ]),
-                # 5. 檔名與時間戳
-                _sec("filename", [
                     c.subhead(theme, i18n.t("settings.sub.filename_template")),
                     c.note(theme, i18n.t("settings.note.filename_template")),
                     self._tf_filename_template,
@@ -643,29 +650,13 @@ class SettingsView(_SettingsHandlersMixin):
                     c.note(theme, i18n.t("settings.note.timestamp")),
                     self._tf_download_time,
                     self._sw_set_file_mtime,
-                ]),
-                # 6. 標籤整理與缺值處理
-                _sec("tags", [
                     c.subhead(theme, i18n.t("settings.sub.tag_organize")),
                     ft.Row(
                         [self._sw_tag_strip_brackets, self._sw_tag_strip_special_chars],
                         wrap=True,
                     ),
-                    c.subhead(theme, i18n.t("settings.sub.missing_value")),
-                    ft.Row([self._sw_notag, self._sw_notime], wrap=True),
                 ]),
-                # 7. 作品篩選條件
-                _sec("filter", [
-                    ft.Row([self._sw_hidefollow, self._sw_nogif], wrap=True),
-                    ft.Row([self._tf_like_num, self._tf_r18_like_num, self._tf_rescrape_within_days], spacing=16, wrap=True),
-                    c.subhead(theme, i18n.t("settings.sub.ban_tag")),
-                    self._ban_tag_row,
-                    ft.Row([self._tf_ban_input, c.icon_action(ft.Icons.ADD, on_click=self._add_ban_tag)]),
-                    c.subhead(theme, i18n.t("settings.sub.must_tag")),
-                    self._must_tag_row,
-                    ft.Row([self._tf_must_input, c.icon_action(ft.Icons.ADD, on_click=self._add_must_tag)]),
-                ]),
-                # 8. 格式轉換、效能與自動化
+                # 5. 格式轉換、效能與自動化
                 _sec("advanced", [
                     c.subhead(theme, i18n.t("settings.sub.jxl")),
                     self._sw_jxl,
