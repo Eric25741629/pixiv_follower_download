@@ -195,7 +195,7 @@
   "main.step.s4": "步驟 4\n下載",
   "main.step.bm1": "步驟 1\n略過追隨",
   "main.step.bm2": "步驟 2\n抓收藏 PID",
-  "main.step.merged": "步驟 3+4\n查到即下載",
+  "main.step.merged": "步驟 3+4\n查到下載",
   "main.source.tooltip.following": "維持原本流程：抓取追隨作者，再掃描作者作品 PID。",
   "main.source.tooltip.bookmarks": "步驟 2 會掃描你按過愛心的作品 PID，後續抓 URL／下載流程不變。",
   "main.log_title": "執行記錄",

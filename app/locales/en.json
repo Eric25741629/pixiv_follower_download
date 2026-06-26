@@ -195,7 +195,7 @@
   "main.step.s4": "Step 4\nDownload",
   "main.step.bm1": "Step 1\nSkip following",
   "main.step.bm2": "Step 2\nBookmark PIDs",
-  "main.step.merged": "Step 3+4\nDownload as found",
+  "main.step.merged": "Step 3+4\nLive DL",
   "main.source.tooltip.following": "Standard flow: fetch following artists, then scan their artwork PIDs.",
   "main.source.tooltip.bookmarks": "Step 2 scans the artwork PIDs you liked; the later URL/download steps are unchanged.",
   "main.log_title": "Activity log",
