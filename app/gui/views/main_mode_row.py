@@ -10,30 +10,45 @@ methods read/write (``self._mode_row``, ``self._scope_row``,
 ``self._step_card_texts``, ``self._step_cards``, ``self._safe_update`` …) are
 created in ``MainView.__init__`` / live on the concrete class.
 
-``STEP_LABELS`` / ``_BOOKMARK_STEP_LABELS`` / ``_MERGED_STEP3_LABEL`` /
-``_SOURCE_TOOLTIPS`` / ``_settings_base_path`` live here (the mode logic owns
+``step_labels()`` / ``bookmark_step_labels()`` / ``merged_step3_label()`` /
+``source_tooltips()`` / ``_settings_base_path`` live here (the mode logic owns
 them) and are re-exported by ``main_view`` for the few non-mode call sites
-(``_make_step_card``) and the tests that import them from ``main_view``.
+(``_make_step_card``) and the tests that import them from ``main_view``. They
+are functions (not constants) so labels resolve via ``i18n.t()`` at call time,
+after ``main()`` sets the locale.
 """
 from __future__ import annotations
 
 import contextlib
 
+from app import i18n
 from app.gui.glass import current_theme, glass_pill
 
-STEP_LABELS = ["步驟 1\n抓追蹤", "步驟 2\n抓 PID", "步驟 3\n抓 URL", "步驟 4\n下載"]
-_BOOKMARK_STEP_LABELS = ["步驟 1\n略過追隨", "步驟 2\n抓收藏 PID"]
+# Step-card labels + source tooltips resolve through i18n.t() at CALL time
+# (not import time) so they honour the locale set in main() before the views
+# build. They are functions, not module constants, for exactly that reason.
+def step_labels() -> list[str]:
+    return [i18n.t("main.step.s1"), i18n.t("main.step.s2"),
+            i18n.t("main.step.s3"), i18n.t("main.step.s4")]
 
-# When 邊查邊下 (download.combined_mode) is on, step 3 absorbs step 4: the
+
+def bookmark_step_labels() -> list[str]:
+    return [i18n.t("main.step.bm1"), i18n.t("main.step.bm2")]
+
+
+# When 查到即下載 (download.combined_mode) is on, step 3 absorbs step 4: the
 # step-3 card is relabeled and the step-4 card is hidden (see
 # MainView.apply_combined_mode).
-_MERGED_STEP3_LABEL = "步驟 3+4\n邊查邊下"
+def merged_step3_label() -> str:
+    return i18n.t("main.step.merged")
 
-# 模式說明（舊 _mode_subtitle 文案）改為來源 pill 的 tooltip。
-_SOURCE_TOOLTIPS = {
-    "following": "維持原本流程：抓追蹤畫師，再掃描畫師作品 PID。",
-    "bookmarks": "步驟 2 會掃描你按過愛心的作品 PID，後續抓 URL / 下載流程不變。",
-}
+
+# 模式說明改為來源 pill 的 tooltip。
+def source_tooltips() -> dict[str, str]:
+    return {
+        "following": i18n.t("main.source.tooltip.following"),
+        "bookmarks": i18n.t("main.source.tooltip.bookmarks"),
+    }
 
 
 def _settings_base_path() -> str:
@@ -75,7 +90,7 @@ class _MainModeRowMixin:
         """
         self._combined_mode = bool(enabled)
         self._step_card_texts[2].value = (
-            _MERGED_STEP3_LABEL if enabled else STEP_LABELS[2]
+            merged_step3_label() if enabled else step_labels()[2]
         )
         self._step_cards[3].visible = not enabled
         for ctrl in (self._step_card_texts[2], self._step_cards[3]):
@@ -114,34 +129,37 @@ class _MainModeRowMixin:
         self._active_scope = scope
         if mode == "bookmarks":
             self._bookmark_scope = scope
-            self._scope_label.value = "收藏範圍"
+            self._scope_label.value = i18n.t("main.scope_label.bookmark")
             self._scope_row.visible = True
-            self._step_card_texts[0].value = _BOOKMARK_STEP_LABELS[0]
-            self._step_card_texts[1].value = _BOOKMARK_STEP_LABELS[1]
+            bm = bookmark_step_labels()
+            self._step_card_texts[0].value = bm[0]
+            self._step_card_texts[1].value = bm[1]
         else:
             self._following_scope = scope
-            self._scope_label.value = "追隨範圍"
+            self._scope_label.value = i18n.t("main.scope_label.following")
             self._scope_row.visible = True
-            self._step_card_texts[0].value = STEP_LABELS[0]
-            self._step_card_texts[1].value = STEP_LABELS[1]
+            sl = step_labels()
+            self._step_card_texts[0].value = sl[0]
+            self._step_card_texts[1].value = sl[1]
+        tips = source_tooltips()
         self._btn_source_following = self._make_mode_button(
-            "抓追隨", mode == "following",
+            i18n.t("main.source.following"), mode == "following",
             lambda e: self._on_source_mode_change("following"),
-            tooltip=_SOURCE_TOOLTIPS["following"],
+            tooltip=tips["following"],
         )
         self._btn_source_bookmarks = self._make_mode_button(
-            "抓收藏", mode == "bookmarks",
+            i18n.t("main.source.bookmarks"), mode == "bookmarks",
             lambda e: self._on_source_mode_change("bookmarks"),
-            tooltip=_SOURCE_TOOLTIPS["bookmarks"],
+            tooltip=tips["bookmarks"],
         )
         self._btn_scope_public = self._make_mode_button(
-            "公開", scope == "public", lambda e: self._on_scope_change("public")
+            i18n.t("main.scope.public"), scope == "public", lambda e: self._on_scope_change("public")
         )
         self._btn_scope_private = self._make_mode_button(
-            "非公開", scope == "private", lambda e: self._on_scope_change("private")
+            i18n.t("main.scope.private"), scope == "private", lambda e: self._on_scope_change("private")
         )
         self._btn_scope_all = self._make_mode_button(
-            "全部", scope == "all", lambda e: self._on_scope_change("all")
+            i18n.t("main.scope.all"), scope == "all", lambda e: self._on_scope_change("all")
         )
         self._source_mode_controls.controls = [
             self._btn_source_following, self._btn_source_bookmarks,

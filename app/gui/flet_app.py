@@ -371,7 +371,7 @@ def main(page: ft.Page) -> None:
         try:
             event_q.put(WorkerEvent(
                 "output",
-                f"<p><font color='gray'>偵測到上次未正常結束，已自動補齊 {_rc} 筆事件</font></p>",
+                f"<p><font color='gray'>{i18n.t('app.recover_notice', n=_rc)}</font></p>",
             ))
         except Exception:
             pass
@@ -431,12 +431,12 @@ def main(page: ft.Page) -> None:
             # runs and is swallowed by the surrounding try/except.
             cd = int(_PERSISTENT_UI_STATE.get("countdown", 0) or 0)
             if cd > 0:
-                main_view._countdown_text.value = f"倒數：{cd} 秒"
+                main_view._countdown_text.value = i18n.t("main.countdown", r=cd)
             if bool(_PERSISTENT_UI_STATE.get("is_paused", False)):
                 main_view._is_paused = True
                 # 控制膠囊 content 是 Row[Image, Text] — 走 glass 的 helper。
                 from app.gui.glass import set_pill_icon, set_pill_label
-                set_pill_label(main_view._btn_pause, "繼續")
+                set_pill_label(main_view._btn_pause, i18n.t("main.btn.resume"))
                 set_pill_icon(main_view._btn_pause, "play")
         except Exception:
             _log.exception("failed to restore persisted UI state")
@@ -640,7 +640,7 @@ def main(page: ft.Page) -> None:
     def handle_loading(data) -> None:
         if isinstance(data, tuple) and len(data) == 2:
             busy, message = data
-            msg_str = str(message) if message else "正在啟動..."
+            msg_str = str(message) if message else i18n.t("main.loading.default")
             main_view.set_loading(bool(busy), msg_str)
             _PERSISTENT_UI_STATE["loading_open"] = bool(busy)
             _PERSISTENT_UI_STATE["loading_message"] = msg_str if bool(busy) else ""
@@ -785,7 +785,7 @@ def main(page: ft.Page) -> None:
     # we need to put it back on the new page; otherwise the buttons stay
     # disabled-looking and the user thinks the app is frozen.
     if bool(_PERSISTENT_UI_STATE.get("loading_open", False)):
-        msg = str(_PERSISTENT_UI_STATE.get("loading_message", "") or "正在啟動...")
+        msg = str(_PERSISTENT_UI_STATE.get("loading_message", "") or i18n.t("main.loading.default"))
         try:
             main_view.set_loading(True, msg)
         except Exception:

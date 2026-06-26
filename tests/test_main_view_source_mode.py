@@ -7,6 +7,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import pytest
 
+import app.i18n as i18n
+
+
+def setup_function(_fn):
+    # Scope labels / step-card labels resolve via i18n.t(); pin zh-TW so the
+    # zh assertions below are stable regardless of test ordering.
+    i18n.set_locale(i18n.BASE_LOCALE)
+
 
 class _FakePage:
     pass
@@ -45,7 +53,7 @@ def test_refresh_source_mode_applies_bookmark_labels_and_scope(view, tmp_path):
 
 
 def test_apply_source_mode_restores_following_labels(view):
-    from app.gui.views.main_view import STEP_LABELS
+    from app.gui.views.main_view import step_labels
 
     view.apply_source_mode("bookmarks", "private")
     view.apply_source_mode("following", "all")
@@ -57,8 +65,8 @@ def test_apply_source_mode_restores_following_labels(view):
     assert view._btn_source_following.bgcolor == theme.accent_fill
     assert view._scope_row.visible is True
     assert view._scope_label.value == "追隨範圍"
-    assert view._step_card_texts[0].value == STEP_LABELS[0]
-    assert view._step_card_texts[1].value == STEP_LABELS[1]
+    assert view._step_card_texts[0].value == step_labels()[0]
+    assert view._step_card_texts[1].value == step_labels()[1]
 
 
 def test_source_mode_buttons_live_in_wrapping_mode_row(view):

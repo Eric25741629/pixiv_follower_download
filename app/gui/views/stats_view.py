@@ -9,6 +9,7 @@ import flet as ft
 from app.core.stats_collector import StatsCollector
 from app.gui import components as c
 from app.gui.glass import current_theme, glass_panel
+from app import i18n
 
 _MAX_BAR_PX = 300
 
@@ -46,10 +47,10 @@ class StatsView:
         # bodies. Both modes here share one body, so a plain button toggle
         # is cleaner than forcing the new Tabs structure.
         self._btn_session = c.primary_button(
-            "本次執行", on_click=lambda e: self._switch_mode("session"),
+            i18n.t("stats.mode.session"), on_click=lambda e: self._switch_mode("session"),
         )
         self._btn_lifetime = c.secondary_button(
-            "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
+            i18n.t("stats.mode.lifetime"), on_click=lambda e: self._switch_mode("lifetime"),
         )
         self._mode_toggle = ft.Row(
             controls=[self._btn_session, self._btn_lifetime], spacing=8,
@@ -64,14 +65,14 @@ class StatsView:
         # us morph button types, so we just toggle them as filled/outlined
         # via Row controls reassignment.
         self._btn_session = c.primary_button(
-            "本次執行", on_click=lambda e: self._switch_mode("session"),
+            i18n.t("stats.mode.session"), on_click=lambda e: self._switch_mode("session"),
         ) if is_session else c.secondary_button(
-            "本次執行", on_click=lambda e: self._switch_mode("session"),
+            i18n.t("stats.mode.session"), on_click=lambda e: self._switch_mode("session"),
         )
         self._btn_lifetime = c.secondary_button(
-            "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
+            i18n.t("stats.mode.lifetime"), on_click=lambda e: self._switch_mode("lifetime"),
         ) if is_session else c.primary_button(
-            "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
+            i18n.t("stats.mode.lifetime"), on_click=lambda e: self._switch_mode("lifetime"),
         )
         self._mode_toggle.controls = [self._btn_session, self._btn_lifetime]
         try:
@@ -85,7 +86,7 @@ class StatsView:
         cards = self._build_cards()
         chart_section = ft.Column(
             controls=[
-                ft.Text("Cookie 請求次數", size=14, weight=ft.FontWeight.BOLD),
+                ft.Text(i18n.t("stats.chart.title"), size=14, weight=ft.FontWeight.BOLD),
                 self._chart_container,
             ],
             spacing=8,
@@ -93,7 +94,7 @@ class StatsView:
         return ft.Container(
             content=ft.Column(
                 controls=[
-                    c.page_title(theme, "統計資料"),
+                    c.page_title(theme, i18n.t("stats.title")),
                     self._mode_toggle,
                     cards,
                     ft.Divider(),
@@ -107,7 +108,8 @@ class StatsView:
         )
 
     def _build_cards(self) -> ft.Row:
-        labels = ["總下載流量", "JXL 節省空間", "HTTP 請求數", "執行時間"]
+        labels = [i18n.t("stats.card.bytes"), i18n.t("stats.card.jxl_saved"),
+                  i18n.t("stats.card.http"), i18n.t("stats.card.elapsed")]
         theme = current_theme(self._page)
         value_colors = _accent_cycle(self._page)
         self._card_containers: list[ft.Container] = []
@@ -194,7 +196,7 @@ class StatsView:
         cookie_counts = data.get("cookie_request_counts", {})
         total_req = sum(cookie_counts.values())
         self._card_values[2].value = str(total_req)
-        self._card_values[3].value = str(data.get("lifetime_sessions", 0)) + " 次"
+        self._card_values[3].value = i18n.t("stats.sessions_count", n=data.get("lifetime_sessions", 0))
         for t in self._card_values:
             try:
                 t.update()
@@ -237,7 +239,7 @@ class StatsView:
         theme = current_theme(self._page)
         if not requests:
             self._chart_container.controls = [
-                ft.Text("尚無資料", size=12, color=theme.text_muted)
+                ft.Text(i18n.t("stats.empty"), size=12, color=theme.text_muted)
             ]
             self._safe_chart_update()
             return
@@ -247,10 +249,10 @@ class StatsView:
         rows = self._build_cookie_bar_rows(cookie_requests)
         if free_count > 0:
             rows.append(ft.Text(
-                f"免 Cookie：{free_count} 次", size=12, color=theme.info,
+                i18n.t("stats.free_cookie", count=free_count), size=12, color=theme.info,
             ))
         if not rows:
-            rows = [ft.Text("尚無資料", size=12, color=theme.text_muted)]
+            rows = [ft.Text(i18n.t("stats.empty"), size=12, color=theme.text_muted)]
 
         self._chart_container.controls = rows
         self._safe_chart_update()

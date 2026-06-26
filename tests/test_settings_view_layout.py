@@ -43,15 +43,18 @@ def test_settings_view_major_section_titles(tmp_path, monkeypatch):
 
     titles = _tile_titles(view.build())
 
-    # The i18n "介面" (language) row leads; the content sections follow.
-    # (The spec's 8-section restructure is a separate follow-on step.)
+    # The i18n "介面" (language) row leads; the 8 content sections follow
+    # (spec §B 設定頁 8 區資訊架構).
     assert titles == [
         "介面",
-        "帳號與連線",
-        "下載輸出",
-        "作品篩選",
-        "執行流程",
-        "速度與自動化",
+        "帳號與登入",
+        "連線與瀏覽識別",
+        "作品來源與抓取策略",
+        "下載位置與資料夾分類",
+        "檔名與時間戳",
+        "標籤整理與缺值處理",
+        "作品篩選條件",
+        "格式轉換、效能與自動化",
     ]
 
 

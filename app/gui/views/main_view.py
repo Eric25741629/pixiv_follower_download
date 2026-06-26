@@ -5,6 +5,7 @@ import threading
 import flet as ft
 
 from app.core.worker_event import WorkerEvent
+from app import i18n
 from app.gui import components as c
 from app.gui.glass import (
     current_theme,
@@ -18,27 +19,28 @@ from app.gui.glass import (
 )
 from app.gui.log_panel import LogPanel
 from app.gui.views.main_mode_row import (
-    _BOOKMARK_STEP_LABELS,
-    _MERGED_STEP3_LABEL,
-    _SOURCE_TOOLTIPS,
+    bookmark_step_labels,
+    merged_step3_label,
+    source_tooltips,
     _MainModeRowMixin,
     _settings_base_path,
-    STEP_LABELS,
+    step_labels,
 )
 from app.gui.views.main_progress import _PROG_LEAD_W, _MainProgressMixin
 
-# Constants/helpers moved to the mixin modules (file-size refactor) and
-# re-exported above: STEP_LABELS / _MERGED_STEP3_LABEL etc. so call sites here
+# Label helpers moved to the mixin modules (file-size refactor) and re-exported
+# above: step_labels() / merged_step3_label() etc. so call sites here
 # (_make_step_card) and tests that ``from app.gui.views.main_view import
-# STEP_LABELS`` keep working. The progress-bar geometry (_PROG_*) and ETA logic
-# live in main_progress; the source/scope/combined logic in main_mode_row.
+# step_labels`` keep working. They are i18n.t()-backed functions (resolved at
+# call time, after the locale is set). The progress-bar geometry (_PROG_*) and
+# ETA logic live in main_progress; source/scope/combined logic in main_mode_row.
 
 __all__ = [
     "MainView",
-    "STEP_LABELS",
-    "_BOOKMARK_STEP_LABELS",
-    "_MERGED_STEP3_LABEL",
-    "_SOURCE_TOOLTIPS",
+    "step_labels",
+    "bookmark_step_labels",
+    "merged_step3_label",
+    "source_tooltips",
     "_settings_base_path",
 ]
 
@@ -70,13 +72,13 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         # set_pill_icon（content 是 Row[Image, Text]，不可對 content 指派
         # 字串）；啟用/停用走 _set_pill_enabled（disabled + 半透明）。
         self._btn_run_all = self._make_action_pill(
-            "一鍵執行", icon="play", primary=True, on_click=self._on_run_all,
+            i18n.t("main.btn.run_all"), icon="play", primary=True, on_click=self._on_run_all,
         )
         self._btn_pause = self._make_action_pill(
-            "暫停", icon="pause", on_click=self._on_pause_toggle, enabled=False,
+            i18n.t("main.btn.pause"), icon="pause", on_click=self._on_pause_toggle, enabled=False,
         )
         self._btn_stop = self._make_action_pill(
-            "停止", icon="stop", on_click=self._on_stop, enabled=False,
+            i18n.t("main.btn.stop"), icon="stop", on_click=self._on_stop, enabled=False,
         )
         self._is_paused = False
         self._cards_disabled = False
@@ -93,10 +95,10 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         # 雙色：整體進度=accent、本作分頁=info — 兩條必須一眼可區分
         # （邊查邊下同時跑 PID 進度與單 PID 多頁進度）。
         self._progress_bar, self._progress_text, self._progress_row = (
-            self._make_progress_row("整體進度", current_theme(page).accent)
+            self._make_progress_row(i18n.t("main.progress.overall"), current_theme(page).accent)
         )
         self._page_progress_bar, self._page_progress_text, self._page_progress_row = (
-            self._make_progress_row("本作分頁", current_theme(page).info)
+            self._make_progress_row(i18n.t("main.progress.page"), current_theme(page).info)
         )
         self._page_progress_value = 0
         self._page_progress_total = 0
@@ -145,7 +147,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
 
         # Modal overlay shown while a step is launching or stopping.
         self._loading_msg = ft.Text(
-            "正在啟動...", size=15, weight=ft.FontWeight.BOLD,
+            i18n.t("main.loading.default"), size=15, weight=ft.FontWeight.BOLD,
             color=current_theme(page).text_primary,
         )
         self._loading_dialog = glass_dialog(
@@ -159,7 +161,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
                     ),
                     self._loading_msg,
                     ft.Text(
-                        "請勿關閉視窗", size=12,
+                        i18n.t("main.loading.dont_close"), size=12,
                         color=current_theme(page).text_secondary,
                     ),
                 ],
@@ -185,31 +187,32 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         self._bookmark_scope = "all"
         self._active_scope = "all"
         self._source_label = ft.Text(
-            "來源", size=12, weight=ft.FontWeight.BOLD,
+            i18n.t("main.source_label"), size=12, weight=ft.FontWeight.BOLD,
             color=current_theme(page).text_muted,
         )
         self._scope_label = ft.Text(
-            "追隨範圍",
+            i18n.t("main.scope_label.following"),
             size=12,
             weight=ft.FontWeight.BOLD,
             color=current_theme(page).text_secondary,
         )
+        _tips = source_tooltips()
         self._btn_source_following = self._make_mode_button(
-            "抓追隨", False, lambda e: self._on_source_mode_change("following"),
-            tooltip=_SOURCE_TOOLTIPS["following"],
+            i18n.t("main.source.following"), False, lambda e: self._on_source_mode_change("following"),
+            tooltip=_tips["following"],
         )
         self._btn_source_bookmarks = self._make_mode_button(
-            "抓收藏", False, lambda e: self._on_source_mode_change("bookmarks"),
-            tooltip=_SOURCE_TOOLTIPS["bookmarks"],
+            i18n.t("main.source.bookmarks"), False, lambda e: self._on_source_mode_change("bookmarks"),
+            tooltip=_tips["bookmarks"],
         )
         self._btn_scope_public = self._make_mode_button(
-            "公開", False, lambda e: self._on_scope_change("public")
+            i18n.t("main.scope.public"), False, lambda e: self._on_scope_change("public")
         )
         self._btn_scope_private = self._make_mode_button(
-            "非公開", False, lambda e: self._on_scope_change("private")
+            i18n.t("main.scope.private"), False, lambda e: self._on_scope_change("private")
         )
         self._btn_scope_all = self._make_mode_button(
-            "全部", False, lambda e: self._on_scope_change("all")
+            i18n.t("main.scope.all"), False, lambda e: self._on_scope_change("all")
         )
         self._scope_row = ft.Row(
             controls=[
@@ -272,7 +275,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         palette = _state_palette(self._page)
         bg, fg = palette["idle"]
         text = ft.Text(
-            STEP_LABELS[index],
+            step_labels()[index],
             text_align=ft.TextAlign.CENTER,
             size=13,
             color=fg,
@@ -374,7 +377,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
     # here (they own the meta-row status slot the mixin calls into).
 
     def _set_downloading_pid(self, pid_text: str) -> None:
-        self._set_downloading_status(f"正在下載：PID {pid_text}" if pid_text else "")
+        self._set_downloading_status(i18n.t("main.downloading_pid", pid=pid_text) if pid_text else "")
 
     def _set_downloading_status(self, value: str) -> None:
         """Single render slot for the current-PID status (查詢中/下載中)."""
@@ -402,11 +405,11 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         except Exception:
             pass
 
-    def set_loading(self, busy: bool, message: str = "正在啟動...") -> None:
+    def set_loading(self, busy: bool, message: str = "") -> None:
         """Show / hide the modal preparing overlay (dim + spinner + message)."""
         with self._loading_lock:
             if busy and not self._loading_open:
-                self._loading_msg.value = message
+                self._loading_msg.value = message or i18n.t("main.loading.default")
                 try:
                     self._page.show_dialog(self._loading_dialog)
                 except Exception:
@@ -436,7 +439,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         # run starts, otherwise the button could keep saying "繼續" with no
         # active worker to resume.
         self._is_paused = False
-        set_pill_label(self._btn_pause, "暫停")
+        set_pill_label(self._btn_pause, i18n.t("main.btn.pause"))
         set_pill_icon(self._btn_pause, "pause")
         if not is_running:
             self.set_phase("")
@@ -444,7 +447,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
     def _on_run_all(self, e: ft.ControlEvent) -> None:
         if self._run_controller is None:
             return
-        self._event_q.put(WorkerEvent("loading", (True, "正在啟動 一鍵執行...")))
+        self._event_q.put(WorkerEvent("loading", (True, i18n.t("main.loading.run_all"))))
         threading.Thread(
             target=self._run_in_background,
             args=(self._run_controller.run_all,),
@@ -456,7 +459,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
             return
         if self._cards_disabled:
             return
-        self._event_q.put(WorkerEvent("loading", (True, f"正在啟動 步驟 {step}...")))
+        self._event_q.put(WorkerEvent("loading", (True, i18n.t("main.loading.step", step=step))))
         threading.Thread(
             target=self._run_in_background,
             args=(self._run_controller.run_step, step),
@@ -484,7 +487,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
                 except Exception:
                     pass
             self._is_paused = False
-            set_pill_label(self._btn_pause, "暫停")
+            set_pill_label(self._btn_pause, i18n.t("main.btn.pause"))
             set_pill_icon(self._btn_pause, "pause")
         else:
             if hasattr(t, "pause"):
@@ -493,7 +496,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
                 except Exception:
                     pass
             self._is_paused = True
-            set_pill_label(self._btn_pause, "繼續")
+            set_pill_label(self._btn_pause, i18n.t("main.btn.resume"))
             set_pill_icon(self._btn_pause, "play")
         try:
             self._btn_pause.update()
@@ -519,7 +522,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
             self._btn_stop.update()
         except Exception:
             pass
-        self._event_q.put(WorkerEvent("loading", (True, "正在停止，等待清理完成...")))
+        self._event_q.put(WorkerEvent("loading", (True, i18n.t("main.loading.stopping"))))
         try:
             t.stop()
         except Exception:
@@ -573,7 +576,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         log_area = glass_panel(
             ft.Column(
                 controls=[
-                    c.subhead(theme, "即時 Log"),
+                    c.subhead(theme, i18n.t("main.log_title")),
                     self._log_panel.control,
                 ],
                 expand=True,

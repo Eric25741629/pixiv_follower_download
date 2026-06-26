@@ -17,8 +17,12 @@ def test_current_locale_overrides_base():
     assert i18n.t("nav.home") == "Home"
 
 
-def test_untranslated_key_falls_back_to_base():
-    # en.json deliberately omits settings.lang.restart_hint -> falls back to zh-TW.
+def test_untranslated_key_falls_back_to_base(monkeypatch):
+    # en.json now has full key parity (full English coverage), so simulate an
+    # untranslated key by dropping it from the loaded en dict: it must fall back
+    # to the zh-TW base value rather than showing the raw key.
+    en_without = {k: v for k, v in i18n._load("en").items() if k != "settings.lang.restart_hint"}
+    monkeypatch.setitem(i18n._cache, "en", en_without)
     i18n.set_locale("en")
     assert i18n.t("settings.lang.restart_hint") == "重啟後生效"
 

@@ -23,6 +23,7 @@ import contextlib
 
 import flet as ft
 
+from app import i18n
 from app.gui.glass import current_theme
 
 
@@ -96,11 +97,9 @@ class _SettingsHandlersMixin:
             avg_f = 35.0
         n = self._n_cookies
         throughput = avg_f / n
-        suffix = "；推薦 >= 30 秒"
         if n == 1:
-            return f"1 個 cookie：每請求約 {throughput:.0f} 秒{suffix}"
-        return (f"{n} 個 cookie：單帳號每 {avg_f:.0f} 秒一次，"
-                f"整體每請求約 {throughput:.1f} 秒{suffix}")
+            return i18n.t("settings.cooldown.hint_one", throughput=throughput)
+        return i18n.t("settings.cooldown.hint_many", n=n, avg=avg_f, throughput=throughput)
 
     def reload_cookie_count(self) -> None:
         """Re-read cookie count from store; refresh hint label in-place."""

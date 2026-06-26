@@ -16,6 +16,7 @@ import time
 
 import flet as ft
 
+from app import i18n
 from app.gui.glass import GlassProgressBar, current_theme
 
 # Shared geometry for the two stacked progress bars (整體進度 / 本作分頁). Both
@@ -163,7 +164,7 @@ class _MainProgressMixin:
         self._page_progress_total = t
         self._page_progress_pid = pid_text
         self._page_progress_value = max(0, min(self._page_progress_value, t))
-        label = f"PID {pid_text} 分頁" if pid_text else "分頁"
+        label = i18n.t("main.page.label", pid=pid_text) if pid_text else i18n.t("main.page.label_nopid")
         trailing = f"{label} {self._page_progress_value}/{self._page_progress_total}"
         self._render_progress_row(
             self._page_progress_row, self._page_progress_bar,
@@ -190,7 +191,7 @@ class _MainProgressMixin:
         if self._progress_value <= 0 or self._progress_total <= 0:
             return ""
         if self._progress_value >= self._progress_total:
-            return "預計剩餘：完成"
+            return i18n.t("main.eta.done")
         elapsed = now - self._progress_started_at
         if elapsed <= 0:
             return ""
@@ -201,15 +202,15 @@ class _MainProgressMixin:
         if eta_sec >= 3600:
             h, rem = divmod(eta_sec, 3600)
             m, s = divmod(rem, 60)
-            return f"預計剩餘：{h}:{m:02d}:{s:02d}"
+            return i18n.t("main.eta.hms", h=h, m=m, s=s)
         m, s = divmod(eta_sec, 60)
-        return f"預計剩餘：{m:02d}:{s:02d}"
+        return i18n.t("main.eta.ms", m=m, s=s)
 
     def update_countdown(self, remaining: int) -> None:
         try:
             r = int(remaining)
         except (TypeError, ValueError):
             r = 0
-        self._countdown_text.value = f"倒數：{r} 秒" if r > 0 else ""
+        self._countdown_text.value = i18n.t("main.countdown", r=r) if r > 0 else ""
         # Update the meta Row, not just the Text, so it reflows reliably.
         self._safe_update(self._meta_row)
