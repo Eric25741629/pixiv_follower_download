@@ -87,6 +87,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         jxl_cjxl_path=r"C:\Users\Eric\Downloads\jxl-x64-windows\bin\cjxl.exe",
         jxl_delete_original=False,
         jxl_effort=7,
+        jxl_skip_gif=True,
         scheduler=None,
         stats_collector=None,
         *legacy_args,
@@ -128,6 +129,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             overrides.get("jxl_cjxl_path", jxl_cjxl_path),
             overrides.get("jxl_delete_original", jxl_delete_original),
             overrides.get("jxl_effort", jxl_effort),
+            overrides.get("jxl_skip_gif", jxl_skip_gif),
         )
         self._init_filter_state(
             overrides.get("like_num", 0),
@@ -370,6 +372,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
 
         # jxl
         self.jxl_enable = bool(jxl.get("enable", False))
+        self.jxl_skip_gif = bool(jxl.get("skip_gif", True))
         try:
             self.jxl_effort = max(1, min(9, int(jxl.get("effort", 7))))
         except (TypeError, ValueError):
@@ -772,6 +775,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         ("jxl_cjxl_path", lambda v: str(v).strip() or None),
         ("jxl_delete_original", bool),
         ("jxl_effort", int),
+        ("jxl_skip_gif", bool),
         ("like_num", lambda v: int(v or 0)),
         ("r18_like_num", lambda v: int(v or 0)),
         ("ai_gen_dir", bool),
@@ -1890,12 +1894,13 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             if page is None:
                 page = self._extract_page_from_download_url(original_url)
             media = "ugoira" if "ugoira" in str(resolved_url).lower() else "image"
+            cookie_used = self._is_cookie_used_for_pid(pid_for_log)
             if page is None:
                 self._q.put(WorkerEvent("output",
-                    f"<p><font color='black'>[下載] PID {pid_for_log} ({media})</font></p>"))
+                    f"<p><font color='black'>[下載] PID {pid_for_log} ({media}, cookie_used={cookie_used})</font></p>"))
             else:
                 self._q.put(WorkerEvent("output",
-                    f"<p><font color='black'>[下載] PID {pid_for_log} 第 {int(page) + 1} 張 ({media})</font></p>"))
+                    f"<p><font color='black'>[下載] PID {pid_for_log} 第 {int(page) + 1} 張 ({media}, cookie_used={cookie_used})</font></p>"))
         except Exception:
             pass
 

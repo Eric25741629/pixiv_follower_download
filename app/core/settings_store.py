@@ -119,6 +119,7 @@ DEFAULTS = {
         "cjxl_path": "",
         "delete_original": False,
         "effort": 7,
+        "skip_gif": True,
     },
     "auth": {
         "login_mode": 0,
@@ -376,6 +377,7 @@ class SettingsStore:
             "cjxl_path": str(d.get("jxl_cjxl_path", "")),
             "delete_original": bool(d.get("jxl_delete_original", False)),
             "effort": int(d.get("jxl_effort", 7)),
+            "skip_gif": bool(d.get("jxl_skip_gif", True)),
         })
 
     def _import_cookies_json(self, merged):

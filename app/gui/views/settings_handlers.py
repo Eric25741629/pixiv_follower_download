@@ -61,6 +61,7 @@ class _SettingsHandlersMixin:
             (self._sw_ai_dir, "directory", "ai_gen_dir", False),
             (self._sw_jxl, "jxl", "enable", False),
             (self._sw_jxl_delete, "jxl", "delete_original", False),
+            (self._sw_jxl_skip_gif, "jxl", "skip_gif", False),
             (self._sw_single_thread, "performance", "single_thread_mode", False),
         ]
 

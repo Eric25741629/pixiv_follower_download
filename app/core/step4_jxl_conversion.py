@@ -25,9 +25,11 @@ from app.core.worker_event import WorkerEvent
 class _JXLMixin:
     """Background JXL-conversion helpers, mixed into ``download_thread``."""
 
-    def _init_jxl_config(self, jxl_enable, jxl_cjxl_path, jxl_delete_original, jxl_effort):
+    def _init_jxl_config(self, jxl_enable, jxl_cjxl_path, jxl_delete_original, jxl_effort,
+                         jxl_skip_gif=True):
         """Resolve JXL settings + reset per-run JXL counters."""
         self.jxl_enable = bool(jxl_enable)
+        self.jxl_skip_gif = bool(jxl_skip_gif)
         jxl_path_raw = (
             str(jxl_cjxl_path).strip()
             if str(jxl_cjxl_path).strip()
@@ -137,6 +139,16 @@ class _JXLMixin:
                 f"<p><font color='orange'>JXL 已啟用，但找不到 cjxl：{self.jxl_cjxl_path}</font></p>"
             ))
 
+    def _warn_gif_skip_once(self):
+        """Emit the 'GIF skipped' notice at most once per worker run."""
+        if self._jxl_gif_skip_warned:
+            return
+        self._jxl_gif_skip_warned = True
+        with contextlib.suppress(Exception):
+            self._q.put(WorkerEvent("output",
+                "<p><font color='gray'>JXL 已啟用,但 GIF 轉檔常逾時,已跳過 GIF 轉檔(原檔保留)</font></p>"
+            ))
+
     def _handle_existing_jxl_destination(self, src_path):
         """Bump ok counter and optionally delete the original when .jxl already exists."""
         try:
@@ -158,6 +170,11 @@ class _JXLMixin:
         src_path = str(src_path)
         ext = os.path.splitext(src_path)[1].lower()
         if ext not in self._JXL_SUPPORTED_EXTS:
+            return False, None, None
+        if ext == ".gif" and self.jxl_skip_gif:
+            # GIF→JXL re-encodes the animation and almost always hits the 120s
+            # cjxl timeout; the 跳過 GIF 轉檔 switch defaults on. Keep the .gif.
+            self._warn_gif_skip_once()
             return False, None, None
         if not os.path.isfile(src_path):
             return False, None, None

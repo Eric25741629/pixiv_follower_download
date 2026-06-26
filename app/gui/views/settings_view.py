@@ -239,6 +239,7 @@ class SettingsView(_SettingsHandlersMixin):
         self._sw_jxl = c.switch(theme, label="啟用 JXL 轉檔", value=bool(jxl.get("enable", False)))
         self._tf_jxl_path = c.text_field(theme, label="cjxl.exe 路徑", value=jxl.get("cjxl_path", ""), expand=True, read_only=True)
         self._sw_jxl_delete = c.switch(theme, label="刪除原檔", value=bool(jxl.get("delete_original", False)))
+        self._sw_jxl_skip_gif = c.switch(theme, label="跳過 GIF 轉檔(常逾時)", value=bool(jxl.get("skip_gif", True)))
         effort_val = max(1, min(9, int(jxl.get("effort", 7))))
         self._sl_jxl_effort = c.slider(theme, min=1, max=9, divisions=8, value=effort_val, label="{value}", width=200)
 
@@ -517,6 +518,7 @@ class SettingsView(_SettingsHandlersMixin):
                 "cjxl_path": self._tf_jxl_path.value,
                 "delete_original": self._sw_jxl_delete.value,
                 "effort": int(self._sl_jxl_effort.value),
+                "skip_gif": self._sw_jxl_skip_gif.value,
             },
         })
         if self._on_saved is not None:
@@ -631,6 +633,7 @@ class SettingsView(_SettingsHandlersMixin):
                         on_click=self._pick_jxl_exe,
                     )]),
                     self._sw_jxl_delete,
+                    self._sw_jxl_skip_gif,
                     ft.Row([ft.Text("Effort（1-9）", color=theme.text_primary), self._sl_jxl_effort]),
                 ]),
                 c.section(theme, "作品篩選", [
