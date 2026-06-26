@@ -4,6 +4,7 @@ import os
 import threading
 
 from app.core.worker_event import WorkerEvent
+from app import i18n
 from app.core.pixiv_thread_base import PauseableThread
 from app.core.pixiv_thread_utils import normalize_pid
 from app.core import thread_url_fetch, thread_download, diag_log
@@ -211,8 +212,8 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             # Phase BEFORE acquire so the UI shows the PID during the cooldown
             # wait instead of leaving the previous PID's label on screen.
             with contextlib.suppress(Exception):
-                verb = "正在查詢" if needs_query else "正在下載"
-                self._q.put(WorkerEvent("phase", f"{verb}：PID {pid}"))
+                phase_key = "log.phase.querying" if needs_query else "log.phase.downloading"
+                self._q.put(WorkerEvent("phase", i18n.t(phase_key, pid=pid)))
         diag_log.log(diag_log.WORKER, f"PID {pid} 開始 (needs_query={needs_query})")
         # The acquire span's elapsed time IS the visible cooldown wait. When it
         # logs ~0.00s the account was ready immediately (cooldown absorbed by the
@@ -269,7 +270,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 self._seed_pending_urls(pid, urls)
                 if emit_phase:
                     with contextlib.suppress(Exception):
-                        self._q.put(WorkerEvent("phase", f"正在下載：PID {pid}"))
+                        self._q.put(WorkerEvent("phase", i18n.t("log.phase.downloading", pid=pid)))
                 self.downloader._set_current_download_account(acc)
                 # Bind THIS account's cookie to the PID so the download leg sends
                 # the held account's cookie over the held account's proxy (the
@@ -389,7 +390,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
     def run(self):
         try:
             self._share_scheduler()
-            self._emit("<p><font color='red'>邊查邊下階段開始</font></p>")
+            self._emit(f"<p><font color='red'>{i18n.t('log.combined.start')}</font></p>")
             self.fetcher._reset_run_counters()
             query_pids, download_only = self._build_work_lists()
             # Resolve the (optionally author-grouped) iteration order once so the
@@ -601,8 +602,8 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                     backup=False,
                 )
                 self.downloader._shadow_mark_failures(fail_records)
-        self._emit("<p><font color='green'>邊查邊下完成</font></p>")
-        self._q.put(WorkerEvent("finished", "邊查邊下完成"))
+        self._emit(f"<p><font color='green'>{i18n.t('log.combined.done')}</font></p>")
+        self._q.put(WorkerEvent("finished", i18n.t("log.combined.done")))
         self._q.put(WorkerEvent("next", -1))  # terminal: Run All stops here
 
     def flush_for_shutdown(self):

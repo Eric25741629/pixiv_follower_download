@@ -219,5 +219,53 @@
 
   "app.recover_notice": "偵測到上次未正常結束，已自動補齊 {n} 筆事件",
 
-  "log.skip.like": "略過 PID {pid}：未達最低讚數（{cur} / {need}）"
+  "log.skip.like": "略過 PID {pid}：未達最低讚數（{cur} / {need}）",
+
+  "log.paused": "已暫停",
+  "log.resumed": "已繼續",
+  "log.stopped": "已停止",
+  "log.retry.attempt": "重試 {work}：第 {attempt}/{total} 次，原因：{err}",
+  "log.retry.exhausted": "{work} 重試 {total} 次仍失敗（原因：{err}），停用此 Cookie",
+
+  "log.phase.querying": "正在查詢：PID {pid}",
+  "log.phase.downloading": "正在下載：PID {pid}",
+
+  "log.following.start": "開始抓取追隨作者：共 {n} 位",
+  "log.following.done": "抓取追隨作者完成：新增 {n} 位",
+  "log.following.fail": "抓取追隨作者失敗",
+
+  "log.pid.progress": "掃描中：已處理 {n} 個作者",
+  "log.pid.done": "抓取作品 PID 完成",
+  "log.pid.stopped": "抓取作品 PID 已停止",
+
+  "log.url.start": "開始整理作品 URL",
+  "log.url.pending": "待整理 URL：共 {n} 個 PID",
+  "log.url.done": "整理作品 URL 完成",
+  "log.url.total": "整理作品 URL 完成：共 {n} 個 URL",
+  "log.url.stopped": "整理作品 URL 已停止",
+  "log.url.fail": "整理作品 URL 失敗",
+
+  "log.dl.start": "開始下載作品",
+  "log.dl.pending": "待下載：共 {n} 個 URL",
+  "log.dl.done": "下載作品完成",
+  "log.dl.stopped": "下載已停止",
+  "log.dl.fail": "下載作品失敗",
+
+  "log.combined.start": "開始查到即下載",
+  "log.combined.done": "查到即下載完成",
+
+  "log.sched.skip": "略過本次排程：已有任務執行中",
+  "log.sched.fail": "排程執行失敗：{err}",
+
+  "log.jxl.cjxl_missing": "注意：找不到 cjxl.exe（{path}），本次略過 JXL 轉檔",
+  "log.jxl.skip_gif": "注意：GIF 轉檔常逾時，本次略過 GIF 轉檔（原檔保留）",
+  "log.jxl.timeout": "JXL 轉檔逾時（120 秒），略過：{name}",
+
+  "log.run.step_start": "--- 步驟 {n} 開始 ---",
+  "log.run.skip_step1": "收藏模式略過步驟 1，直接抓收藏 PID",
+  "log.run.need_userid": "請先在「設定」填入 User ID",
+  "log.run.need_following": "找不到追隨清單，請先執行步驟 1",
+  "log.run.need_path": "請先在「設定」指定下載路徑",
+  "log.run.build_fail": "步驟 {n} 建立執行緒失敗：{err}",
+  "log.run.already_running": "已有任務執行中，忽略本次啟動"
 }

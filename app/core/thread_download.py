@@ -9,6 +9,7 @@ import requests
 from queue import Queue, Empty
 from pixiv_api import *  # noqa: F403  (intentional: re-exports Pixiv_info/gif_download/etc.)
 from app.core.worker_event import WorkerEvent
+from app import i18n
 import pixiv_api
 from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
@@ -522,7 +523,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             print(f"all_url.txt 讀取完成，URL數量：{len(self.allurl)}")
             print("正在過濾已存在的 PID...")
         except Exception:
-            self._q.put(WorkerEvent("finished", 'Task finished'))
+            self._q.put(WorkerEvent("finished", i18n.t("log.dl.done")))
 
     def _enqueue_retriable_failures(self, db) -> None:
         """Append URLs from prior failed pages back into ``self.allurl``.
@@ -1338,8 +1339,8 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             self._q.put(WorkerEvent("timechanged", value))
 
     def _emit_step4_header(self):
-        self._q.put(WorkerEvent("output", "<p><font color='red'>下載階段開始...</font></p>"))
-        self._q.put(WorkerEvent("output", f"<p><font color='red'>Pending URL: {len(self.allurl)}</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>{i18n.t('log.dl.start')}</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='gray'>{i18n.t('log.dl.pending', n=len(self.allurl))}</font></p>"))
         with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4過濾設定] like_min={self.like_num}, special_rules={len(self.special_like_rules)}, ban_tag={len(self._ban_tag_norm)}, must_tag={len(self._must_tag_norm)}, ai_dir={bool(self.ai_gen_dir)}</font></p>"
@@ -1375,10 +1376,10 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         self._emit_cookie_usage_summary("step4", "Step4 Cookie統計")
         self._emit_output("<p><font color='orange'>Step4 無待下載 URL，保留現有 all_url.txt 不改寫</font></p>")
         if self._stopped_by_request or self._stop_event.is_set():
-            self._q.put(WorkerEvent("finished", 'Task finished'))
+            self._q.put(WorkerEvent("finished", i18n.t("log.dl.stopped")))
             self._q.put(WorkerEvent("next", -1))
         else:
-            self._q.put(WorkerEvent("finished", '下載完成'))
+            self._q.put(WorkerEvent("finished", i18n.t("log.dl.done")))
 
     def _emit_single_mode_header(self):
         """Print the 'single-thread mode' header + cooldown summary line."""
@@ -1428,7 +1429,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         neutral = False
         try:
             self._set_current_download_account(acc)
-            self._emit_phase(f"正在下載：PID {pid}")
+            self._emit_phase(i18n.t("log.phase.downloading", pid=pid))
             ok, result, _ = self._run_with_network_retry(
                 f"PID {pid}",
                 lambda: self._download_pid_group(pid, urls),
@@ -1462,7 +1463,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
                 f"（{len(pid_groups.get(pid, []))} 張）</font></p>"))
 
             urls = pid_groups.get(pid, [])
-            self._emit_phase(f"正在下載：PID {pid}")
+            self._emit_phase(i18n.t("log.phase.downloading", pid=pid))
             if self._scheduler is not None:
                 result, stop = self._download_pid_with_scheduler(pid, urls)
                 if stop:
@@ -1811,7 +1812,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
                 remaining_count=len(remaining_urls),
                 exist_pid_count=len(self.exist_pid),
             )
-            self._q.put(WorkerEvent("finished", 'Task finished'))
+            self._q.put(WorkerEvent("finished", i18n.t("log.dl.stopped")))
             self._q.put(WorkerEvent("next", -1))
         else:
             self._diag(
@@ -1820,7 +1821,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
                 remaining_count=len(remaining_urls),
                 exist_pid_count=len(self.exist_pid),
             )
-            self._q.put(WorkerEvent("finished", '下載完成'))
+            self._q.put(WorkerEvent("finished", i18n.t("log.dl.done")))
 
     def run(self):
         try:
@@ -1881,7 +1882,8 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         except Exception as e:
             self._emit_phase("")
             self._diag("step4_exception", error=output_err(e))
-            self._q.put(WorkerEvent("output", 'Task failed'))
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='red'>{i18n.t('log.dl.fail')}</font></p>"))
             self._q.put(WorkerEvent("output", output_err(e)))
             self._q.put(WorkerEvent("next", -1))
     def _emit_download_progress_log(self, original_url, resolved_url):

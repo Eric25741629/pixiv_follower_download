@@ -20,6 +20,7 @@ import threading
 from queue import Empty, Queue
 
 from app.core.worker_event import WorkerEvent
+from app import i18n
 
 
 class _JXLMixin:
@@ -93,7 +94,7 @@ class _JXLMixin:
         except subprocess.TimeoutExpired:
             with contextlib.suppress(Exception):
                 self._q.put(WorkerEvent("output",
-                    f"<p><font color='orange'>JXL 轉檔逾時（120s），跳過：{os.path.basename(str(src_path))}</font></p>"
+                    f"<p><font color='orange'>{i18n.t('log.jxl.timeout', name=os.path.basename(str(src_path)))}</font></p>"
                 ))
             return False, "cjxl timeout (120s)"
         if completed.returncode == 0 and os.path.isfile(dst_path):
@@ -136,7 +137,7 @@ class _JXLMixin:
         self._jxl_path_warned = True
         with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
-                f"<p><font color='orange'>JXL 已啟用，但找不到 cjxl：{self.jxl_cjxl_path}</font></p>"
+                f"<p><font color='orange'>{i18n.t('log.jxl.cjxl_missing', path=self.jxl_cjxl_path)}</font></p>"
             ))
 
     def _warn_gif_skip_once(self):
@@ -146,7 +147,7 @@ class _JXLMixin:
         self._jxl_gif_skip_warned = True
         with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("output",
-                "<p><font color='gray'>JXL 已啟用,但 GIF 轉檔常逾時,已跳過 GIF 轉檔(原檔保留)</font></p>"
+                f"<p><font color='gray'>{i18n.t('log.jxl.skip_gif')}</font></p>"
             ))
 
     def _handle_existing_jxl_destination(self, src_path):

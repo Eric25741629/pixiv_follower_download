@@ -9,6 +9,8 @@ from __future__ import annotations
 import datetime
 import threading
 
+from app import i18n
+
 
 def _parse_hhmm(text: str) -> tuple[int, int]:
     """Parse 'HH:MM' -> (hour, minute); fall back to (0, 0) on any error."""
@@ -69,7 +71,7 @@ class SchedulerService:
         if now < due:
             return False
         if self._is_active():
-            self._emit("<p><font color='gray'>排程時間到，但已有任務執行中，略過本次</font></p>")
+            self._emit(f"<p><font color='gray'>{i18n.t('log.sched.skip')}</font></p>")
             self._last_fire = now
             return False
         self._last_fire = now
@@ -80,7 +82,7 @@ class SchedulerService:
             # a silently-swallowed run_all left the user with no diagnostic and
             # still advanced _last_fire, costing a whole scheduled cycle.
             self._emit(
-                f"<p><font color='red'>排程執行失敗：{exc}</font></p>"
+                f"<p><font color='red'>{i18n.t('log.sched.fail', err=exc)}</font></p>"
             )
             return False
         return True

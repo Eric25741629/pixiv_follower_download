@@ -219,5 +219,53 @@
 
   "app.recover_notice": "Detected an unclean shutdown last time; auto-recovered {n} events",
 
-  "log.skip.like": "Skip PID {pid}: below min likes ({cur} / {need})"
+  "log.skip.like": "Skip PID {pid}: below min likes ({cur} / {need})",
+
+  "log.paused": "Paused",
+  "log.resumed": "Resumed",
+  "log.stopped": "Stopped",
+  "log.retry.attempt": "Retry {work}: attempt {attempt}/{total}, reason: {err}",
+  "log.retry.exhausted": "{work} still failed after {total} retries (reason: {err}); disabling this cookie",
+
+  "log.phase.querying": "Querying: PID {pid}",
+  "log.phase.downloading": "Downloading: PID {pid}",
+
+  "log.following.start": "Fetching following artists: {n} total",
+  "log.following.done": "Following artists done: {n} added",
+  "log.following.fail": "Failed to fetch following artists",
+
+  "log.pid.progress": "Scanning: {n} artists processed",
+  "log.pid.done": "Artwork PID scan done",
+  "log.pid.stopped": "Artwork PID scan stopped",
+
+  "log.url.start": "Building artwork URLs",
+  "log.url.pending": "Pending: {n} PIDs to resolve",
+  "log.url.done": "Artwork URLs done",
+  "log.url.total": "Artwork URLs done: {n} URLs total",
+  "log.url.stopped": "Artwork URL build stopped",
+  "log.url.fail": "Failed to build artwork URLs",
+
+  "log.dl.start": "Downloading artworks",
+  "log.dl.pending": "Pending: {n} URLs to download",
+  "log.dl.done": "Downloads done",
+  "log.dl.stopped": "Downloads stopped",
+  "log.dl.fail": "Downloads failed",
+
+  "log.combined.start": "Download-as-found started",
+  "log.combined.done": "Download-as-found done",
+
+  "log.sched.skip": "Skipping scheduled run: a task is already running",
+  "log.sched.fail": "Scheduled run failed: {err}",
+
+  "log.jxl.cjxl_missing": "Note: cjxl.exe not found ({path}); skipping JXL conversion this run",
+  "log.jxl.skip_gif": "Note: GIF→JXL often times out; skipping GIF conversion (original kept)",
+  "log.jxl.timeout": "JXL conversion timed out (120s), skipping: {name}",
+
+  "log.run.step_start": "--- Step {n} started ---",
+  "log.run.skip_step1": "Bookmark mode skips step 1; scanning bookmark PIDs directly",
+  "log.run.need_userid": "Please set your User ID in Settings first",
+  "log.run.need_following": "No following list found; run step 1 first",
+  "log.run.need_path": "Please set the download path in Settings first",
+  "log.run.build_fail": "Step {n} failed to start: {err}",
+  "log.run.already_running": "A task is already running; ignoring this start"
 }

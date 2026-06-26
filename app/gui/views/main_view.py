@@ -391,10 +391,14 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         「正在查詢/正在下載」 per-PID messages are routed to the meta row's
         正在下載 slot instead — the meta row (next to ETA/倒數) is where the
         current PID already shows, so rendering them in the phase row too
-        would duplicate the same PID on two lines.
+        would duplicate the same PID on two lines. Detection uses the localized
+        prefixes (workers emit these via i18n.t), so it still works under en.
         """
         t = (text or "").strip()
-        if t.startswith("正在查詢") or t.startswith("正在下載"):
+        # Strip everything from the {pid} placeholder onward to get the prefix.
+        q_pre = i18n.t("log.phase.querying", pid="\x00").split("\x00", 1)[0]
+        d_pre = i18n.t("log.phase.downloading", pid="\x00").split("\x00", 1)[0]
+        if (q_pre and t.startswith(q_pre)) or (d_pre and t.startswith(d_pre)):
             self._set_downloading_status(t)
             return
         has_text = bool(t)

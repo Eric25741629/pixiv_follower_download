@@ -8,6 +8,7 @@ import threading
 from pixiv_api import *
 from app.core.metadata_db import MetadataDB, emit_db_stats, mirror_exist_pid_set
 from app.core.worker_event import WorkerEvent
+from app import i18n
 from app.core.pixiv_thread_utils import (
     init_cookie_fields,
     normalize_pid_set,
@@ -349,14 +350,14 @@ class get_pixiv_author_imgID_Thread(PauseableThread, _Step2BookmarkMixin,
         end = [i for i in end if i not in self.exist_pid]
         self._commit_step2_outputs(end)
         if self._stop_event.is_set():
-            self._q.put(WorkerEvent("finished", 'Task finished'))
+            self._q.put(WorkerEvent("finished", i18n.t("log.pid.stopped")))
             self._q.put(WorkerEvent("next", -1))
         else:
             # Emit finished BEFORE next so the dispatcher's single-drain order is
             # handle_finished (tear down step 2) THEN handle_next (start step 3).
             # The old next-then-finished order made handle_finished re-mark the
             # just-started step 3 as 'done' and disable its pause/stop. (B7)
-            self._q.put(WorkerEvent("finished", '抓取所有PID完成'))
+            self._q.put(WorkerEvent("finished", i18n.t("log.pid.done")))
             self._q.put(WorkerEvent("next", 3))
     def _step2_fetch_artist_pid_list(self, author_pids, cookie, Agent, proxies=None):
         '''發送單一畫師的 profile/all 請求並回傳 PID list。
@@ -530,7 +531,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread, _Step2BookmarkMixin,
         if self._stop_event.is_set():
             return 'stop'
         if (_current_pid_num % 10 == 0):
-            self._q.put(WorkerEvent("output", f"<p><font color='black'>PID progress: {_current_pid_num}</font></p>"))
+            self._q.put(WorkerEvent("output", f"<p><font color='black'>{i18n.t('log.pid.progress', n=_current_pid_num)}</font></p>"))
         try:
             pid = self._step2_fetch_artist_pid_list(author_pids, cookie, Agent, proxies=proxies)
             if pid is None:

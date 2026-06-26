@@ -8,6 +8,7 @@ import requests
 from queue import Queue
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
+from app import i18n
 import pixiv_api
 from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
@@ -560,7 +561,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
                 f"<p><font color='red'>讀取失敗: {detail}</font></p>"))
         except Exception:
             pass
-        self._q.put(WorkerEvent("finished", 'Task finished'))
+        self._q.put(WorkerEvent("finished", i18n.t("log.url.stopped")))
         self._q.put(WorkerEvent("next", -1))
 
     def check_exist(self):
@@ -794,7 +795,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             pending_count=self.pid_max,
         )
         self._emit_output(f"<p><font color='gray'>[TaskFilter][Step3] input={raw_pid_count}, skipped_no_to_check={skipped_no_to_check}, skipped_exist={skipped_exist}, skipped_revoked={skipped_revoked}, duplicate={duplicate_count}, invalid={invalid_count}, cached_hit_pid={0}, cached_generated_url={0}, cached_filtered={0}, cached_fallback_network={0}, pending_network={self.pid_max}</font></p>")
-        self._q.put(WorkerEvent("output", f"<p><font color='red'>Total pending network PID: {self.pid_max}</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='gray'>{i18n.t('log.url.pending', n=self.pid_max)}</font></p>"))
         try:
             self._q.put(WorkerEvent("output", "<p><font color='gray'>URL 輸出檔案: {}</font></p>".format(os.path.join(self.path, "all_url.txt"))))
         except Exception:
@@ -958,7 +959,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             self._apply_live_settings_if_changed()
 
             with contextlib.suppress(Exception):
-                self._q.put(WorkerEvent("phase", f"正在查詢：PID {pid}"))
+                self._q.put(WorkerEvent("phase", i18n.t("log.phase.querying", pid=pid)))
 
             if self._scheduler is not None:
                 one, stop = self._fetch_one_pid_via_scheduler(pid)
@@ -1015,7 +1016,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             self._q.put(WorkerEvent("output", msg))
         except Exception:
             pass
-        self._q.put(WorkerEvent("finished", 'Task finished'))
+        self._q.put(WorkerEvent("finished", i18n.t("log.url.stopped")))
         self._q.put(WorkerEvent("next", -1))
 
     def _step3_emit(self, html):
@@ -1081,14 +1082,14 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
                 f"<p><font color='orange'>本次新增失效 PID "
                 f"{len(self._revoked_pid_new)} 筆，已寫入 revoked_pid.txt</font></p>"
             )
-        self._q.put(WorkerEvent("finished", '抓取所有PID完成'))
+        self._q.put(WorkerEvent("finished", i18n.t("log.url.done")))
         self._q.put(WorkerEvent("next", 4))
         self._q.put(WorkerEvent("output",
-            f"<p><font color='red'>Total URL count: {len(merged)}</font></p>"))
+            f"<p><font color='green'>{i18n.t('log.url.total', n=len(merged))}</font></p>"))
 
     def run(self):
         try:
-            self._q.put(WorkerEvent("output", "URL階段開始"))
+            self._q.put(WorkerEvent("output", i18n.t("log.url.start")))
             self._reset_run_counters()
             pictures_id = self._load_and_filter_pid_list()
             if pictures_id is None:
@@ -1110,7 +1111,8 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
                 self._finalize_on_complete(results)
         except Exception as e:
             self._diag("step3_exception", error=output_err(e))
-            self._q.put(WorkerEvent("output", 'Task failed'))
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='red'>{i18n.t('log.url.fail')}</font></p>"))
             self._q.put(WorkerEvent("output", output_err(e)))
             self._q.put(WorkerEvent("next", -1))
 

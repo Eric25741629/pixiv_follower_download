@@ -22,6 +22,7 @@ from app.core.metadata_db import DB_FILENAME, MetadataDB
 from app.core.live_settings import LiveSettings
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
 from app.gui.cookie_validation import _RETEST_INTERVAL_SEC, _CookieValidationMixin
+from app import i18n
 import contextlib
 
 DEFAULT_AGENT = (
@@ -334,12 +335,12 @@ class RunController(_CookieValidationMixin):
         # the previous step's worker is legitimately still finishing.
         with self._start_lock:
             if require_idle and self._is_run_active():
-                self._log("<p><font color='gray'>已有任務執行中，忽略本次啟動</font></p>")
+                self._log(f"<p><font color='gray'>{i18n.t('log.run.already_running')}</font></p>")
                 return
             try:
                 t = self._build_thread(n)
             except Exception as err:
-                self._log(f"<p><font color='red'>步驟 {n} 建立執行緒失敗：{err}</font></p>")
+                self._log(f"<p><font color='red'>{i18n.t('log.run.build_fail', n=n, err=err)}</font></p>")
                 self._main_view.set_running(False)
                 self._main_view.set_step_state(n - 1, "error")
                 # No worker thread started -> emit a terminal event so a headless
@@ -368,16 +369,16 @@ class RunController(_CookieValidationMixin):
             for i in range(4):
                 self._main_view.set_step_state(i, "idle")
             self._main_view.set_step_state(n - 1, "running")
-            self._log(f"<p><font color='gray'>--- 步驟 {n} 開始 ---</font></p>")
+            self._log(f"<p><font color='gray'>{i18n.t('log.run.step_start', n=n)}</font></p>")
             t.start()
 
     def _build_step1(self, auth, agent, dl, flt):
         if str(dl.get("source_mode", "following") or "following") == "bookmarks":
-            self._log("<p><font color='gray'>收藏模式略過步驟 1，直接抓收藏 PID</font></p>")
+            self._log(f"<p><font color='gray'>{i18n.t('log.run.skip_step1')}</font></p>")
             return None
         userid = str(auth.get("userid", "")).strip()
         if not userid:
-            self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
+            self._log(f"<p><font color='red'>{i18n.t('log.run.need_userid')}</font></p>")
             return None
         valid_cookies = self._validate_cookies_for_step(auth, agent, 1)
         if not valid_cookies:
@@ -395,12 +396,12 @@ class RunController(_CookieValidationMixin):
         authors = [] if source_mode == "bookmarks" else _load_author_list()
         if source_mode != "bookmarks" and not authors:
             self._log(
-                "<p><font color='red'>找不到 following 清單，請先執行步驟 1</font></p>"
+                f"<p><font color='red'>{i18n.t('log.run.need_following')}</font></p>"
             )
             return None
         bookmark_user_id = str(auth.get("userid", "") or "").strip()
         if source_mode == "bookmarks" and not bookmark_user_id:
-            self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
+            self._log(f"<p><font color='red'>{i18n.t('log.run.need_userid')}</font></p>")
             return None
         valid_cookies = self._validate_cookies_for_step(auth, agent, 2)
         if not valid_cookies:
@@ -528,7 +529,7 @@ class RunController(_CookieValidationMixin):
             return None
         dl_path = str(dl.get("path", "")).strip()
         if not dl_path:
-            self._log("<p><font color='red'>請先在「設定」指定下載路徑</font></p>")
+            self._log(f"<p><font color='red'>{i18n.t('log.run.need_path')}</font></p>")
             return None
         self._sync_exist_pid_from_download_folder(dl_path, path, step_num=3)
         from app.core import thread_combined
@@ -586,7 +587,7 @@ class RunController(_CookieValidationMixin):
     def _build_step4(self, auth, agent, dl, flt, perf, directory, jxl):
         dl_path = str(dl.get("path", "")).strip()
         if not dl_path:
-            self._log("<p><font color='red'>請先在「設定」指定下載路徑</font></p>")
+            self._log(f"<p><font color='red'>{i18n.t('log.run.need_path')}</font></p>")
             return None
         dt = self._parse_download_time(dl.get("download_time"))
         valid_cookies = self._validate_cookies_for_step(auth, agent, 4)

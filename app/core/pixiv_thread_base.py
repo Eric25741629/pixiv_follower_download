@@ -7,6 +7,7 @@ import queue as _queue
 import requests
 
 from app.core.worker_event import WorkerEvent
+from app import i18n
 from pixiv_api import *
 from app.core.pixiv_thread_utils import (
     cookie_usage_label,
@@ -175,19 +176,19 @@ class PauseableThread(threading.Thread):
 
     def pause(self):
         self._pause_event.clear()
-        self._q.put(WorkerEvent("output", "<p><font color='red'>已暫停</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>{i18n.t('log.paused')}</font></p>"))
         # Hooks may do disk I/O (e.g. flushing partial-progress JSON). Run
         # them off the caller's thread so a UI click handler isn't blocked.
         threading.Thread(target=self._on_pause_hook, daemon=True).start()
 
     def resume(self):
         self._pause_event.set()
-        self._q.put(WorkerEvent("output", "<p><font color='red'>已繼續</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>{i18n.t('log.resumed')}</font></p>"))
 
     def stop(self):
         self._stop_event.set()
         self._pause_event.set()   # unblock any waiting pause
-        self._q.put(WorkerEvent("output", "<p><font color='red'>已停止</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>{i18n.t('log.stopped')}</font></p>"))
         threading.Thread(target=self._on_stop_hook, daemon=True).start()
 
     def _on_pause_hook(self):
@@ -472,18 +473,19 @@ class PauseableThread(threading.Thread):
                 last_exc = err
                 if attempt < NETWORK_RETRY_ATTEMPTS:
                     self._emit_output(
-                        f"<p><font color='#b58900'>{work_label} 第 {attempt}/"
-                        f"{NETWORK_RETRY_ATTEMPTS} 次失敗"
-                        f"（{err.__class__.__name__}），"
-                        f"{NETWORK_RETRY_WAIT_SEC} 秒後重試</font></p>"
+                        "<p><font color='#b58900'>" + i18n.t(
+                            "log.retry.attempt", work=work_label, attempt=attempt,
+                            total=NETWORK_RETRY_ATTEMPTS, err=err.__class__.__name__,
+                        ) + "</font></p>"
                     )
                     if not self._wait_interruptible(NETWORK_RETRY_WAIT_SEC):
                         return False, None, last_exc
                 else:
                     self._emit_output(
-                        f"<p><font color='red'>{work_label} 重試 "
-                        f"{NETWORK_RETRY_ATTEMPTS} 次仍失敗"
-                        f"（{err.__class__.__name__}），停用此 Cookie</font></p>"
+                        "<p><font color='red'>" + i18n.t(
+                            "log.retry.exhausted", work=work_label,
+                            total=NETWORK_RETRY_ATTEMPTS, err=err.__class__.__name__,
+                        ) + "</font></p>"
                     )
         return False, None, last_exc
 

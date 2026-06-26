@@ -7,6 +7,7 @@ import threading
 from functools import partial
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
+from app import i18n
 from app.core.pixiv_thread_utils import (
     atomic_write_json,
     atomic_write_text,
@@ -152,7 +153,7 @@ class get_following(PauseableThread):
             total_by_rest[rest] = total_num
             page_ranges[rest] = list(range(0, total_num+200, 100))
         self.max = int(sum(total_by_rest.values()))
-        self._q.put(WorkerEvent("output", f'total following: {self.max}'))
+        self._q.put(WorkerEvent("output", i18n.t("log.following.start", n=self.max)))
         results = []
         for rest in rest_values:
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as self.executor:
@@ -164,17 +165,18 @@ class get_following(PauseableThread):
         try:
             all_pixiv_ids = self.illusts()
             texts = np.unique(all_pixiv_ids).tolist()
-            self._q.put(WorkerEvent("output", '抓取 following 完成'))
             atomic_write_text(os.path.join(self.path, "following.txt"), texts, backup=True)
             atomic_write_json(os.path.join(self.path, "following.json"), texts, backup=True)
-            self._q.put(WorkerEvent("output", "<p><font color='red'>抓取關注畫師完成</font></p>"))
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='green'>{i18n.t('log.following.done', n=len(texts))}</font></p>"))
             # Emit finished BEFORE next so the dispatcher tears down step 1 first
             # and THEN starts step 2 — otherwise handle_finished re-marks the
             # just-started step 2 'done' and disables its pause/stop. (B7)
-            self._q.put(WorkerEvent("finished", '抓取關注畫師完成'))
+            self._q.put(WorkerEvent("finished", i18n.t("log.following.done", n=len(texts))))
             self._q.put(WorkerEvent("next", 2))
         except Exception as e:
-            self._q.put(WorkerEvent("output", 'Task failed'))
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='red'>{i18n.t('log.following.fail')}</font></p>"))
             self._q.put(WorkerEvent("output", output_err(e)))
             self._q.put(WorkerEvent("next", -1))
 
