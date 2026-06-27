@@ -57,3 +57,29 @@ def test_dry_run_changes_nothing(tmp_path):
 def test_non_timetag_files_ignored(tmp_path):
     _mk(tmp_path, "PID999_no_time.jpg")
     assert collect(str(tmp_path)) == []
+
+
+def test_same_pid_pages_keep_shared_timetag(tmp_path):
+    # All pages of one PID share a stamp by design -> the tool must NOT split
+    # them apart (that would undo the per-PID shared-timetag download behaviour).
+    _mk(tmp_path, "20260330_084355_PID130008458_p0.jpg")
+    _mk(tmp_path, "20260330_084355_PID130008458_p1.jpg")
+    _mk(tmp_path, "20260330_084355_PID130008458_p2.jpg")
+    renames = plan_renames(collect(str(tmp_path)))
+    assert renames == []
+
+
+def test_different_pids_same_stamp_move_all_pages_together(tmp_path):
+    # Two PIDs collided on one stamp (the old bug). The later PID's pages must
+    # ALL move together to a single new stamp, staying grouped as one artwork.
+    _mk(tmp_path, "20260330_084355_PID111_p0.jpg")
+    _mk(tmp_path, "20260330_084355_PID111_p1.jpg")
+    _mk(tmp_path, "20260330_084355_PID222_p0.jpg")
+    _mk(tmp_path, "20260330_084355_PID222_p1.jpg")
+    renames = plan_renames(collect(str(tmp_path)))
+    moved = {old: tag for _d, old, _new, tag in renames}
+    # PID111 (sorts first) keeps the stamp; both PID222 pages advance together.
+    assert "20260330_084355_PID111_p0.jpg" not in moved
+    assert "20260330_084355_PID111_p1.jpg" not in moved
+    assert moved["20260330_084355_PID222_p0.jpg"] == "20260330_084356"
+    assert moved["20260330_084355_PID222_p1.jpg"] == "20260330_084356"

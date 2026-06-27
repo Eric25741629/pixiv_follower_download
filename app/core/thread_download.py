@@ -1226,6 +1226,11 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             sess = _pixiv_api.make_session(acc.proxy_url)
         else:
             sess = requests.Session()
+        # Reserve ONE shared timetag for this PID so every page gets the same
+        # timestamp / filename prefix / mtime (an artwork = one moment). This is
+        # the single owner of the per-PID block for every Step 4 path (single /
+        # pool / scheduler) and combined mode, which all funnel through here.
+        self._begin_pid_timetag_block()
         try:
             with diag_log.span(diag_log.DOWNLOAD, f"PID {pid} 下載 ({len(urls)} 頁)"):
                 for idx, u in enumerate(urls):
@@ -1247,6 +1252,8 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
                     if self._stop_event.is_set():
                         break
         finally:
+            with contextlib.suppress(Exception):
+                self._end_pid_timetag_block()
             with contextlib.suppress(Exception):
                 sess.close()
         return failed

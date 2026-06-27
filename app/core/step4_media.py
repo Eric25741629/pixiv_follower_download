@@ -349,44 +349,38 @@ class _Step4MediaMixin:
         '(KHTML, like Gecko) Chrome/99.0.4844.82 Safari/537.36'
     )
 
-    def _begin_pid_timetag_block(self, n):
-        """Reserve a contiguous block of ``n`` timetags for the calling thread.
+    def _begin_pid_timetag_block(self, n=1):
+        """Reserve ONE shared timetag for the calling thread's current PID.
 
-        Combined concurrent mode calls this before a PID's pages so the pages
-        get base+0..base+n-1 (contiguous, non-interleaved) even while other
-        PIDs download on other threads. The global ``download_time`` jumps past
-        the whole block under ``timelock``, so concurrent reservations are
-        mutually exclusive and the persisted high-water never rewinds.
+        Every page of the PID gets this single stamp (see ``_reserve_one_timetag``),
+        so an artwork's pages share one timestamp / filename prefix / mtime. The
+        global ``download_time`` advances by exactly 1 s under ``timelock``, so
+        the next PID gets a distinct stamp and concurrent PIDs on other threads
+        reserve disjoint stamps. Uniqueness of each file is carried by
+        ``PID{pid}{page_suffix}``, not the timetag, so a shared stamp is
+        collision-safe. ``n`` is accepted for back-compat and ignored.
         """
-        try:
-            count = max(0, int(n))
-        except Exception:
-            count = 0
         with self.timelock:
             base = self.download_time
-            self.download_time = self.download_time + datetime.timedelta(seconds=count or 1)
+            self.download_time = self.download_time + datetime.timedelta(seconds=1)
         self._timetag_block_local.base = base
-        self._timetag_block_local.next = 0
 
     def _end_pid_timetag_block(self):
-        """Drop the calling thread's reserved block (revert to the global path)."""
+        """Drop the calling thread's reserved stamp (revert to the global path)."""
         with contextlib.suppress(AttributeError):
             del self._timetag_block_local.base
-        with contextlib.suppress(AttributeError):
-            del self._timetag_block_local.next
 
     def _reserve_one_timetag(self):
         """Next datetime to stamp this file with.
 
-        Block reserved on this thread -> hand out base+offset (no global
-        advance, contiguous per PID). Otherwise advance the global counter by
-        1 s under ``timelock`` (legacy sequential behaviour, byte-identical)."""
+        Block reserved on this thread -> return the PID's single shared stamp
+        (no global advance; all pages of the PID get the same timestamp).
+        Otherwise advance the global counter by 1 s under ``timelock`` (legacy
+        per-file path for any caller that never opened a block)."""
         local = getattr(self, "_timetag_block_local", None)
         base = getattr(local, "base", None) if local is not None else None
         if base is not None:
-            off = getattr(local, "next", 0)
-            local.next = off + 1
-            return base + datetime.timedelta(seconds=off)
+            return base
         with self.timelock:
             my_time = self.download_time
             self.download_time += datetime.timedelta(seconds=1)

@@ -183,7 +183,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         failed, ok = self._process_one_pid_core(
             pid, needs_query,
             emit_phase=True, page_progress=True, drop_overall_inline=True,
-            apply_live=True, reserve_timetag_block=False,
+            apply_live=True,
         )
         if failed is None:
             return None
@@ -191,17 +191,17 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         return failed
 
     def _process_one_pid_core(self, pid, needs_query, *, emit_phase,
-                              page_progress, drop_overall_inline, apply_live,
-                              reserve_timetag_block):
+                              page_progress, drop_overall_inline, apply_live):
         """Core query+download for one PID. Returns ``(failed, ok)``.
 
         ``failed is None`` signals acquire returned no account (stop / all
         disabled). The flags let the concurrent path suppress per-PID phase /
         page-progress events (the coordinator owns those), skip the per-call
         queue swaps (the engines' queues are swapped once for the whole
-        concurrent phase), skip the per-PID live-settings re-apply (done once
-        up front), and reserve a contiguous timetag block so a PID's pages stay
-        non-interleaved across concurrent workers.
+        concurrent phase), and skip the per-PID live-settings re-apply (done
+        once up front). The per-PID shared timetag is owned by
+        ``download_thread._download_pid_group`` (the common download choke
+        point), so concurrent PIDs still get disjoint, non-interleaved stamps.
         """
         if apply_live:
             # Pick up any mid-run 「儲存設定」 on both engines before this PID
@@ -230,7 +230,6 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         account_ok = True
         download_ok = True
         neutral = False
-        block_begun = False
         try:
             if needs_query:
                 # The fetcher's get_download_url emits one ("progress",(1,
@@ -279,11 +278,6 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 # it over acc's IP — a mismatch Pixiv anti-fraud flags. Mirrors
                 # standalone Step 4 (_download_pid_with_scheduler).
                 self.downloader._pid_cookie_selection[normalize_pid(pid) or str(pid)] = acc.cookie
-                if reserve_timetag_block:
-                    # Contiguous timetag block so this PID's pages get
-                    # non-interleaved timestamps under concurrency. Thread-local.
-                    self.downloader._begin_pid_timetag_block(len(urls))
-                    block_begun = True
                 if page_progress:
                     _download_call = lambda: self._download_pid_group_with_page_progress(pid, urls)
                 else:
@@ -323,9 +317,6 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             neutral = True  # non-network failure: not the cookie's fault
             raise
         finally:
-            if block_begun:
-                with contextlib.suppress(Exception):
-                    self.downloader._end_pid_timetag_block()
             self.downloader._clear_current_download_account()
             # Stop mid-PID or a non-network error releases NEUTRALLY: don't credit
             # the cookie with a success (ok=True would refresh its trust window for
@@ -551,7 +542,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             failed, ok = self._process_one_pid_core(
                 pid, needs_query,
                 emit_phase=False, page_progress=False, drop_overall_inline=False,
-                apply_live=False, reserve_timetag_block=True,
+                apply_live=False,
             )
             if failed is None:
                 return None

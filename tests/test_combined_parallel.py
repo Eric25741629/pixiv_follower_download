@@ -167,19 +167,16 @@ def test_concurrent_stop_halts_submission(monkeypatch):
     assert len(processed) < 20
 
 
-# ── the user's hard requirement: a PID's page timetags must NOT interleave ──
-def test_timetag_block_contiguous_per_pid():
+# ── the user's hard requirement: a PID's pages share ONE stamp, PIDs differ ──
+def test_timetag_block_same_stamp_per_pid():
     d = _thread(workers=2).downloader
     d._begin_pid_timetag_block(3)
     tags = [d._jpg_advance_timetag() for _ in range(3)]
     d._end_pid_timetag_block()
-    fmt = "%Y%m%d_%H%M%S"
-    secs = [datetime.datetime.strptime(s, fmt) for s in tags]
-    assert (secs[1] - secs[0]).total_seconds() == 1
-    assert (secs[2] - secs[1]).total_seconds() == 1
+    assert tags[0] == tags[1] == tags[2]  # one artwork = one shared timestamp
 
 
-def test_timetag_blocks_disjoint_and_contiguous_across_threads():
+def test_timetag_blocks_shared_within_pid_disjoint_across_threads():
     d = _thread(workers=2).downloader
     results = {}
     start = threading.Barrier(2, timeout=5)
@@ -194,12 +191,9 @@ def test_timetag_blocks_disjoint_and_contiguous_across_threads():
     t2 = threading.Thread(target=worker, args=("Y", 4))
     t1.start(); t2.start(); t1.join(); t2.join()
 
-    fmt = "%Y%m%d_%H%M%S"
     for name in ("X", "Y"):
-        secs = [datetime.datetime.strptime(s, fmt) for s in results[name]]
-        for i in range(1, len(secs)):
-            assert (secs[i] - secs[i - 1]).total_seconds() == 1  # contiguous
-    assert set(results["X"]).isdisjoint(set(results["Y"]))        # no interleave
+        assert len(set(results[name])) == 1   # each PID's pages share one stamp
+    assert set(results["X"]).isdisjoint(set(results["Y"]))  # different PIDs differ
 
 
 def test_run_end_to_end_concurrent_emits_terminal(monkeypatch):

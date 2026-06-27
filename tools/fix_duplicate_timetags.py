@@ -26,6 +26,7 @@ import re
 import sys
 
 _PREFIX_RE = re.compile(r"^(\d{8}_\d{6})_(.+)$")
+_PID_RE = re.compile(r"PID(\d+)")
 _FMT = "%Y%m%d_%H%M%S"
 
 
@@ -34,6 +35,16 @@ def _parse_tag(tag: str) -> datetime.datetime | None:
         return datetime.datetime.strptime(tag, _FMT)
     except ValueError:
         return None
+
+
+def _pid_of(dirpath: str, name: str) -> str:
+    """Group key for a file: its PID when present, else a per-file key.
+
+    All pages of one PID share a timetag by design, so the dedup unit is the
+    PID — not the individual file. Files with no parseable PID fall back to a
+    unique per-file key (legacy per-file de-duplication for those)."""
+    m = _PID_RE.search(name)
+    return f"PID:{m.group(1)}" if m else f"FILE:{dirpath}\0{name}"
 
 
 def collect(root: str):
@@ -48,29 +59,47 @@ def collect(root: str):
 
 
 def plan_renames(entries):
-    """Compute [(dirpath, old_name, new_name, new_tag)] de-duplicating prefixes.
+    """Compute [(dirpath, old_name, new_name, new_tag)] giving each PID one tag.
 
-    Deterministic: entries sorted by (tag, path); the first occurrence of a
-    tag keeps it, later ones advance +1 s to the next globally unused tag.
+    De-duplication unit is the PID, not the file: all pages of one PID share a
+    timetag by design and must stay together. Each PID's original tag = the min
+    tag among its pages. PIDs are processed in (original-tag, pid) order; the
+    first PID claiming a tag keeps it, a later PID colliding on it advances +1 s
+    to the next unused tag and ALL its pages move there together. The set of
+    originally-occupied tags is pre-seeded so an existing PID's tag is never
+    stolen (no cascade), matching the prior single-page behaviour.
     """
-    entries = sorted(entries, key=lambda e: (e[2], e[0], e[1]))
-    used = {e[2] for e in entries}
-    seen: set[str] = set()
-    renames = []
+    by_pid: dict[str, list] = {}
     for dirpath, name, tag in entries:
-        if tag not in seen:
-            seen.add(tag)
+        by_pid.setdefault(_pid_of(dirpath, name), []).append((dirpath, name, tag))
+    pid_orig = {pid: min(t for _d, _n, t in files) for pid, files in by_pid.items()}
+
+    used = set(pid_orig.values())      # every PID's original tag is occupied
+    taken: set[str] = set()            # tags already claimed in this pass
+    assigned: dict[str, str] = {}
+    for pid in sorted(by_pid, key=lambda p: (pid_orig[p], p)):
+        tag = pid_orig[pid]
+        if tag not in taken:
+            taken.add(tag)
+            assigned[pid] = tag
             continue
         dt = _parse_tag(tag)
         while True:
             dt += datetime.timedelta(seconds=1)
             new_tag = dt.strftime(_FMT)
-            if new_tag not in used:
+            if new_tag not in used and new_tag not in taken:
                 break
         used.add(new_tag)
-        seen.add(new_tag)
-        new_name = new_tag + name[len(tag):]
-        renames.append((dirpath, name, new_name, new_tag))
+        taken.add(new_tag)
+        assigned[pid] = new_tag
+
+    renames = []
+    for pid, files in by_pid.items():
+        new_tag = assigned[pid]
+        for dirpath, name, tag in files:
+            if tag != new_tag:
+                renames.append((dirpath, name, new_tag + name[len(tag):], new_tag))
+    renames.sort(key=lambda r: (r[0], r[1]))
     return renames
 
 

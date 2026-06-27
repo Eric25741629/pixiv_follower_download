@@ -164,6 +164,9 @@ def test_download_pid_group_uses_account_proxy_session(monkeypatch):
     t._sleep_within_pid = lambda pid: None
     t.gif_or_jpg = lambda u, session=None: -1  # bypass actual download
     t._scheduler = object()  # truthy
+    # _download_pid_group now reserves one shared timetag per PID.
+    t.download_time = __import__("datetime").datetime(1970, 1, 1)
+    t._timetag_block_local = __import__("threading").local()
 
     failed = t._download_pid_group("777", ["https://i.pximg.net/img-original/img/1/777_p0.png"])
 
