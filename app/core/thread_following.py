@@ -18,8 +18,6 @@ from app.core.pixiv_thread_base import (
     PauseableThread,
 )
 
-_pid_count_lock = threading.Lock()
-
 class get_following(PauseableThread):
     '''抓取使用者關注的畫師清單'''
     def __init__(self, q, userid, cookies, Agent, following_scope):
@@ -85,9 +83,6 @@ class get_following(PauseableThread):
         self._pause_event.wait()
         if self._stop_event.is_set():
             return []
-        global pid_num
-        with _pid_count_lock:
-            pid_num = pid_num + 100
         url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
         resdicts = []
         for attempt in range(3):
