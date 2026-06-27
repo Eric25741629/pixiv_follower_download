@@ -205,6 +205,11 @@ def test_invalidate_cookie_status_writes_失效(run_controller, monkeypatch):
         def update_section(self, name, value):
             captured["value"] = value
 
+        def mutate_section(self, name, mutator):
+            # Mirror SettingsStore.mutate_section: run the mutator on the loaded
+            # section and capture the result (the RMW now happens in one lock).
+            captured["value"] = mutator(self.get_section(name))
+
     monkeypatch.setattr("app.gui.run_actions._store", lambda: FakeStore())
 
     run_controller._invalidate_cookie_status("c1")
@@ -212,6 +217,17 @@ def test_invalidate_cookie_status_writes_失效(run_controller, monkeypatch):
     assert new_entries[0]["status"] == "失效"
     assert new_entries[0]["last_tested_at"] > 1.0  # bumped to now
     assert new_entries[1] == {"cookie": "c2", "alias": "A2"}  # untouched
+
+    # A live cookie_status event must be emitted so the cookies view flips to
+    # 失效 immediately, not only after the next reload_from_settings.
+    events = []
+    while not run_controller._event_q.empty():
+        events.append(run_controller._event_q.get_nowait())
+    cookie_status = [e for e in events if getattr(e, "type", None) == "cookie_status"]
+    assert cookie_status, "on_disable must emit a cookie_status event"
+    payload = cookie_status[-1].data
+    assert payload[0] == "c1"
+    assert payload[1] == "失效"
 
 
 def test_attach_aliases_pairs_cookies_with_alias_map(run_controller):
@@ -251,3 +267,44 @@ def test_attach_aliases_flow_into_thread_alias_map():
     assert alias_map == {"c1": "Main", "c2": "Backup"}
     assert cookie_usage_label("c1", pool, alias_map) == "Main"
     assert cookie_usage_label("c2", pool, alias_map) == "Backup"
+
+
+class _StubView:
+    def __init__(self):
+        self._active_thread = None
+        self._step_states = ["idle"] * 4
+
+    def set_running(self, _b):
+        pass
+
+    def set_step_state(self, _i, _s):
+        pass
+
+
+def test_run_step_and_run_all_forward_require_idle_through_tracking_wrapper():
+    """flet_app.main wraps run_controller._start_step to capture the active
+    worker into a module global; that wrapper MUST forward kwargs. run_step /
+    run_all call _start_step(n, require_idle=True), so a wrapper that only
+    accepts (n) raises 'TypeError: ... unexpected keyword argument require_idle'
+    on the real GUI thread (unit tests bypass the wrapper, so this was missed).
+    Reproduce the flet_app wrapping and assert require_idle is forwarded."""
+    rc = RunController(_StubView(), Queue())
+    seen = []
+    orig = rc._start_step
+
+    # Mirrors flet_app.main's _start_step_with_tracking signature exactly.
+    def _wrap(n, *args, **kwargs):
+        seen.append((n, kwargs.get("require_idle")))
+        orig(n, *args, **kwargs)
+
+    rc._start_step = _wrap
+    rc._build_thread = lambda _n: None  # no real worker thread
+
+    rc.run_step(3)
+    rc.run_all()
+
+    assert seen, "run_step/run_all must invoke the wrapped _start_step"
+    assert all(ri is True for (_n, ri) in seen), (
+        "run_step/run_all must pass require_idle=True so the tracking wrapper "
+        "(and the TOCTOU idle-guard) receive it"
+    )

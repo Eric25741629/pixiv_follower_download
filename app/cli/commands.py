@@ -6,6 +6,7 @@ Exit codes are meaningful (0 ok, non-zero on error).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -110,7 +111,11 @@ def _cmd_cookie_test(args) -> int:
     results = []
     for c in cookies:
         try:
-            count, _ = pixiv_api.Test_cookies([c], agent)
+            # Test_cookies prints exceptions to stdout; redirect to stderr so a
+            # `--json` run keeps stdout a single clean JSON line (the CLI
+            # contract: JSON to stdout, human/diagnostic text to stderr).
+            with contextlib.redirect_stdout(sys.stderr):
+                count, _ = pixiv_api.Test_cookies([c], agent)
             ok = int(count) > 0
         except Exception:
             ok = False
@@ -134,9 +139,115 @@ def _cmd_following_export(args) -> int:
     return 0
 
 
+def _fmt_from_path_or_url(file_path, url) -> str:
+    """Pick an image format from the file path extension, falling back to the URL."""
+    for cand in (file_path, url):
+        if not cand:
+            continue
+        ext = os.path.splitext(str(cand))[1].lstrip(".").lower()
+        if ext:
+            return ext
+    return ""
+
+
+def _build_page_path_index(download_path):
+    """Walk ``download_path`` once, mapping ``(pid, page_index) -> abs path`` and
+    collecting stale ``.part`` temp files left by a force-killed atomic write.
+
+    Reuses the canonical filename parser so it understands every on-disk naming
+    form. Returns ``(index, part_files)``; both empty when the folder is missing.
+    One walk serves both so a 200k-file folder is scanned only once.
+    """
+    from app.core.pid_filesystem import extract_pid_pages
+    index: dict[tuple[str, int], str] = {}
+    part_files: list[str] = []
+    if not download_path or not os.path.isdir(download_path):
+        return index, part_files
+    for dirpath, _dirs, files in os.walk(download_path):
+        for fn in files:
+            if fn.endswith(".part"):
+                part_files.append(os.path.join(dirpath, fn))
+                continue
+            for pid, page in extract_pid_pages(fn):
+                index.setdefault((str(pid), int(page)), os.path.join(dirpath, fn))
+    return index, part_files
+
+
+def _resolve_page_file(pid, page_index, url, file_path, path_index):
+    """Resolve the on-disk path for a (pid, page): DB file_path first, else scan."""
+    if file_path and os.path.isfile(file_path):
+        return file_path
+    return path_index.get((str(pid), int(page_index)))
+
+
+def _cmd_verify_files(args) -> int:
+    from app.core.image_integrity import validate_image_file
+    from app.core.metadata_db import MetadataDB
+    base = _base_path()
+    download_path = str(_store().get_section("download").get("path") or "").strip()
+    db = MetadataDB(base)
+    try:
+        pages = db.get_downloaded_pages()
+        path_index, part_files = _build_page_path_index(download_path)
+        ok = truncated = missing = 0
+        bad_pages: list[tuple[str, int]] = []
+        for pid, page_index, url, file_path in pages:
+            resolved = _resolve_page_file(pid, page_index, url, file_path, path_index)
+            if not resolved or not os.path.isfile(resolved):
+                missing += 1
+                bad_pages.append((str(pid), int(page_index)))
+                continue
+            fmt = _fmt_from_path_or_url(resolved, url)
+            valid, _reason = validate_image_file(resolved, fmt)
+            if valid:
+                ok += 1
+            else:
+                truncated += 1
+                bad_pages.append((str(pid), int(page_index)))
+                if args.fix:
+                    with contextlib.suppress(Exception):
+                        os.remove(resolved)
+        reset = 0
+        if args.fix and bad_pages:
+            for pid, page_index in bad_pages:
+                db.mark_page_pending(pid, page_index)
+            reset = len(bad_pages)
+        # Stale .part temp files (force-kill mid-stream leaves the atomic-write
+        # temp behind; each run uses a new timetag name so they accumulate).
+        removed_part_files = 0
+        if args.fix:
+            for pf in part_files:
+                with contextlib.suppress(Exception):
+                    os.remove(pf)
+                    removed_part_files += 1
+    finally:
+        db.close()
+    payload = {
+        "downloaded_pages": len(pages),
+        "ok": ok,
+        "truncated": truncated,
+        "missing": missing,
+        "reset": reset,
+        "part_files": len(part_files),
+        "removed_part_files": removed_part_files,
+        "download_path": download_path,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(
+            f"已下載頁數={payload['downloaded_pages']} 完整(ok)={ok} "
+            f"截斷(truncated)={truncated} 遺失(missing)={missing} "
+            f"已重設待下載(reset)={reset} "
+            f"殘留.part={len(part_files)} 已清除.part={removed_part_files}",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def _cmd_run(args) -> int:
     from app.cli.headless_runner import run_headless
-    return run_headless(args.step)
+    return run_headless(args.step, force_rescan=bool(getattr(args, "force_rescan", False)))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -146,6 +257,9 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("run", help="run a pipeline step / all / combined")
     pr.add_argument("--step", required=True,
                     choices=["1", "2", "3", "4", "combined", "all"])
+    pr.add_argument("--force-rescan", action="store_true",
+                    help="Step 2 only: ignore the 30-day skip and re-scan all "
+                         "artists to backfill author user_id")
     pr.set_defaults(func=_cmd_run)
 
     ps = sub.add_parser("status", help="print DB status")
@@ -164,6 +278,14 @@ def build_parser() -> argparse.ArgumentParser:
     pkt = ksub.add_parser("test", help="test configured cookies")
     pkt.add_argument("--json", action="store_true")
     pkt.set_defaults(func=_cmd_cookie_test)
+
+    pv = sub.add_parser("verify-files",
+                        help="scan downloaded pages for truncated/missing files")
+    pv.add_argument("--fix", action="store_true",
+                    help="re-queue truncated/missing pages (mark pending) and "
+                         "delete truncated files")
+    pv.add_argument("--json", action="store_true")
+    pv.set_defaults(func=_cmd_verify_files)
 
     pf = sub.add_parser("following", help="following utilities")
     fsub = pf.add_subparsers(dest="following_cmd", required=True)

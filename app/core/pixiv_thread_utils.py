@@ -1,7 +1,6 @@
 import datetime
 import json
 import os
-import re
 import shutil
 import sys
 import traceback
@@ -54,89 +53,17 @@ def output_err(e):
     return errMsg
 
 
-def normalize_pid(value):
-    s = str(value).strip()
-    if not s:
-        return ""
-    if '_' in s:
-        s = s.split('_', 1)[0]
-    s = s.replace('p0', '')
-    m = re.search(r"\d+", s)
-    if m:
-        return m.group(0)
-    return s
-
-
-def normalize_pid_set(values):
-    out = set()
-    if not values:
-        return out
-    try:
-        for v in values:
-            pid = normalize_pid(v)
-            if pid:
-                out.add(pid)
-    except Exception:
-        pid = normalize_pid(values)
-        if pid:
-            out.add(pid)
-    return out
-
-
-def canonicalize_pximg_url_for_storage(url):
-    """
-    Normalize pximg original URL to a stable storage form without hash segment.
-    Example:
-      .../139112835-c476..._p0.jpg -> .../139112835_p0.jpg
-    """
-    try:
-        s = str(url).strip()
-        if not s:
-            return s
-        head, tail = s.rsplit("/", 1)
-        # Keep only the PID and page marker in filename for all_url.txt readability.
-        tail2 = re.sub(
-            r"^(\d{5,12})-[a-f0-9]+(_(?:p\d+|ugoira\d+)\.[A-Za-z0-9]+)$",
-            r"\1\2",
-            tail,
-            flags=re.IGNORECASE,
-        )
-        return head + "/" + tail2
-    except Exception:
-        return str(url)
-
-
-_PID_FROM_NAME_PATTERNS = [
-    re.compile(r"PID[=\s_-]?(\d{5,12})", re.IGNORECASE),
-    re.compile(r"illust[_-]?(\d{5,12})", re.IGNORECASE),
-    re.compile(r"(\d{5,12})_p\d+", re.IGNORECASE),
-    re.compile(r"(\d{5,12})p\d+", re.IGNORECASE),
-    # pximg original filename: 139112835-<hash>_p0.jpg
-    re.compile(r"^(\d{5,12})-[a-f0-9]+_p\d+", re.IGNORECASE),
-]
-
-
-def _extract_pid_candidates_from_name(file_name):
-    out = set()
-    try:
-        name = os.path.basename(str(file_name))
-    except Exception:
-        return out
-    for pattern in _PID_FROM_NAME_PATTERNS:
-        try:
-            for pid in pattern.findall(name):
-                n = normalize_pid(pid)
-                if n:
-                    out.add(n)
-        except Exception:
-            pass
-    try:
-        stem, _ = os.path.splitext(name)
-        if re.fullmatch(r"\d{5,12}", stem):
-            out.add(stem)
-    except Exception:
-        pass
-    return out
+# PID normalization + filename mining moved to pid_utils.py (file-size refactor).
+# Re-exported so existing ``from app.core.pixiv_thread_utils import normalize_pid``
+# (and normalize_pid_set / canonicalize_pximg_url_for_storage / the filename
+# miner) callers keep working unchanged.
+from app.core.pid_utils import (  # noqa: F401  (public re-export)
+    normalize_pid,
+    normalize_pid_set,
+    canonicalize_pximg_url_for_storage,
+    _extract_pid_candidates_from_name,
+    _PID_FROM_NAME_PATTERNS,
+)
 
 
 def trash_file(file_path, base_path, max_days=30):
@@ -263,55 +190,18 @@ def load_exist_pid_set(base_path):
     return out
 
 
-def scan_download_folder_for_pid_set(download_path, recursive=True):
-    found = set()
-    scanned_files = 0
-    p = str(download_path or "").strip()
-    if not p or (not os.path.isdir(p)):
-        return found, scanned_files
-    for root, _, files in os.walk(p):
-        for file_name in files:
-            scanned_files += 1
-            try:
-                found.update(_extract_pid_candidates_from_name(file_name))
-            except Exception:
-                pass
-        if not recursive:
-            break
-    return found, scanned_files
-
-
-def _get_folder_file_count_cache_path(base_path):
-    """取得檔案數量快取檔案的路徑"""
-    return os.path.join(base_path, "folder_file_count_cache.json")
-
-
-def _count_files_in_folder(download_path, recursive=True):
-    """遞迴計算資料夾中的檔案數量"""
-    p = str(download_path or "").strip()
-    if not p or (not os.path.isdir(p)):
-        return 0
-    count = 0
-    for root, _, files in os.walk(p):
-        count += len(files)
-        if not recursive:
-            break
-    return count
-
-
-def _load_folder_file_count_cache(base_path):
-    """載入檔案數量快取"""
-    cache_path = _get_folder_file_count_cache_path(base_path)
-    return safe_read_json(cache_path, {})
-
-
-def _save_folder_file_count_cache(base_path, cache):
-    """儲存檔案數量快取"""
-    try:
-        cache_path = _get_folder_file_count_cache_path(base_path)
-        atomic_write_json(cache_path, cache, backup=True)
-    except Exception:
-        pass
+# Download-folder scan + mtime-signature cache moved to folder_scan.py
+# (file-size refactor). Re-exported below so existing callers and the
+# ``sync_exist_pid_with_download_folder`` orchestrator (which stays here and
+# looks these up as module globals) are unchanged.
+from app.core.folder_scan import (  # noqa: F401  (public re-export)
+    _folder_dir_mtimes_match,
+    _get_folder_file_count_cache_path,
+    _load_folder_file_count_cache,
+    _save_folder_file_count_cache,
+    _scan_download_folder,
+    scan_download_folder_for_pid_set,
+)
 
 
 # ─── PHASE-A-EXIST-PID-MIGRATION ──────────────────────────────────────────
@@ -378,27 +268,27 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
     merged = set(disk_set)
     merged.update(normalize_pid_set(current_exist_pid))
 
-    # 檢查檔案數量快取
+    # 目錄 mtime 簽章快取：未變動就完全略過 os.walk（只 stat 已知目錄）
     cache = _load_folder_file_count_cache(base_path)
-    current_file_count = _count_files_in_folder(download_path, recursive=recursive)
-
     download_path_norm = os.path.normpath(str(download_path or ""))
     cached_info = cache.get(download_path_norm, {})
-    cached_count = cached_info.get("file_count", -1)
-    cached_pids = set(cached_info.get("pids", []))
+    cached_dir_mtimes = cached_info.get("dir_mtimes", {})
+    prev_cached_pids = set(cached_info.get("pids", []))
 
-    # 如果檔案數量相同，使用快取的 PID 結果
-    used_cache = cached_count == current_file_count and current_file_count > 0
+    used_cache = _folder_dir_mtimes_match(cached_dir_mtimes)
+    new_pids = set()
     if used_cache:
-        scanned_pids = cached_pids
-        scanned_files = current_file_count
+        scanned_pids = prev_cached_pids
+        scanned_files = int(cached_info.get("file_count", 0) or 0)
     else:
-        # 檔案數量變化，重新掃描
-        scanned_pids, scanned_files = scan_download_folder_for_pid_set(
+        # 任一目錄 mtime 變了（或首次/舊格式快取）→ 重新掃描一趟
+        scanned_pids, dir_mtimes, scanned_files = _scan_download_folder(
             download_path, recursive=recursive,
         )
+        new_pids = scanned_pids - prev_cached_pids
         cache[download_path_norm] = {
-            "file_count": current_file_count,
+            "file_count": scanned_files,
+            "dir_mtimes": dir_mtimes,
             "pids": list(scanned_pids),
             "updated_at": datetime.datetime.now().isoformat(),
         }
@@ -412,10 +302,13 @@ def sync_exist_pid_with_download_folder(base_path, download_path, current_exist_
     if base_path and changed_vs_disk:
         json_path = os.path.join(base_path, "exist_pid.json")
         atomic_write_json(json_path, list(merged), backup=True)  # PHASE-A
-    # PHASE-A: shadow-write the scanned set (not merged — DB already has
-    # closed-artwork rows for every PID workers have downloaded; we only
-    # need to register externally-discovered ones).
-    _shadow_write_exist_pid_to_db(base_path, scanned_pids, event_log=event_log)
+    # PHASE-A: shadow-write only the *newly discovered* PIDs (the delta).
+    # On a cache hit nothing is new; previously-scanned PIDs were already
+    # mirrored on the run that discovered them. This avoids re-importing the
+    # whole folder set (200k+ rows) every run AND keeps the DB file signature
+    # stable so the closed-artwork-set cache survives across the step build.
+    if new_pids:
+        _shadow_write_exist_pid_to_db(base_path, new_pids, event_log=event_log)
 
     return {
         "merged_set": merged,
@@ -511,329 +404,60 @@ def read_pid_lines(file_path):
         return []
 
 
-def safe_read_json(file_path, default=None):
-    """Read a JSON file, returning `default` on any error (missing file, decode error, etc.)."""
-    try:
-        if not os.path.isfile(file_path):
-            return default
-        with open(file_path, encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return default
+# JSON read + history-backup recovery helpers moved to json_recovery.py
+# (file-size refactor). Re-exported so existing
+# ``from app.core.pixiv_thread_utils import safe_read_json`` /
+# ``read_json_with_recovery`` (and the internal _safe_emit / _NO_RECOVERY /
+# _try_recover_from_history / _list_history_backups / _atomic_restore_file
+# names) callers keep working unchanged.
+from app.core.json_recovery import (  # noqa: F401  (public re-export)
+    _NO_RECOVERY,
+    _atomic_restore_file,
+    _list_history_backups,
+    _safe_emit,
+    _try_recover_from_history,
+    read_json_with_recovery,
+    safe_read_json,
+)
 
 
-def _safe_emit(emit, html):
-    """Best-effort callback into the optional ``emit`` hook."""
-    if emit is None:
-        return
-    try:
-        emit(html)
-    except Exception:
-        pass
+# Cookie pool parsing / dedupe / aliasing / usage-label moved to cookie_utils.py
+# (file-size refactor). Re-exported so existing
+# ``from app.core.pixiv_thread_utils import normalize_cookie_entries`` (and the
+# rest of the cookie helpers, incl. the deprecated speed_divisor/speedup) callers
+# keep working unchanged.
+from app.core.cookie_utils import (  # noqa: F401  (public re-export)
+    _strip_cookie_prefix,
+    _parse_cookie_entry,
+    _merge_duplicate_entry,
+    _dedupe_cookie_entries,
+    _fill_missing_aliases,
+    normalize_cookie_entries,
+    normalize_cookie_pool,
+    cookie_usage_label,
+    format_cookie_usage_summary,
+    cookie_speed_divisor,
+    apply_cookie_pool_speedup,
+    init_cookie_fields,
+)
 
 
-def _list_history_backups(hist_dir, base):
-    """Return sibling backup files for ``base``, newest first."""
-    try:
-        candidates = [
-            os.path.join(hist_dir, n) for n in os.listdir(hist_dir)
-            if n.startswith(base + '.')
-        ]
-    except Exception:
-        return []
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return candidates
-
-
-def _atomic_restore_file(file_path, value):
-    """Replace a corrupt JSON file with ``value`` via tmp + os.replace."""
-    try:
-        tmp = file_path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(value, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, file_path)
-    except Exception:
-        pass
-
-
-_NO_RECOVERY = object()
-
-
-def _try_recover_from_history(file_path, emit):
-    """Attempt to restore a corrupt JSON file from its history/ backups.
-
-    Returns the recovered value on success, or the sentinel
-    ``_NO_RECOVERY`` when no usable backup was found (so callers can
-    distinguish a legitimately recovered ``None`` from "nothing found").
-    """
-    hist_dir = os.path.join(os.path.dirname(file_path), 'history')
-    base = os.path.basename(file_path)
-    if not os.path.isdir(hist_dir):
-        _safe_emit(emit,
-            f"<p><font color='red'>[警告] 無 history/ 備份可還原，"
-            f"{base} 將以空值繼續。</font></p>"
-        )
-        return _NO_RECOVERY
-    for cand in _list_history_backups(hist_dir, base):
-        try:
-            with open(cand, encoding='utf-8') as f:
-                value = json.load(f)
-        except Exception:
-            continue
-        _atomic_restore_file(file_path, value)
-        n = len(value) if isinstance(value, (dict, list)) else 0
-        _safe_emit(emit,
-            f"<p><font color='green'>[還原] 已從 "
-            f"history/{os.path.basename(cand)} 還原 {n} 筆</font></p>"
-        )
-        return value
-    _safe_emit(emit,
-        f"<p><font color='red'>[警告] history/ 內所有 {base} 備份"
-        f"都無法解析，將以空值繼續。</font></p>"
-    )
-    return _NO_RECOVERY
-
-
-def read_json_with_recovery(file_path, default=None, emit=None):
-    """Read a JSON file; on parse failure, try to auto-recover from
-    the latest valid backup in ``history/`` next to it.
-
-    Returns ``(value, status)`` where status is one of:
-      'missing'   — file doesn't exist; returned default
-      'ok'        — file parsed cleanly
-      'recovered' — file was corrupt; restored from history/<name>.<...>
-      'corrupt'   — file was corrupt and no usable backup found
-
-    ``emit`` is an optional callback ``emit(html_message)`` for surfacing
-    recovery actions to the user (e.g., the worker thread's _q.put).
-    """
-    if not os.path.isfile(file_path):
-        return default, 'missing'
-    try:
-        with open(file_path, encoding='utf-8') as f:
-            return json.load(f), 'ok'
-    except Exception as parse_err:
-        _safe_emit(emit,
-            f"<p><font color='red'>[警告] {os.path.basename(file_path)} "
-            f"解析失敗（{type(parse_err).__name__}），嘗試從 history/ 還原...</font></p>"
-        )
-        recovered = _try_recover_from_history(file_path, emit)
-        if recovered is _NO_RECOVERY:
-            return default, 'corrupt'
-        return recovered, 'recovered'
-
-
-def _strip_cookie_prefix(text):
-    """Drop the leading ``Cookie:`` prefix some users paste verbatim."""
-    if text.lower().startswith("cookie:"):
-        return text.split(":", 1)[1].strip()
-    return text
-
-
-def _parse_cookie_entry(item):
-    """Convert one raw input (str or dict) into a normalised entry dict.
-
-    Returns ``None`` for empty / blank inputs so the caller can skip them.
-    """
-    if isinstance(item, dict):
-        text = str(item.get("cookie", "") or "").strip()
-        alias = str(item.get("alias", "") or "").strip()
-        status = str(item.get("status", "") or "").strip()
-        last_tested_at = item.get("last_tested_at", None)
-        enabled_raw = item.get("enabled", None)
-    else:
-        text = str(item or "").strip()
-        alias = ""
-        status = ""
-        last_tested_at = None
-        enabled_raw = None
-
-    if not text:
-        return None
-    text = _strip_cookie_prefix(text)
-    if not text:
-        return None
-
-    entry = {"cookie": text, "alias": alias}
-    if status:
-        entry["status"] = status
-    if last_tested_at is not None:
-        entry["last_tested_at"] = last_tested_at
-    # Only persist `enabled` when explicitly disabled; missing key means
-    # enabled (the default), so legacy entries stay free of the key.
-    if enabled_raw is False:
-        entry["enabled"] = False
-    return entry
-
-
-def _merge_duplicate_entry(existing, duplicate):
-    """Carry alias / status / last_tested_at / enabled forward when the dedupe target is missing them."""
-    alias_text = str(duplicate.get("alias", "") or "").strip()
-    if alias_text and not str(existing.get("alias", "")).strip():
-        existing["alias"] = alias_text
-    if "status" in duplicate and not existing.get("status"):
-        existing["status"] = duplicate["status"]
-    if "last_tested_at" in duplicate and existing.get("last_tested_at") is None:
-        existing["last_tested_at"] = duplicate["last_tested_at"]
-    # Explicit `enabled=False` on either side wins (safer default: keep disabled).
-    if duplicate.get("enabled") is False or existing.get("enabled") is False:
-        existing["enabled"] = False
-
-
-def _dedupe_cookie_entries(entries):
-    """Collapse entries with the same cookie string, merging metadata first-wins."""
-    deduped = []
-    seen = {}
-    for item in entries:
-        cookie_text = str(item.get("cookie", "") or "").strip()
-        if not cookie_text:
-            continue
-        if cookie_text in seen:
-            _merge_duplicate_entry(deduped[seen[cookie_text]], item)
-            continue
-        seen[cookie_text] = len(deduped)
-        new_entry = {
-            "cookie": cookie_text,
-            "alias": str(item.get("alias", "") or "").strip(),
-        }
-        if "status" in item:
-            new_entry["status"] = item["status"]
-        if "last_tested_at" in item:
-            new_entry["last_tested_at"] = item["last_tested_at"]
-        if item.get("enabled") is False:
-            new_entry["enabled"] = False
-        deduped.append(new_entry)
-    return deduped
-
-
-def _fill_missing_aliases(entries, alias_map):
-    """Populate empty ``alias`` fields from a ``{cookie: alias}`` lookup."""
-    if not isinstance(alias_map, dict) or not alias_map:
-        return
-    for entry in entries:
-        if entry.get("alias"):
-            continue
-        entry["alias"] = str(alias_map.get(entry.get("cookie", ""), "") or "").strip()
-
-
-def normalize_cookie_entries(raw_value, alias_map=None):
-    """Normalise any raw cookie input into a deduplicated list of {cookie, alias} dicts.
-
-    alias_map: optional {cookie_str: alias_str} dict to fill in aliases that are not
-    already embedded in the raw entries (used by the GUI cookie-persistence layer).
-    """
-    if isinstance(raw_value, (list, tuple, set)):
-        candidates = list(raw_value)
-    else:
-        candidates = [raw_value]
-
-    parsed = [e for e in (_parse_cookie_entry(item) for item in candidates) if e]
-    deduped = _dedupe_cookie_entries(parsed)
-    _fill_missing_aliases(deduped, alias_map)
-    return deduped
-
-
-def normalize_cookie_pool(raw_value):
-    """Return a deduplicated list of cookie strings from raw input."""
-    return [x.get("cookie", "") for x in normalize_cookie_entries(raw_value) if str(x.get("cookie", "")).strip()]
-
-
-def cookie_usage_label(cookie_value, cookie_pool=None, alias_map=None):
-    """Return a human-readable label for a cookie value (alias → pool index → fallback)."""
-    cookie_text = str(cookie_value or "").strip()
-    if not cookie_text:
-        return "未提供Cookie"
-    try:
-        if isinstance(alias_map, dict):
-            alias = str(alias_map.get(cookie_text, "") or "").strip()
-            if alias:
-                return alias
-    except Exception:
-        pass
-    try:
-        if cookie_pool and cookie_text in cookie_pool:
-            return f"Cookie{cookie_pool.index(cookie_text) + 1}"
-    except Exception:
-        pass
-    return "Cookie"
-
-
-def format_cookie_usage_summary(cookie_usage_counts, cookie_pool=None, alias_map=None):
-    """Return a summary string of cookie usage counts."""
-    try:
-        if not isinstance(cookie_usage_counts, dict) or not cookie_usage_counts:
-            return "未使用 Cookie"
-        normalized_items = []
-        total = 0
-        for cookie_label, count in cookie_usage_counts.items():
-            try:
-                count_int = int(count)
-            except Exception:
-                count_int = 0
-            if count_int <= 0:
-                continue
-            total += count_int
-            normalized_items.append((str(cookie_label), count_int))
-        if total <= 0:
-            return "未使用 Cookie"
-        normalized_items.sort(key=lambda item: (-item[1], item[0]))
-        parts = [f"{lbl} {cnt} 次" for lbl, cnt in normalized_items]
-        return "總計 {} 次；{}".format(total, "，".join(parts))
-    except Exception:
-        return "未使用 Cookie"
-
-
-# Deprecated: superseded by AccountScheduler per-account cooldown. Kept for import compat.
-def cookie_speed_divisor(cookie_pool):
-    """Speed multiplier for multi-cookie pool: n=1→1.0x, n=2→1.6x … max 4.0x."""
-    try:
-        n = len(cookie_pool or [])
-    except Exception:
-        n = 0
-    if n <= 1:
-        return 1.0
-    return min(4.0, 1.0 + 0.6 * float(n - 1))
-
-
-# Deprecated: superseded by AccountScheduler per-account cooldown. Kept for import compat.
-def apply_cookie_pool_speedup(delay, cookie_pool):
-    """Reduce delay proportionally to cookie pool size."""
-    try:
-        d = int(delay)
-    except Exception:
-        return delay
-    if d <= 0:
-        return 0
-    div = cookie_speed_divisor(cookie_pool)
-    if div <= 1.0:
-        return d
-    return max(1, int(round(float(d) / div)))
-
-
-def init_cookie_fields(raw_cookies):
-    """
-    Parse raw cookie input into the 4-tuple used by thread __init__.
-    Returns (cookie_entries, cookie_pool, alias_map, first_cookie_str).
-    """
-    entries = normalize_cookie_entries(raw_cookies)
-    pool = [x.get("cookie", "") for x in entries if str(x.get("cookie", "")).strip()]
-    alias_map = {
-        str(x.get("cookie", "")).strip(): str(x.get("alias", "") or "").strip()
-        for x in entries
-        if str(x.get("cookie", "")).strip()
-    }
-    first = pool[0] if pool else str(raw_cookies or "").strip()
-    return entries, pool, alias_map, first
-
-
-def fetch_with_cookie_retry(http_get, url, headers, cookies, retry_statuses=(403, 404)):
+def fetch_with_cookie_retry(http_get, url, headers, cookies, retry_statuses=(403, 404),
+                            timeout=(10, 30)):
     """
     Request once, then retry once with Cookie when status is in retry_statuses
     and the first request didn't include Cookie.
     Returns (final_response, trace_info, first_response_or_none).
+
+    ``timeout`` is a (connect, read) tuple passed to ``http_get``. It MUST be
+    set: this is the ugoira_meta fetch that precedes every ugoira download, and
+    an unbounded request here can hang the worker forever (the 2026-06-21 wedge,
+    same class as the image-body hang). The body is read non-streamed by the
+    caller (``json.loads(resp.content)``), so the read timeout bounds a silent
+    socket while the small JSON makes a trickle window negligible.
     """
     first_headers = dict(headers or {})
-    first_response = http_get(url, headers=first_headers, stream=True)
+    first_response = http_get(url, headers=first_headers, stream=True, timeout=timeout)
     first_status = getattr(first_response, "status_code", None)
     trace = {
         "first_try_status": first_status,
@@ -845,7 +469,7 @@ def fetch_with_cookie_retry(http_get, url, headers, cookies, retry_statuses=(403
     if first_status in set(retry_statuses or ()) and (not has_cookie_in_first) and str(cookies or "").strip():
         retry_headers = dict(first_headers)
         retry_headers["Cookie"] = str(cookies).strip()
-        retry_response = http_get(url, headers=retry_headers, stream=True)
+        retry_response = http_get(url, headers=retry_headers, stream=True, timeout=timeout)
         retry_status = getattr(retry_response, "status_code", None)
         trace["retry_used"] = True
         trace["retry_with_cookie_status"] = retry_status
@@ -878,17 +502,27 @@ def to_int_lenient(value, default=None):
 
 
 def normalize_filter_tags(tags):
-    """Lowercase + dedupe a tag-filter list.  Returns ``[]`` for non-list
-    input.  Best-effort routes through ``tag_edit.Tag`` for alias expansion
-    when available."""
+    """Lowercase + strip + dedupe a tag-filter list.  Returns ``[]`` for
+    non-list input.  Operates on the raw tag string with no alias / translation
+    rewriting, so the user-configured filter strings are compared verbatim
+    against Pixiv's source tags.
+
+    .. warning::
+        Historical behavior routed filter tags through ``tag_edit.Tag()``
+        which applied ~300 Japanese→Chinese translation rules. That module
+        was removed because the silent rewriting (a) broke filter matching
+        when users typed the Japanese form, and (b) permanently mutated the
+        cached tag strings in ``artworks.tags`` and ``all_url_meta.json``.
+
+        **Migration note for callers:** if a user's ban_tag / must_tag list
+        was tuned against the *translated* string (e.g. ``Hololive`` instead
+        of ``ホロライブ``), those entries silently stop matching after the
+        switch to verbatim comparison. The user must re-enter the filter
+        tags using Pixiv's original strings.
+    """
     out = []
     if not isinstance(tags, list):
         return out
-    try:
-        import tag_edit
-        tags = tag_edit.Tag(tags)
-    except Exception:
-        pass
     for t in tags:
         s = str(t).strip()
         if s:

@@ -72,7 +72,6 @@ jobs:
             --collect-submodules selenium `
             --collect-submodules bs4 `
             --hidden-import pixiv_api `
-            --hidden-import tag_edit `
             --hidden-import update_selenium `
             --hidden-import user_info `
             --hidden-import PIL `

@@ -349,3 +349,116 @@ def test_new_keys_merged_into_old_settings(tmp_path):
     perf = store.get_section("performance")
     assert perf["intra_pid_wait_min"] == 5
     assert perf["intra_pid_wait_max"] == 15
+
+
+# ── concurrency: read-modify-write must not lose cross-section updates ──────
+#
+# Regression for the combined-mode (邊查邊下 / Step 3+4) cookie-refresh bug.
+# During a run two threads write settings.json with no synchronisation:
+#   * dispatcher thread, every PID: handle_timechanged ->
+#     update_fields("download", ...)  (combined emits "timechanged" per PID), and
+#   * worker thread, on each cookie's first success: _refresh_cookie_timestamp
+#     -> update_section("auth", ...).
+# Each does load() -> modify ONE section -> save() the WHOLE file, so whichever
+# saves last reverts the other thread's section to its stale snapshot. The
+# visible symptom is the cookie last_tested_at refresh (auth) being clobbered by
+# a download write -> the cookies view shows stale state ("cookies 沒有正常刷新").
+
+class _PausingStore(SettingsStore):
+    """SettingsStore whose first load() parks mid read-modify-write.
+
+    Lets a test deterministically interleave two writers: this store loads,
+    parks (still inside its update_* call), a second writer completes a full RMW
+    on a different section, then this one resumes and saves. Separate instances
+    also prove the lock is shared per-file, not per-instance.
+    """
+
+    def __init__(self, base_path, paused, resume):
+        super().__init__(base_path)
+        self._paused = paused
+        self._resume = resume
+        self._armed = True
+
+    def load(self):
+        data = super().load()
+        if self._armed:
+            self._armed = False
+            self._paused.set()
+            self._resume.wait(5.0)
+        return data
+
+
+def test_concurrent_section_writes_do_not_clobber(tmp_path):
+    import threading
+    import time
+
+    base = str(tmp_path)
+    seed = SettingsStore(base)
+    seed.save(seed._merge_defaults({
+        "auth": {"cookies_entries": [
+            {"cookie": "c", "status": "有效", "last_tested_at": 1.0},
+        ]},
+        "download": {"download_time": "OLD"},
+    }))
+
+    paused, resume = threading.Event(), threading.Event()
+    a_store = _PausingStore(base, paused, resume)   # writes auth, parks mid-RMW
+    b_store = SettingsStore(base)                    # writes download, separate instance
+
+    def writer_a():
+        a_store.update_section("auth", {"cookies_entries": [
+            {"cookie": "c", "status": "有效", "last_tested_at": 999.0},
+        ]})
+
+    ta = threading.Thread(target=writer_a)
+    ta.start()
+    assert paused.wait(5.0), "writer A never reached its mid-RMW pause"
+
+    tb = threading.Thread(
+        target=lambda: b_store.update_fields("download", {"download_time": "NEW"})
+    )
+    tb.start()
+    time.sleep(0.25)  # B finishes (unlocked) or blocks on the lock (locked)
+    resume.set()
+    ta.join(5.0)
+    tb.join(5.0)
+
+    final = SettingsStore(base)
+    # B's download write must survive (committed while A was parked).
+    assert final.get_section("download")["download_time"] == "NEW"
+    # A's auth write must also be present.
+    assert final.get_section("auth")["cookies_entries"][0]["last_tested_at"] == 999.0
+
+
+def test_parallel_writers_lose_no_updates(tmp_path):
+    """Stress: two threads each bump their own section's counter; with proper
+    serialisation every increment survives (final counter == iteration count)."""
+    import threading
+
+    base = str(tmp_path)
+    seed = SettingsStore(base)
+    data = seed._merge_defaults({})
+    data["auth"] = {"n": 0}
+    data["download"] = {"n": 0}
+    seed.save(data)
+
+    iters = 60
+
+    def bump(section):
+        for _ in range(iters):
+            store = SettingsStore(base)
+            cur = store.get_section(section).get("n", 0)
+            store.update_fields(section, {"n": cur + 1})
+
+    threads = [
+        threading.Thread(target=bump, args=("auth",)),
+        threading.Thread(target=bump, args=("download",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(20.0)
+
+    final = SettingsStore(base)
+    assert final.get_section("auth")["n"] == iters
+    assert final.get_section("download")["n"] == iters

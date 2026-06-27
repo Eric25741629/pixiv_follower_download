@@ -12,19 +12,28 @@ import datetime
 import json
 import logging
 import os
-import re
 import sys
 import threading
 import time
 from typing import IO
 
-EVENTS_DIRNAME = "events"
-_FILENAME_FMT = "events-{date}.jsonl"
+# Pure file iteration / naming helpers split into event_log_io.py (file-size
+# refactor); re-imported here so existing
+# ``from app.core.event_log import _iter_events, _iter_lines_reverse,
+# _parse_event_filename, _sorted_event_files`` callers and the in-module
+# references (EventLog methods / replay / recover_tail look them up as module
+# globals) are unchanged. _FILENAME_FMT / _EVENTS_RE move with them.
+from app.core.event_log_io import (  # noqa: F401  (public re-export)
+    _EVENTS_RE,
+    _FILENAME_FMT,
+    _event_filename,
+    _iter_events,
+    _iter_lines_reverse,
+    _parse_event_filename,
+    _sorted_event_files,
+)
 
-# Filename scheme: 'events-YYYYMMDD.jsonl' is the day's first/oldest chunk
-# (sequence 0, kept bare for back-compat); same-day size-based rotation adds
-# 'events-YYYYMMDD.NNN.jsonl' (zero-padded sequence >= 1).
-_EVENTS_RE = re.compile(r"^events-(\d{8})(?:\.(\d+))?\.jsonl$")
+EVENTS_DIRNAME = "events"
 
 # Anchors that bound crash recovery: everything physically AFTER the most recent
 # one is an orphan to re-apply. 'checkpoint' is emitted at startup (after
@@ -54,72 +63,9 @@ def _today_key() -> str:
     return datetime.datetime.now().strftime("%Y%m%d")
 
 
-def _event_filename(date: str, seq: int) -> str:
-    """Build an event-log filename. seq <= 0 -> bare 'events-DATE.jsonl' (the
-    historical name); seq >= 1 -> 'events-DATE.NNN.jsonl' for same-day rotation."""
-    if seq <= 0:
-        return _FILENAME_FMT.format(date=date)
-    return f"events-{date}.{seq:03d}.jsonl"
-
-
-def _parse_event_filename(name: str):
-    """Return (date_str, seq) for an event-log filename, or None. A bare
-    'events-DATE.jsonl' is sequence 0 (the day's first/oldest chunk)."""
-    m = _EVENTS_RE.match(name)
-    if not m:
-        return None
-    return (m.group(1), int(m.group(2)) if m.group(2) is not None else 0)
-
-
-def _sorted_event_files(log_dir: str, *, reverse: bool = False) -> list[str]:
-    """Event-log filenames sorted chronologically by (date, seq).
-
-    Uses parsed keys, NOT lexical order: '.001' must sort AFTER the bare
-    same-day file, which a plain string sort gets wrong because '.' < 'j'.
-    """
-    try:
-        items = []
-        for n in os.listdir(log_dir):
-            key = _parse_event_filename(n)
-            if key is not None:
-                items.append((key, n))
-    except OSError:
-        return []
-    items.sort(key=lambda x: x[0], reverse=reverse)
-    return [n for _, n in items]
-
-
-def _iter_lines_reverse(path: str, *, block_size: int = 65536, max_bytes: int | None = None):
-    """Yield text lines from ``path`` newest-first (from EOF backward).
-
-    Streams fixed-size blocks with a partial-line carry, so a single line longer
-    than ``block_size`` (e.g. a fat pages.upsert_bulk record) is still
-    reassembled and yielded whole. When ``max_bytes`` is set, stops after
-    reading that many bytes from the end (bounds startup scans); callers compare
-    ``os.path.getsize(path)`` to ``max_bytes`` to distinguish 'reached start of
-    file' from 'hit the budget'. Decodes UTF-8 with replacement so a torn final
-    record from a crash never raises.
-    """
-    with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        pos = f.tell()
-        carry = b""
-        read = 0
-        while pos > 0:
-            chunk = min(block_size, pos)
-            pos -= chunk
-            f.seek(pos)
-            block = f.read(chunk)
-            read += chunk
-            data = block + carry
-            parts = data.split(b"\n")
-            carry = parts[0]  # fragment continued in an earlier (not-yet-read) block
-            for piece in reversed(parts[1:]):
-                yield piece.decode("utf-8", "replace")
-            if max_bytes is not None and read >= max_bytes:
-                return  # dangling carry is a partial line at the boundary; drop it
-        if carry:
-            yield carry.decode("utf-8", "replace")
+# _event_filename / _parse_event_filename / _sorted_event_files /
+# _iter_lines_reverse moved to event_log_io (re-imported at the top of this
+# module).
 
 
 class EventLog:
@@ -342,7 +288,14 @@ class EventLog:
             path = os.path.join(self._dir, files[idx])
             try:
                 has_anchor = False
-                for ln in _iter_lines_reverse(path, max_bytes=_DETECT_MAX_SCAN_BYTES):
+                # Scan the WHOLE file, not just the trailing 16 MB: files rotate
+                # at rotate_size_bytes (128 MB) and anchors (session.start /
+                # checkpoint / snapshot) are written at a file's HEAD while it is
+                # still small, so a 16 MB tail window misses them once the file
+                # grows — which made _anchor_protected_basenames protect every
+                # file and silently defeat the byte-cap retention. The reverse
+                # stream short-circuits on the first anchor, so cost stays low.
+                for ln in _iter_lines_reverse(path, max_bytes=None):
                     s = ln.strip()
                     if not s:
                         continue
@@ -507,6 +460,9 @@ def _dispatch_table():
                            discovered_at=e.get("discovered_at"),
                            user_id=e.get("user_id"))
 
+    def _artwork_user_id_backfill(db, e):
+        db.backfill_user_ids(e.get("pids", []), e.get("user_id"))
+
     def _artwork_revoked(db, e):
         db.mark_artwork_revoked(pid=e["pid"], revoked_at=e.get("revoked_at"))
 
@@ -525,6 +481,7 @@ def _dispatch_table():
         "pages.downloaded_bulk": _pages_downloaded_bulk,
         "artwork.upsert": _artwork_upsert,
         "artwork.discovered": _artwork_discovered,
+        "artwork.user_id_backfill": _artwork_user_id_backfill,
         "artwork.revoked": _artwork_revoked,
         "artwork.imported_set": _artwork_imported_set,
         "session.start": _noop,
@@ -534,23 +491,7 @@ def _dispatch_table():
     }
 
 
-def _iter_events(log_dir: str):
-    """Yield events from all events-*.jsonl files in chronological order."""
-    names = _sorted_event_files(log_dir)
-    for name in names:
-        path = os.path.join(log_dir, name)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for ln in f:
-                    ln = ln.strip()
-                    if not ln:
-                        continue
-                    try:
-                        yield json.loads(ln)
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            continue
+# _iter_events moved to event_log_io (re-imported at the top of this module).
 
 
 def replay(
@@ -562,9 +503,13 @@ def replay(
 ) -> ReplayResult:
     """Rebuild a DB at db_path from snapshot (optional) + all events in log_dir.
 
-    Restore snapshot first (via SQLite backup API), then apply every event with
-    timestamp > snapshot's. If no snapshot is provided, apply everything from
-    the start of the log.
+    Restore snapshot first (via SQLite backup API), then apply every event whose
+    timestamp is >= the snapshot's (a strict '<' cutoff for *skipping*). The
+    boundary millisecond is re-applied rather than skipped because 't' is only
+    millisecond-resolution: an event emitted in the same millisecond as the
+    snapshot but AFTER the backup ran must not be dropped, and re-applying is
+    idempotent. If no snapshot is provided, apply everything from the start of
+    the log.
     """
     import sqlite3
     from app.core.metadata_db import DB_FILENAME, MetadataDB
@@ -596,7 +541,7 @@ def replay(
     result = ReplayResult()
     if dry_run:
         for ev in _iter_events(log_dir):
-            if snapshot_ts and ev.get("t", "") <= snapshot_ts:
+            if snapshot_ts and ev.get("t", "") < snapshot_ts:
                 result.skipped_pre_snapshot += 1
             else:
                 result.applied += 1
@@ -606,7 +551,13 @@ def replay(
     dispatch = _dispatch_table()
     try:
         for ev in _iter_events(log_dir):
-            if snapshot_ts and ev.get("t", "") <= snapshot_ts:
+            # Strict '<': re-apply the snapshot's own millisecond instead of
+            # skipping it. 't' is millisecond-resolution, so a mutation emitted
+            # in the same ms as the snapshot but AFTER the backup ran would be
+            # dropped by '<='. Re-applying the boundary ms is safe (every
+            # dispatched mutation is INSERT OR IGNORE / ON CONFLICT idempotent),
+            # whereas dropping a post-snapshot event silently loses data.
+            if snapshot_ts and ev.get("t", "") < snapshot_ts:
                 result.skipped_pre_snapshot += 1
                 continue
             handler = dispatch.get(ev.get("k", ""))
@@ -713,3 +664,40 @@ def recover_tail(db, log_dir: str) -> int:
         if hasattr(db, "_event_log"):
             db._event_log = saved
     return applied
+
+
+def event_log_kwargs_from_settings(base_path: str) -> dict:
+    """Read ``othersettings.event_log`` durability/rotation knobs for EventLog.
+
+    Flet-free (lazy SettingsStore import) so the headless CLI can build the same
+    EventLog without dragging in the GUI stack — importing it from flet_app used
+    to pull in ``flet`` and silently disable crash recovery on a Flet-less host.
+    Missing/invalid values fall back to the durable defaults.
+    """
+    try:
+        from app.core.settings_store import SettingsStore
+        cfg = SettingsStore(base_path).get_section("event_log")
+    except Exception:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    def _i(key, default):
+        try:
+            return int(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _f(key, default):
+        try:
+            return float(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "retention_days": _i("retention_days", 60),
+        "fsync_every_n": _i("fsync_every_n", 200),
+        "fsync_interval_sec": _f("fsync_interval_sec", 1.0),
+        "max_total_bytes": _i("max_total_bytes", 4 * 1024 * 1024 * 1024),
+        "rotate_size_bytes": _i("rotate_size_bytes", 128 * 1024 * 1024),
+    }

@@ -17,7 +17,7 @@ class DummyResponse:
 def test_ugoira_meta_retry_404_then_200():
     calls = []
 
-    def fake_get(url, headers=None, verify=False, stream=True):
+    def fake_get(url, headers=None, verify=False, stream=True, timeout=None):
         calls.append(dict(headers or {}))
         if len(calls) == 1:
             return DummyResponse(404, '{"error":true,"body":[]}')
@@ -44,7 +44,7 @@ def test_ugoira_meta_retry_404_then_200():
 def test_ugoira_meta_retry_404_then_404():
     calls = []
 
-    def fake_get(url, headers=None, verify=False, stream=True):
+    def fake_get(url, headers=None, verify=False, stream=True, timeout=None):
         calls.append(dict(headers or {}))
         return DummyResponse(404, '{"error":true,"body":[]}')
 
@@ -67,7 +67,7 @@ def test_ugoira_meta_retry_404_then_404():
 def test_ugoira_meta_no_retry_on_200():
     calls = []
 
-    def fake_get(url, headers=None, verify=False, stream=True):
+    def fake_get(url, headers=None, verify=False, stream=True, timeout=None):
         calls.append(dict(headers or {}))
         return DummyResponse(200, '{"error":false}')
 

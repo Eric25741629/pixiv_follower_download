@@ -1,11 +1,13 @@
+import contextlib
 import random as pyrandom
 import threading
-import queue as _queue
 import time
+import queue as _queue
 
 import requests
 
 from app.core.worker_event import WorkerEvent
+from app import i18n
 from pixiv_api import *
 from app.core.pixiv_thread_utils import (
     cookie_usage_label,
@@ -28,6 +30,38 @@ _NETWORK_RETRY_EXCEPTIONS = (
     requests.exceptions.ConnectTimeout,
     requests.exceptions.ConnectionError,
 )
+
+# Per-page download bounds. The requests ``timeout`` tuple is a PER-RECV
+# socket deadline only — urllib3 never sets ``Timeout.total`` from requests,
+# so a trickling/half-open connection (a few bytes inside every read-timeout
+# window) keeps ``iter_content`` looping forever without raising. The CONNECT
+# and READ values below bound a fully-silent socket; the wall-clock
+# DOWNLOAD_DEADLINE_SEC (enforced in Python between chunks by
+# ``_stream_to_sink``) is what bounds the trickle and honours Stop. Both
+# layers are required. See the 2026-06-21 download-hang investigation.
+DOWNLOAD_CONNECT_TIMEOUT = 10
+DOWNLOAD_READ_TIMEOUT = 30
+DOWNLOAD_DEADLINE_SEC = 120.0
+
+
+class DownloadStopped(Exception):
+    """Raised by ``_stream_to_sink`` when stop_event fires mid-transfer.
+
+    A user Stop is NOT a failure: callers must leave the page pending
+    (no err_url, no attempt_count bump, no cookie disable) — mirror the
+    pre-fetch stop path in ``gif_or_jpg``.
+    """
+
+
+class DownloadDeadlineExceeded(Exception):
+    """Raised by ``_stream_to_sink`` when the total wall-clock budget is hit.
+
+    A deadline IS a page failure (the connection wedged/trickled). Callers
+    settle it as the normal fail-list ``[url, timetag]`` so the PID stays
+    pending and is retried next run — but the cookie is NOT disabled (a
+    deadline is not the cookie's fault), so this must never be raised across
+    a scheduler-aware boundary as a network exception.
+    """
 
 
 def _coerce_to_rule_iterable(raw_rules):
@@ -138,22 +172,23 @@ class PauseableThread(threading.Thread):
         self._pause_event.set()   # not paused by default
         self._stop_event = threading.Event()
         self._scheduler = scheduler  # AccountScheduler | None
+        self._cookie_usage_lock = threading.Lock()
 
     def pause(self):
         self._pause_event.clear()
-        self._q.put(WorkerEvent("output", "<p><font color='red'>已暫停</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>{i18n.t('log.paused')}</font></p>"))
         # Hooks may do disk I/O (e.g. flushing partial-progress JSON). Run
         # them off the caller's thread so a UI click handler isn't blocked.
         threading.Thread(target=self._on_pause_hook, daemon=True).start()
 
     def resume(self):
         self._pause_event.set()
-        self._q.put(WorkerEvent("output", "<p><font color='red'>已繼續</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>{i18n.t('log.resumed')}</font></p>"))
 
     def stop(self):
         self._stop_event.set()
         self._pause_event.set()   # unblock any waiting pause
-        self._q.put(WorkerEvent("output", "<p><font color='red'>已停止</font></p>"))
+        self._q.put(WorkerEvent("output", f"<p><font color='red'>{i18n.t('log.stopped')}</font></p>"))
         threading.Thread(target=self._on_stop_hook, daemon=True).start()
 
     def _on_pause_hook(self):
@@ -188,12 +223,13 @@ class PauseableThread(threading.Thread):
             return label
         pid_key = normalize_pid(pid) or str(pid)
         try:
-            seen = self._cookie_usage_seen.setdefault(stage_key, set())
-            if pid_key in seen:
-                return label
-            seen.add(pid_key)
-            counts = self._cookie_usage_counts.setdefault(stage_key, {})
-            counts[label] = int(counts.get(label, 0)) + 1
+            with self._cookie_usage_lock:
+                seen = self._cookie_usage_seen.setdefault(stage_key, set())
+                if pid_key in seen:
+                    return label
+                seen.add(pid_key)
+                counts = self._cookie_usage_counts.setdefault(stage_key, {})
+                counts[label] = int(counts.get(label, 0)) + 1
         except Exception:
             pass
         return label
@@ -226,10 +262,16 @@ class PauseableThread(threading.Thread):
         else:
             selected = str(self.cookies or "").strip()
         try:
-            self._pid_cookie_selection[pid_key] = selected
-            alias_cache = getattr(self, "_pid_cookie_alias_selection", None)
-            if alias_cache is not None:
-                alias_cache[pid_key] = cookie_usage_label(selected, self.cookie_pool, self._cookie_alias_map)
+            # setdefault under the cookie-usage lock so two pool workers racing
+            # on the same fresh PID agree on one cookie (first writer wins).
+            with self._cookie_usage_lock:
+                selected = self._pid_cookie_selection.setdefault(pid_key, selected)
+                alias_cache = getattr(self, "_pid_cookie_alias_selection", None)
+                if alias_cache is not None:
+                    alias_cache.setdefault(
+                        pid_key,
+                        cookie_usage_label(selected, self.cookie_pool, self._cookie_alias_map),
+                    )
         except Exception:
             pass
         return selected
@@ -239,7 +281,16 @@ class PauseableThread(threading.Thread):
         then SQLite ``self._metadata_db`` lookup.  Returns ``{}`` when nothing
         is known about the PID."""
         pid_key = str(pid_key)
-        cached = self.url_meta.get(pid_key) if isinstance(getattr(self, "url_meta", None), dict) else None
+        lock = getattr(self, "_url_meta_lock", None)
+        url_meta = getattr(self, "url_meta", None)
+        if isinstance(url_meta, dict):
+            if lock is not None:
+                with lock:
+                    cached = url_meta.get(pid_key)
+            else:
+                cached = url_meta.get(pid_key)
+        else:
+            cached = None
         if isinstance(cached, dict) and cached:
             return cached
         db = getattr(self, "_metadata_db", None)
@@ -295,6 +346,42 @@ class PauseableThread(threading.Thread):
             return
         self._scheduler.release(account, ok=ok)
 
+    def _release_account_after_work(
+        self, account, ok: bool = True, neutral: bool = False
+    ) -> None:
+        """Release an account per the work-unit contract (the proven Step-4
+        pattern, factored out so Steps 2/3/combined cannot drift from it).
+
+        Call from a ``finally`` with ``neutral=True`` set in an ``except`` so a
+        NON-network exception (disk/decode/sqlite error — not the cookie's
+        fault) releases neutrally. A user Stop during the work also releases
+        neutrally. In both cases the cookie is neither disabled (``ok=False`` ->
+        on_disable persists ``失効`` to settings) nor credited with a success
+        (``ok=True`` refreshes the trust window). Only genuine network-retry
+        exhaustion (``ok=False`` off the stop path) disables the cookie."""
+        if account is None:
+            return
+        if neutral or (not ok and self._stop_event.is_set()):
+            if self._scheduler is not None:
+                self._scheduler.release_neutral(account)
+        else:
+            # Defer to _release_account (which guards a None scheduler itself);
+            # this keeps the single release seam that Steps 2/3/4 stub in tests.
+            self._release_account(account, ok=ok)
+
+    def _r18_aware_like_base(self, artwork_tags):
+        """Effective minimum-like base: raised to r18_like_num for R-18 works
+        when stricter. artwork_tags are already normalized (lowercased). Default
+        r18_like_num=0 -> always returns like_num (zero behavior change)."""
+        base = int(getattr(self, "like_num", 0) or 0)
+        r18 = int(getattr(self, "r18_like_num", 0) or 0)
+        if r18 <= base:
+            return base
+        tags = artwork_tags or []
+        is_r18g = any("r-18g" in str(t) for t in tags)
+        is_r18 = (not is_r18g) and any(str(t) == "r-18" for t in tags)
+        return r18 if is_r18 else base
+
     def _emit_output(self, html: str) -> None:
         try:
             self._q.put(WorkerEvent("output", html))
@@ -322,6 +409,52 @@ class PauseableThread(threading.Thread):
             elapsed += slice_s
         return True
 
+    def _stream_to_sink(self, response, write, *, chunk_size=65536, deadline_sec=None):
+        """Drain a streamed ``requests`` Response into ``write(bytes)`` with a
+        TOTAL wall-clock deadline plus stop/pause awareness.
+
+        The per-recv read timeout on the originating request bounds a fully
+        silent socket; this loop bounds a *trickle* (the confirmed wedge mode)
+        and lets Stop interrupt an in-flight transfer. Paused time does not
+        count toward the deadline (mirrors ``_wait_interruptible``). The
+        response is ALWAYS closed (success, deadline, stop, error) so a
+        mid-stream abort never leaks the pooled socket.
+
+        Raises ``DownloadStopped`` on stop and ``DownloadDeadlineExceeded`` on
+        the wall-clock deadline; both propagate to the caller, which decides how
+        to settle the page (stop -> pending; deadline -> failed). ``write`` is a
+        sink callback, e.g. ``file.write`` or ``bytearray.extend``.
+        """
+        if deadline_sec is None:
+            deadline_sec = getattr(self, "_download_deadline_sec", DOWNLOAD_DEADLINE_SEC)
+        deadline = time.monotonic() + float(deadline_sec)
+        # Control events always exist on a real PauseableThread; tolerate their
+        # absence (e.g. a unit test instantiating via __new__) by degrading to a
+        # plain deadline-only stream.
+        pause_event = getattr(self, "_pause_event", None)
+        stop_event = getattr(self, "_stop_event", None)
+        try:
+            for data in response.iter_content(chunk_size=chunk_size):
+                # Refund paused time so a long human pause never trips the
+                # deadline. _pause_event is SET while running, CLEAR while paused.
+                while pause_event is not None and not pause_event.is_set():
+                    if stop_event is not None and stop_event.is_set():
+                        raise DownloadStopped()
+                    waited_from = time.monotonic()
+                    pause_event.wait(timeout=0.5)
+                    deadline += time.monotonic() - waited_from
+                if stop_event is not None and stop_event.is_set():
+                    raise DownloadStopped()
+                if time.monotonic() >= deadline:
+                    raise DownloadDeadlineExceeded(
+                        f"download exceeded {float(deadline_sec):.0f}s total deadline"
+                    )
+                if data:
+                    write(data)
+        finally:
+            with contextlib.suppress(Exception):
+                response.close()
+
     def _run_with_network_retry(self, work_label: str, fn):
         """Run ``fn()`` with up to NETWORK_RETRY_ATTEMPTS attempts on the
         scheduler network triple. Returns ``(ok, result, last_exc)``.
@@ -340,18 +473,19 @@ class PauseableThread(threading.Thread):
                 last_exc = err
                 if attempt < NETWORK_RETRY_ATTEMPTS:
                     self._emit_output(
-                        f"<p><font color='#b58900'>{work_label} 第 {attempt}/"
-                        f"{NETWORK_RETRY_ATTEMPTS} 次失敗"
-                        f"（{err.__class__.__name__}），"
-                        f"{NETWORK_RETRY_WAIT_SEC} 秒後重試</font></p>"
+                        "<p><font color='#b58900'>" + i18n.t(
+                            "log.retry.attempt", work=work_label, attempt=attempt,
+                            total=NETWORK_RETRY_ATTEMPTS, err=err.__class__.__name__,
+                        ) + "</font></p>"
                     )
                     if not self._wait_interruptible(NETWORK_RETRY_WAIT_SEC):
                         return False, None, last_exc
                 else:
                     self._emit_output(
-                        f"<p><font color='red'>{work_label} 重試 "
-                        f"{NETWORK_RETRY_ATTEMPTS} 次仍失敗"
-                        f"（{err.__class__.__name__}），停用此 Cookie</font></p>"
+                        "<p><font color='red'>" + i18n.t(
+                            "log.retry.exhausted", work=work_label,
+                            total=NETWORK_RETRY_ATTEMPTS, err=err.__class__.__name__,
+                        ) + "</font></p>"
                     )
         return False, None, last_exc
 

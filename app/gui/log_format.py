@@ -13,7 +13,7 @@ COLOR_MAP: dict[str, str] = {
 }
 
 _FONT_RE = re.compile(
-    r"<font\s+color=['\"](\w+)['\"]>(.*?)</font>",
+    r"<font\s+color=['\"](#?\w+)['\"]>(.*?)</font>",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -35,7 +35,7 @@ def html_to_spans(html: str) -> list[ft.TextSpan]:
 
         color_name = m.group(1).lower()
         content = m.group(2)
-        flet_color = COLOR_MAP.get(color_name)
+        flet_color = COLOR_MAP.get(color_name) or (color_name if color_name.startswith("#") else None)
         style = ft.TextStyle(color=flet_color) if flet_color else None
         spans.append(ft.TextSpan(text=content, style=style))
         last_end = m.end()

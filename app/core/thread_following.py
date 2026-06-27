@@ -7,6 +7,7 @@ import threading
 from functools import partial
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
+from app import i18n
 from app.core.pixiv_thread_utils import (
     atomic_write_json,
     atomic_write_text,
@@ -17,9 +18,11 @@ from app.core.pixiv_thread_base import (
     PauseableThread,
 )
 
+_pid_count_lock = threading.Lock()
+
 class get_following(PauseableThread):
     '''抓取使用者關注的畫師清單'''
-    def __init__(self, q, userid, cookies, Agent, hide_mode):
+    def __init__(self, q, userid, cookies, Agent, following_scope):
         super().__init__(q)
         self.userid=userid
         self.cookies=cookies
@@ -27,14 +30,34 @@ class get_following(PauseableThread):
         self.path=os.getenv('APPDATA')+r'/pixiv_download/'
         self._partial_following = []
         self._partial_lock = threading.Lock()
-        if hasattr(hide_mode, "isChecked"):
-            try:
-                self.hide = bool(hide_mode.isChecked())
-            except Exception:
-                self.hide = False
-        else:
-            self.hide = bool(hide_mode)
+        self.following_scope = self._coerce_following_scope(following_scope)
+        # Legacy compatibility: old code used hide=True to mean "public only".
+        self.hide = self.following_scope == "public"
         self.max=0
+
+    @staticmethod
+    def _coerce_following_scope(value):
+        if hasattr(value, "isChecked"):
+            try:
+                return "public" if bool(value.isChecked()) else "all"
+            except Exception:
+                return "all"
+        if isinstance(value, bool):
+            return "public" if value else "all"
+        scope = str(value or "all").strip().lower()
+        if scope == "show":
+            return "public"
+        if scope == "hide":
+            return "private"
+        return scope if scope in {"public", "private", "all"} else "all"
+
+    @staticmethod
+    def _following_rest_values(scope):
+        if scope == "public":
+            return ["show"]
+        if scope == "private":
+            return ["hide"]
+        return ["show", "hide"]
 
     def _flush_following_snapshot(self):
         try:
@@ -63,10 +86,22 @@ class get_following(PauseableThread):
         if self._stop_event.is_set():
             return []
         global pid_num
-        pid_num=pid_num+100
+        with _pid_count_lock:
+            pid_num = pid_num + 100
         url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=100&rest='+state+'&tag=&lang=zh_tw')
-        res = requests.get(url.format(id), headers=headers, timeout=(10, 30))
-        resdicts = safe_json(res, 'body', 'users', default=[])
+        resdicts = []
+        for attempt in range(3):
+            try:
+                res = requests.get(url.format(id), headers=headers, timeout=(10, 30))
+                res.raise_for_status()
+                resdicts = safe_json(res, 'body', 'users', default=[])
+                break
+            except Exception as e:
+                if attempt < 2:
+                    print(output_err(e))
+                    time.sleep(2)
+                else:
+                    resdicts = []
         self._q.put(WorkerEvent("progress", (100, self.max)))
         i=[]
         try:
@@ -88,51 +123,60 @@ class get_following(PauseableThread):
             ,'referer': 'https://www.pixiv.net/users/'+str(self.userid)+'/following',        
         }
         times=0
-        url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=1&rest=show&tag=&lang=zh_tw') # 先查公開關注總數
-        print(url.format(self.userid))
-
-        res = requests.get(url.format(self.userid), headers=headers, timeout=(10, 30))
-        print(res.text)
-        show_total_num = safe_json(res, 'body', 'total', default=0)
-        show_list = list(range(0, show_total_num+200, 100))
-
-        if (self.hide==False):
-            #print("yes")
-            url = ('https://www.pixiv.net/ajax/user/{}/following?offset='+str(times)+'&limit=1&rest=hide&tag=&lang=zh_tw')
-            res = requests.get(url.format(self.userid), headers=headers, timeout=(10, 30))
-            hide_total_num = safe_json(res, 'body', 'total', default=0)
-            hide_list=[i for i in range(0,hide_total_num+200,100)]
-            self.max=int(hide_total_num+show_total_num)
-        else:
-            self.max=int(show_total_num)
-        self._q.put(WorkerEvent("output", f'total following: {self.max}'))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as self.executor:
-            func=partial(self.get_follow_illust,self.userid,headers,'show')
-            pixiv_following = list(self.executor.map(func,show_list))
-            results1=([i for item in pixiv_following for i in item]) 
-            #print(len(results1))
-        if (self.hide==False):
-        
+        rest_values = self._following_rest_values(self.following_scope)
+        page_ranges = {}
+        total_by_rest = {}
+        for rest in rest_values:
+            url = (
+                'https://www.pixiv.net/ajax/user/{}/following?offset='
+                + str(times)
+                + '&limit=1&rest='
+                + rest
+                + '&tag=&lang=zh_tw'
+            )
+            print(url.format(self.userid))
+            total_num = 0
+            for attempt in range(3):
+                try:
+                    res = requests.get(url.format(self.userid), headers=headers, timeout=(10, 30))
+                    res.raise_for_status()
+                    if rest == "show":
+                        print(res.text)
+                    total_num = safe_json(res, 'body', 'total', default=0)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        print(output_err(e))
+                        time.sleep(2)
+                    else:
+                        total_num = 0
+            total_by_rest[rest] = total_num
+            page_ranges[rest] = list(range(0, total_num+200, 100))
+        self.max = int(sum(total_by_rest.values()))
+        self._q.put(WorkerEvent("output", i18n.t("log.following.start", n=self.max)))
+        results = []
+        for rest in rest_values:
             with concurrent.futures.ThreadPoolExecutor(max_workers=16) as self.executor:
-                func=partial(self.get_follow_illust,self.userid,headers,'hide')
-                pixiv_following2 = list(self.executor.map(func,hide_list))
-                results2=([i for item in pixiv_following2 for i in item]) 
-                #print(len(results2))
-                return results1+results2
-        else:
-            return results1
+                func=partial(self.get_follow_illust,self.userid,headers,rest)
+                pixiv_following = list(self.executor.map(func,page_ranges[rest]))
+                results.extend([i for item in pixiv_following for i in item])
+        return results
     def run(self):
         try:
             all_pixiv_ids = self.illusts()
             texts = np.unique(all_pixiv_ids).tolist()
-            self._q.put(WorkerEvent("output", '抓取 following 完成'))
             atomic_write_text(os.path.join(self.path, "following.txt"), texts, backup=True)
             atomic_write_json(os.path.join(self.path, "following.json"), texts, backup=True)
-            self._q.put(WorkerEvent("output", "<p><font color='red'>抓取關注畫師完成</font></p>"))
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='green'>{i18n.t('log.following.done', n=len(texts))}</font></p>"))
+            # Emit finished BEFORE next so the dispatcher tears down step 1 first
+            # and THEN starts step 2 — otherwise handle_finished re-marks the
+            # just-started step 2 'done' and disables its pause/stop. (B7)
+            self._q.put(WorkerEvent("finished", i18n.t("log.following.done", n=len(texts))))
             self._q.put(WorkerEvent("next", 2))
-            self._q.put(WorkerEvent("finished", '抓取關注畫師完成'))
         except Exception as e:
-            self._q.put(WorkerEvent("output", 'Task failed'))
+            self._q.put(WorkerEvent("output",
+                f"<p><font color='red'>{i18n.t('log.following.fail')}</font></p>"))
             self._q.put(WorkerEvent("output", output_err(e)))
             self._q.put(WorkerEvent("next", -1))
 

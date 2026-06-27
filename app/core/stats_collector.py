@@ -23,6 +23,7 @@ class StatsCollector:
         self._session_jxl_src: int = 0
         self._session_jxl_dst: int = 0
         self._session_started_at: float | None = None
+        self._session_ended_at: float | None = None
         self._lifetime: dict[str, Any] = {
             "lifetime_bytes_downloaded": 0,
             "lifetime_files_downloaded": 0,
@@ -43,6 +44,28 @@ class StatsCollector:
             self._session_jxl_src = 0
             self._session_jxl_dst = 0
             self._session_started_at = time.monotonic()
+            self._session_ended_at = None
+
+    def mark_session_end(self) -> None:
+        """Freeze the elapsed timer at the moment the run finished.
+
+        Idempotent: only the first call after a reset records the end time, so
+        a combined-mode terminal that emits both 'finished' and 'next -1'
+        freezes once (the second call is a no-op).
+        """
+        with self._lock:
+            if self._session_started_at is not None and self._session_ended_at is None:
+                self._session_ended_at = time.monotonic()
+
+    def resume_session(self) -> None:
+        """Un-freeze the timer when Run All chains into the next step.
+
+        Keeps the original start time so the displayed elapsed spans the whole
+        run, not just the current step.
+        """
+        with self._lock:
+            if self._session_started_at is not None:
+                self._session_ended_at = None
 
     def report_bytes(self, n: int) -> None:
         if n <= 0:
@@ -71,7 +94,12 @@ class StatsCollector:
         with self._lock:
             elapsed = 0.0
             if self._session_started_at is not None:
-                elapsed = time.monotonic() - self._session_started_at
+                end = (
+                    self._session_ended_at
+                    if self._session_ended_at is not None
+                    else time.monotonic()
+                )
+                elapsed = end - self._session_started_at
             return {
                 "bytes": self._session_bytes,
                 "files_ok": self._session_files_ok,

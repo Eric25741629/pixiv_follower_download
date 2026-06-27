@@ -7,6 +7,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.gui.run_actions import RunController, _RETEST_INTERVAL_SEC
+from app.core.settings_store import SettingsStore
+from app.core.worker_event import WorkerEvent
 
 
 def test_fresh_when_status_valid_and_recent():
@@ -71,3 +73,32 @@ def test_boundary_at_retest_interval():
     now = 1_000_000.0
     entry = {"status": "有效", "last_tested_at": now - _RETEST_INTERVAL_SEC}
     assert RunController._cookie_cache_is_fresh(entry, now) is False
+
+
+def test_refresh_cookie_timestamp_emits_cookie_status_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    base = tmp_path / "pixiv_download"
+    store = SettingsStore(str(base))
+    data = store.load()
+    data["auth"]["cookies_entries"] = [
+        {"cookie": "c1", "alias": "A", "status": "有效", "last_tested_at": 1.0}
+    ]
+    store.save(data)
+
+    import queue
+
+    class _View:
+        _active_thread = None
+
+    event_q = queue.Queue()
+    controller = RunController(_View(), event_q)
+
+    controller._refresh_cookie_timestamp("c1")
+
+    ev = event_q.get_nowait()
+    assert isinstance(ev, WorkerEvent)
+    assert ev.type == "cookie_status"
+    cookie, status, tested_at = ev.data
+    assert cookie == "c1"
+    assert status == "有效"
+    assert float(tested_at) > 1.0

@@ -1,10 +1,19 @@
 from __future__ import annotations
-import math
 import os
 import threading
 import flet as ft
 from app.core.settings_store import SettingsStore
+from app.gui import components as c
+from app.gui.glass import current_theme, glass_snackbar
+from app.gui.views.settings_handlers import _SettingsHandlersMixin
+from app import i18n
 import contextlib
+
+
+# Locale display names are endonyms (shown in their own language), not translated
+# per current UI locale. Codes come from i18n.available_locales(); unknown codes
+# fall back to the raw code so a newly-dropped-in locale still appears.
+_LOCALE_DISPLAY_NAMES = {"zh-TW": "中文（繁體）", "en": "English"}
 
 
 def _store() -> SettingsStore:
@@ -25,11 +34,14 @@ def _safe_int(value, default: int) -> int:
         return default
 
 
-class SettingsView:
+class SettingsView(_SettingsHandlersMixin):
     """Settings page grouped into ExpansionTile sections."""
 
-    def __init__(self, page: ft.Page):
+    def __init__(self, page: ft.Page, on_saved=None):
         self._page = page
+        # Optional callback fired after any persist (explicit save + autosave
+        # toggles) so a running task can be notified to apply live settings.
+        self._on_saved = on_saved
         # Flet 0.84: FilePicker is a Service (not a Control) and is registered
         # via page.services; methods are async and return values directly.
         self._file_picker = ft.FilePicker()
@@ -44,165 +56,259 @@ class SettingsView:
         perf = store.get_section("performance")
         jxl = store.get_section("jxl")
         directory = store.get_section("directory")
+        ui = store.get_section("ui")
         self._n_cookies: int = max(1, len(auth.get("cookies_pool", []) or []))
 
-        self._tf_account = ft.TextField(label="帳號", value=auth.get("account", ""), width=300)
-        self._tf_password = ft.TextField(label="密碼", value=auth.get("password", ""), width=300, password=True, can_reveal_password=True)
-        self._tf_userid = ft.TextField(label="User ID", value=str(auth.get("userid", "")), width=200)
-        self._tf_path = ft.TextField(label="下載路徑", value=dl.get("path", ""), expand=True, read_only=True)
+        theme = current_theme(page)
 
-        self._sw_hidefollow = ft.Switch(label="隱藏追蹤", value=bool(flt.get("hidefollow", False)))
-        self._sw_nogif = ft.Switch(label="過濾 GIF", value=bool(flt.get("nogif", False)))
-        self._sw_notag = ft.Switch(label="無 tag 不下載", value=bool(flt.get("notag", False)))
-        self._sw_notime = ft.Switch(label="無時間不下載", value=bool(flt.get("notime", False)))
-        self._tf_like_num = ft.TextField(label="最低讚數（一般）", value=str(dl.get("like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
-        self._tf_r18_like_num = ft.TextField(label="最低讚數（R18）", value=str(dl.get("r18_like_num", 0)), width=150, keyboard_type=ft.KeyboardType.NUMBER)
-        self._tf_rescrape_within_days = ft.TextField(
-            label="重抓上限（天數，0=關閉）",
-            value=str(dl.get("rescrape_within_days", 365)),
-            width=200,
-            keyboard_type=ft.KeyboardType.NUMBER,
-            tooltip="作品距上傳時間小於此天數時，Step 3 會重新抓取 meta 以更新讚數，避免新作品因初始讚數不足被永久過濾。0 表示停用。已下載的作品永遠不會重抓。",
+        # 介面語言（apply-on-restart）。語言名稱顯示為各自的語言（endonym），
+        # 不隨目前 UI 語言翻譯。
+        self._dd_language = c.dropdown(
+            theme,
+            label=i18n.t("settings.lang.label"),
+            value=str(ui.get("language", i18n.BASE_LOCALE) or i18n.BASE_LOCALE),
+            options=[
+                (code, _LOCALE_DISPLAY_NAMES.get(code, code))
+                for code in i18n.available_locales()
+            ],
+            width=220,
+            on_select=self._on_language_select,
         )
-        self._tf_filename_template = ft.TextField(
-            label="檔名範本（留空＝使用預設）",
+
+        self._tf_account = c.text_field(theme, label=i18n.t("settings.account.account"), value=auth.get("account", ""), width=300)
+        self._tf_password = c.text_field(theme, label=i18n.t("settings.account.password"), value=auth.get("password", ""), width=300, password=True)
+        self._tf_userid = c.text_field(theme, label=i18n.t("settings.account.userid"), value=str(auth.get("userid", "")), width=200)
+        self._tf_path = c.text_field(theme, label=i18n.t("settings.download.path"), value=dl.get("path", ""), expand=True, read_only=True)
+
+        self._sw_hidefollow = c.switch(theme, label=i18n.t("settings.filter.hidefollow"), value=bool(flt.get("hidefollow", False)))
+        self._sw_nogif = c.switch(theme, label=i18n.t("settings.filter.nogif"), value=bool(flt.get("nogif", False)))
+        self._sw_notag = c.switch(theme, label=i18n.t("settings.tags.notag"), value=bool(flt.get("notag", False)))
+        self._sw_notime = c.switch(theme, label=i18n.t("settings.tags.notime"), value=bool(flt.get("notime", False)))
+        self._tf_like_num = c.number_field(theme, label=i18n.t("settings.filter.like_num"), value=dl.get("like_num", 0), width=150)
+        self._tf_r18_like_num = c.number_field(theme, label=i18n.t("settings.filter.r18_like_num"), value=dl.get("r18_like_num", 0), width=150)
+        self._tf_rescrape_within_days = c.number_field(
+            theme,
+            label=i18n.t("settings.filter.rescrape_days"),
+            value=dl.get("rescrape_within_days", 365),
+            width=200,
+            tooltip=i18n.t("settings.filter.rescrape_days_tooltip"),
+        )
+        self._tf_filename_template = c.text_field(
+            theme,
+            label=i18n.t("settings.filename.template_label"),
             value=str(dl.get("filename_template", "") or ""),
-            hint_text="例：{timetag}_PID{pid}{page}{hashtag}.{ext}",
+            hint_text=i18n.t("settings.filename.template_hint"),
             expand=True,
         )
-        self._sw_tag_strip_brackets = ft.Switch(
-            label="Tag 過濾括號內容",
+        self._tf_download_time = c.text_field(
+            theme,
+            label=i18n.t("settings.filename.download_time"),
+            value=str(dl.get("download_time", "") or ""),
+            hint_text=i18n.t("settings.filename.download_time_hint"),
+            width=320,
+            tooltip=i18n.t("settings.filename.download_time_tooltip"),
+        )
+        self._sw_set_file_mtime = c.switch(
+            theme,
+            label=i18n.t("settings.filename.set_mtime"),
+            value=bool(dl.get("set_file_mtime", True)),
+            tooltip=i18n.t("settings.filename.set_mtime_tooltip"),
+        )
+        self._sw_tag_strip_brackets = c.switch(
+            theme,
+            label=i18n.t("settings.tags.strip_brackets"),
             value=bool(dl.get("tag_strip_brackets", False)),
-            tooltip="開啟後，tag 中成對括號（含 () （） [] 【】 《》 〈〉 「」 『』 〔〕 〘〙）與內容會從檔名移除",
+            tooltip=i18n.t("settings.tags.strip_brackets_tooltip"),
         )
-        self._sw_tag_strip_special_chars = ft.Switch(
-            label="Tag 過濾裝飾符號與 emoji",
+        self._sw_tag_strip_special_chars = c.switch(
+            theme,
+            label=i18n.t("settings.tags.strip_special"),
             value=bool(dl.get("tag_strip_special_chars", False)),
-            tooltip="開啟後，箭頭、★☆♀♂♪♫、◯●◎、各式 emoji 等裝飾性符號會從 tag 中移除",
+            tooltip=i18n.t("settings.tags.strip_special_tooltip"),
         )
-        self._sw_author_order = ft.Switch(
-            label="依作者順序下載（同作者連續）",
+        self._sw_author_order = c.switch(
+            theme,
+            label=i18n.t("settings.source.author_order"),
             value=bool(dl.get("author_order", False)),
-            tooltip="開啟後，步驟 4 會把同一作者的作品連續下載完（PID 由大到小）再換下一位；作者不明的作品排到最後",
+            tooltip=i18n.t("settings.source.author_order_tooltip"),
         )
-        self._sw_combined_mode = ft.Switch(
-            label="邊查邊下（查到即下載，合併步驟三、四）",
+        self._sw_combined_mode = c.switch(
+            theme,
+            label=i18n.t("settings.source.combined"),
             value=bool(dl.get("combined_mode", False)),
-            tooltip="開啟後，步驟 3 會逐一查詢 PID 並立即下載該 PID 的頁面（查詢與下載共用同一次帳號冷卻）；同時自動吸收上次未完成的下載",
+            tooltip=i18n.t("settings.source.combined_tooltip"),
+        )
+        self._tf_combined_workers = c.number_field(
+            theme,
+            label=i18n.t("settings.source.workers"),
+            value=int(dl.get("combined_workers", 1)),
+            width=200,
+            tooltip=i18n.t("settings.source.workers_tooltip"),
+        )
+        self._sw_force_rescan = c.switch(
+            theme,
+            label=i18n.t("settings.source.force_rescan"),
+            value=bool(dl.get("force_full_rescan", False)),
+            tooltip=i18n.t("settings.source.force_rescan_tooltip"),
+        )
+        self._dd_source_mode = c.dropdown(
+            theme,
+            label=i18n.t("settings.source.mode"),
+            value=str(dl.get("source_mode", "following") or "following"),
+            options=[
+                ("following", i18n.t("settings.source.mode.following")),
+                ("bookmarks", i18n.t("settings.source.mode.bookmarks")),
+            ],
+            width=220,
+        )
+        self._dd_following_scope = c.dropdown(
+            theme,
+            label=i18n.t("settings.source.following_scope"),
+            value=str(dl.get("following_scope", "all") or "all"),
+            options=[
+                ("public", i18n.t("settings.source.following.public")),
+                ("private", i18n.t("settings.source.following.private")),
+                ("all", i18n.t("settings.source.following.all")),
+            ],
+            width=220,
+        )
+        self._dd_bookmark_scope = c.dropdown(
+            theme,
+            label=i18n.t("settings.source.bookmark_scope"),
+            value=str(dl.get("bookmark_scope", "all") or "all"),
+            options=[
+                ("public", i18n.t("settings.source.bookmark.public")),
+                ("private", i18n.t("settings.source.bookmark.private")),
+                ("all", i18n.t("settings.source.bookmark.all")),
+            ],
+            width=220,
         )
 
         sch = store.get_section("schedule")
-        self._sw_schedule_enabled = ft.Switch(
-            label="啟用排程（定時自動 Run All）",
+        self._sw_schedule_enabled = c.switch(
+            theme,
+            label=i18n.t("settings.adv.schedule_enabled"),
             value=bool(sch.get("enabled", False)),
         )
-        self._dd_schedule_mode = ft.Dropdown(
-            label="排程方式",
+        self._dd_schedule_mode = c.dropdown(
+            theme,
+            label=i18n.t("settings.adv.schedule_mode"),
             value=str(sch.get("mode", "daily")),
-            options=[ft.dropdown.Option("daily", "每日固定時間"),
-                     ft.dropdown.Option("interval", "固定間隔")],
+            options=[("daily", i18n.t("settings.adv.schedule.daily")),
+                     ("interval", i18n.t("settings.adv.schedule.interval"))],
             width=200,
         )
-        self._tf_schedule_time = ft.TextField(
-            label="每日時間 (HH:MM)", value=str(sch.get("time", "03:00")), width=160,
+        self._tf_schedule_time = c.text_field(
+            theme, label=i18n.t("settings.adv.schedule_time"), value=str(sch.get("time", "03:00")), width=160,
         )
-        self._tf_schedule_interval = ft.TextField(
-            label="間隔 (小時)", value=str(sch.get("interval_hours", 6)), width=160,
+        self._tf_schedule_interval = c.text_field(
+            theme, label=i18n.t("settings.adv.schedule_interval"), value=str(sch.get("interval_hours", 6)), width=160,
         )
 
         self._ban_tags: list[str] = list(dl.get("ban_tag", []))
         self._must_tags: list[str] = list(dl.get("must_tag", []))
         self._ban_tag_row = ft.Row(wrap=True, spacing=4)
         self._must_tag_row = ft.Row(wrap=True, spacing=4)
-        self._tf_ban_input = ft.TextField(label="新增禁止 tag", width=200, on_submit=self._add_ban_tag)
-        self._tf_must_input = ft.TextField(label="新增必須 tag", width=200, on_submit=self._add_must_tag)
+        self._tf_ban_input = c.text_field(theme, label=i18n.t("settings.filter.new_ban"), width=200)
+        self._tf_ban_input.on_submit = self._add_ban_tag
+        self._tf_must_input = c.text_field(theme, label=i18n.t("settings.filter.new_must"), width=200)
+        self._tf_must_input.on_submit = self._add_must_tag
         self._refresh_tag_rows()
 
-        self._sw_create_dir = ft.Switch(
-            label="依作者 ID 建立子資料夾",
+        self._sw_create_dir = c.switch(
+            theme,
+            label=i18n.t("settings.dir.create_dir"),
             value=bool(directory.get("create_dir", False)),
         )
-        self._sw_r18_dir = ft.Switch(
-            label="R-18 作品分類資料夾",
+        self._sw_r18_dir = c.switch(
+            theme,
+            label=i18n.t("settings.dir.r18"),
             value=not bool(directory.get("no_R18_dir", False)),
         )
-        self._sw_r18g_dir = ft.Switch(
-            label="R-18G 作品分類資料夾",
+        self._sw_r18g_dir = c.switch(
+            theme,
+            label=i18n.t("settings.dir.r18g"),
             value=not bool(directory.get("no_R18G_dir", False)),
         )
-        self._sw_ai_dir = ft.Switch(
-            label="AI 生成作品分類資料夾",
+        self._sw_ai_dir = c.switch(
+            theme,
+            label=i18n.t("settings.dir.ai"),
             value=bool(directory.get("ai_gen_dir", False)),
         )
 
-        self._sw_jxl = ft.Switch(label="啟用 JXL 轉檔", value=bool(jxl.get("enable", False)))
-        self._tf_jxl_path = ft.TextField(label="cjxl.exe 路徑", value=jxl.get("cjxl_path", ""), expand=True, read_only=True)
-        self._sw_jxl_delete = ft.Switch(label="刪除原檔", value=bool(jxl.get("delete_original", False)))
+        self._sw_jxl = c.switch(theme, label=i18n.t("settings.adv.jxl_enable"), value=bool(jxl.get("enable", False)))
+        self._tf_jxl_path = c.text_field(theme, label=i18n.t("settings.adv.jxl_path"), value=jxl.get("cjxl_path", ""), expand=True, read_only=True)
+        self._sw_jxl_delete = c.switch(theme, label=i18n.t("settings.adv.jxl_delete"), value=bool(jxl.get("delete_original", False)))
+        self._sw_jxl_skip_gif = c.switch(theme, label=i18n.t("settings.adv.jxl_skip_gif"), value=bool(jxl.get("skip_gif", True)))
         effort_val = max(1, min(9, int(jxl.get("effort", 7))))
-        self._sl_jxl_effort = ft.Slider(min=1, max=9, divisions=8, value=effort_val, label="{value}", width=200)
+        self._sl_jxl_effort = c.slider(theme, min=1, max=9, divisions=8, value=effort_val, label="{value}", width=200)
 
         # Cooldown controls — replace old pid_wait_min / pid_wait_max text fields
         cooldown_avg = int(perf.get("pid_cooldown_avg", 35))
-        self._sl_cooldown = ft.Slider(
-            min=5, max=300, divisions=59, value=float(cooldown_avg),
+        self._sl_cooldown = c.slider(
+            theme,
+            min=0, max=300, divisions=60, value=float(cooldown_avg),
             label="{value}", width=240,
             on_change=self._on_cooldown_slider_change,
         )
-        self._tf_cooldown = ft.TextField(
-            label="平均冷卻秒數",
-            value=str(cooldown_avg),
+        self._tf_cooldown = c.number_field(
+            theme,
+            label=i18n.t("settings.adv.cooldown_label"),
+            value=cooldown_avg,
             width=170,
-            keyboard_type=ft.KeyboardType.NUMBER,
             on_change=self._on_cooldown_tf_change,
         )
         self._label_cooldown_hint = ft.Text(
             self._cooldown_hint(cooldown_avg),
             size=11,
-            color=ft.Colors.RED_600 if cooldown_avg < 30 else ft.Colors.GREY_600,
+            color=self._cooldown_hint_color(cooldown_avg),
         )
-        self._sw_single_thread = ft.Switch(label="單執行緒 PID 模式", value=bool(perf.get("single_thread_mode", False)))
+        self._sw_single_thread = c.switch(theme, label=i18n.t("settings.adv.single_thread"), value=bool(perf.get("single_thread_mode", False)))
 
         # Proxy controls
         proxy_pool = auth.get("proxy_pool") or []
-        self._tf_proxy_pool = ft.TextField(
-            label="Proxy 列表（每行一個）",
-            hint_text="# 一行一個 proxy\nhttp://1.2.3.4:8080\nsocks5://user:pass@host:1080",
+        self._tf_proxy_pool = c.multiline_field(
+            theme,
+            label=i18n.t("settings.proxy.label"),
+            hint_text=i18n.t("settings.proxy.hint"),
             value="\n".join(proxy_pool),
-            multiline=True,
             min_lines=4,
             max_lines=15,
-            expand=True,
         )
         self._proxy_test_results = ft.Column([], spacing=4)
 
         # Wait time controls
         intra_min = int(perf.get("intra_pid_wait_min", 5))
         intra_max = int(perf.get("intra_pid_wait_max", 15))
-        self._tf_intra_min = ft.TextField(
-            value=str(intra_min), width=80, keyboard_type=ft.KeyboardType.NUMBER,
-        )
-        self._tf_intra_max = ft.TextField(
-            value=str(intra_max), width=80, keyboard_type=ft.KeyboardType.NUMBER,
-        )
+        self._tf_intra_min = c.number_field(theme, label=None, value=intra_min, width=80)
+        self._tf_intra_max = c.number_field(theme, label=None, value=intra_max, width=80)
         nocookie_min = int(perf.get("pid_wait_nocookie_min", 3))
         nocookie_max = int(perf.get("pid_wait_nocookie_max", 8))
-        self._tf_nocookie_min = ft.TextField(
-            value=str(nocookie_min), width=80, keyboard_type=ft.KeyboardType.NUMBER,
-        )
-        self._tf_nocookie_max = ft.TextField(
-            value=str(nocookie_max), width=80, keyboard_type=ft.KeyboardType.NUMBER,
-        )
+        self._tf_nocookie_min = c.number_field(theme, label=None, value=nocookie_min, width=80)
+        self._tf_nocookie_max = c.number_field(theme, label=None, value=nocookie_max, width=80)
 
         # User-Agent controls
-        self._tf_agent = ft.TextField(
+        self._tf_agent = c.text_field(
+            theme,
+            label=None,
             value=auth.get("agent", ""),
-            hint_text="未設定，將使用內建隨機 UA",
+            hint_text=i18n.t("settings.ua.hint"),
             expand=True,
         )
-        self._btn_detect_ua = ft.OutlinedButton(
-            "重新偵測 Chrome", on_click=self._on_detect_chrome,
+        self._btn_detect_ua = c.secondary_button(
+            i18n.t("settings.ua.detect_btn"), on_click=self._on_detect_chrome,
         )
-        self._label_ua_status = ft.Text("", size=11, color=ft.Colors.GREY_600)
+        self._label_ua_status = ft.Text("", size=11, color=theme.text_secondary)
+
+        # Flipping any Switch persists that one field immediately (主動紀錄),
+        # so a toggle sticks without the user having to click 「儲存設定」.
+        # Text fields / sliders still rely on the explicit save button.
+        self._wire_switch_autosave()
+
+    # _cooldown_hint_color / the per-switch autosave wiring
+    # (_switch_autosave_map / _wire_switch_autosave / _make_autosave_handler)
+    # moved to settings_handlers._SettingsHandlersMixin (file-size refactor);
+    # inherited.
 
     # ------------------------------------------------------------------
     # File picker handlers
@@ -260,68 +366,10 @@ class SettingsView:
         self._refresh_tag_rows()
         self._page.update()
 
-    # ------------------------------------------------------------------
-    # Cooldown helpers
-    # ------------------------------------------------------------------
-
-    def _cooldown_hint(self, avg) -> str:
-        try:
-            avg_f = max(1.0, float(avg))
-        except (TypeError, ValueError):
-            avg_f = 35.0
-        n = self._n_cookies
-        throughput = avg_f * math.log(n + 1) / n
-        suffix = "；推薦 >= 30 秒"
-        if n == 1:
-            return f"1 個 cookie：每請求約 {throughput:.0f} 秒{suffix}"
-        speedup = math.log(2) * n / math.log(n + 1)
-        return f"{n} 個 cookie：每請求約 {throughput:.1f} 秒（比單 cookie 快 {speedup:.1f}x）{suffix}"
-
-    def reload_cookie_count(self) -> None:
-        """Re-read cookie count from store; refresh hint label in-place."""
-        auth = _store().get_section("auth")
-        self._n_cookies = max(1, len(auth.get("cookies_pool", []) or []))
-        avg = self._safe_int_cooldown()
-        self._label_cooldown_hint.value = self._cooldown_hint(avg)
-        self._label_cooldown_hint.color = ft.Colors.RED_600 if avg < 30 else ft.Colors.GREY_600
-        with contextlib.suppress(Exception):
-            self._label_cooldown_hint.update()
-
-    def _on_cooldown_slider_change(self, e: ft.ControlEvent) -> None:
-        try:
-            val = int(e.control.value)
-        except (TypeError, ValueError):
-            return
-        self._tf_cooldown.value = str(val)
-        self._label_cooldown_hint.value = self._cooldown_hint(val)
-        self._label_cooldown_hint.color = ft.Colors.RED_600 if val < 30 else ft.Colors.GREY_600
-        try:
-            self._tf_cooldown.update()
-            self._label_cooldown_hint.update()
-        except Exception:
-            pass
-
-    def _on_cooldown_tf_change(self, e: ft.ControlEvent) -> None:
-        try:
-            val = max(5, min(300, int(self._tf_cooldown.value or "35")))
-        except (TypeError, ValueError):
-            return
-        self._tf_cooldown.value = str(val)            # snap displayed text to clamped value
-        self._sl_cooldown.value = float(val)
-        self._label_cooldown_hint.value = self._cooldown_hint(val)
-        self._label_cooldown_hint.color = ft.Colors.RED_600 if val < 30 else ft.Colors.GREY_600
-        try:
-            self._tf_cooldown.update()                # flush the TextField update
-            self._sl_cooldown.update()
-            self._label_cooldown_hint.update()
-        except Exception:
-            pass
-
-    def _safe_int_cooldown(self) -> int:
-        try:
-            return max(5, min(300, int(self._tf_cooldown.value or "35")))
-        except (TypeError, ValueError):
-            return 35
+    # Cooldown helpers (_cooldown_hint / reload_cookie_count /
+    # _on_cooldown_slider_change / _on_cooldown_tf_change / _safe_int_cooldown)
+    # moved to settings_handlers._SettingsHandlersMixin (file-size refactor);
+    # inherited. _clamp_wait / _clamp_wait_max stay (save-path helpers).
 
     @staticmethod
     def _clamp_wait(tf: ft.TextField, default: int, lo: int = 1) -> int:
@@ -345,20 +393,21 @@ class SettingsView:
 
     def _on_test_proxies(self, e: ft.ControlEvent) -> None:
         from app.core.proxy_utils import parse_proxy_list, test_proxy
+        theme = current_theme(self._page)
         lines = parse_proxy_list(self._tf_proxy_pool.value or "")
-        self._proxy_test_results.controls = [ft.Text("測試中...", size=11)]
+        self._proxy_test_results.controls = [ft.Text(i18n.t("settings.proxy.testing"), size=11)]
         with contextlib.suppress(Exception):
             self._page.update()
 
         def _run():
             results = []
             if not lines:
-                results = [ft.Text("（無有效 proxy）", size=11, color=ft.Colors.GREY_600)]
+                results = [ft.Text(i18n.t("settings.proxy.none"), size=11, color=theme.text_secondary)]
             else:
                 for url in lines:
                     ok, msg = test_proxy(url, timeout=10)
                     icon = "v" if ok else "x"
-                    color = ft.Colors.GREEN_600 if ok else ft.Colors.RED_600
+                    color = theme.success if ok else theme.error
                     results.append(ft.Text(f"{icon} {url} — {msg}", size=11, color=color))
             self._proxy_test_results.controls = results
             with contextlib.suppress(Exception):
@@ -368,15 +417,16 @@ class SettingsView:
 
     def _on_detect_chrome(self, e: ft.ControlEvent) -> None:
         from app.core.chrome_detect import detect_chrome_ua
+        theme = current_theme(self._page)
         ua = detect_chrome_ua()
         if ua:
             self._tf_agent.value = ua
             version = ua.split("Chrome/")[1].split(" ")[0] if "Chrome/" in ua else ua
-            self._label_ua_status.value = f"已從登錄檔偵測到 Chrome {version}，UA 已更新"
-            self._label_ua_status.color = ft.Colors.GREEN_600
+            self._label_ua_status.value = i18n.t("settings.ua.detected", version=version)
+            self._label_ua_status.color = theme.success
         else:
-            self._label_ua_status.value = "找不到 Chrome 安裝（已檢查登錄檔與 AppData），請手動填寫 UA"
-            self._label_ua_status.color = ft.Colors.RED_600
+            self._label_ua_status.value = i18n.t("settings.ua.not_found")
+            self._label_ua_status.color = theme.error
         try:
             self._tf_agent.update()
             self._label_ua_status.update()
@@ -386,6 +436,18 @@ class SettingsView:
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
+
+    def _persist_language(self, code: str) -> None:
+        """Persist ui.language, preserving the rest of the ui section."""
+        _store().update_fields("ui", {"language": str(code or i18n.BASE_LOCALE)})
+
+    def _on_language_select(self, e: ft.ControlEvent) -> None:
+        # File I/O off the event loop (matches the theme-save pattern). Language
+        # is apply-on-restart, so there is nothing to re-render now.
+        code = str(self._dd_language.value or i18n.BASE_LOCALE)
+        threading.Thread(
+            target=self._persist_language, args=(code,), daemon=True,
+        ).start()
 
     def save(self) -> None:
         store = _store()
@@ -404,14 +466,20 @@ class SettingsView:
             "path": self._tf_path.value,
             "like_num": _safe_int(self._tf_like_num.value, 0),
             "r18_like_num": _safe_int(self._tf_r18_like_num.value, 0),
-            "rescrape_within_days": _safe_int(self._tf_rescrape_within_days.value, 0),
+            "rescrape_within_days": _safe_int(self._tf_rescrape_within_days.value, 365),
             "ban_tag": self._ban_tags,
             "must_tag": self._must_tags,
             "filename_template": (self._tf_filename_template.value or "").strip(),
+            "download_time": (self._tf_download_time.value or "").strip(),
+            "set_file_mtime": bool(self._sw_set_file_mtime.value),
             "tag_strip_brackets": bool(self._sw_tag_strip_brackets.value),
             "tag_strip_special_chars": bool(self._sw_tag_strip_special_chars.value),
             "author_order": bool(self._sw_author_order.value),
             "combined_mode": bool(self._sw_combined_mode.value),
+            "combined_workers": max(1, _safe_int(self._tf_combined_workers.value, 1)),
+            "source_mode": str(self._dd_source_mode.value or "following"),
+            "following_scope": str(self._dd_following_scope.value or "all"),
+            "bookmark_scope": str(self._dd_bookmark_scope.value or "all"),
         })
         store.update_section("schedule", {
             "enabled": bool(self._sw_schedule_enabled.value),
@@ -450,10 +518,20 @@ class SettingsView:
                 "cjxl_path": self._tf_jxl_path.value,
                 "delete_original": self._sw_jxl_delete.value,
                 "effort": int(self._sl_jxl_effort.value),
+                "skip_gif": self._sw_jxl_skip_gif.value,
             },
         })
+        if self._on_saved is not None:
+            with contextlib.suppress(Exception):
+                self._on_saved()
+
+    def _saved_snackbar(self) -> ft.SnackBar:
+        snack = glass_snackbar(current_theme(self._page), i18n.t("settings.saved"))
+        snack.duration = 1500
+        return snack
 
     def _save_and_notify(self, e) -> None:
+        theme = current_theme(self._page)
         avg_val = self._safe_int_cooldown()
         if avg_val < 30:
             def _confirm(ev):
@@ -461,22 +539,23 @@ class SettingsView:
                     self._page.pop_dialog()
                 self.save()
                 with contextlib.suppress(Exception):
-                    self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
+                    self._page.show_dialog(self._saved_snackbar())
 
             def _cancel(ev):
                 with contextlib.suppress(Exception):
                     self._page.pop_dialog()
 
             try:
-                self._page.show_dialog(ft.AlertDialog(
-                    title=ft.Text("冷卻時間偏短"),
+                self._page.show_dialog(c.confirm_dialog(
+                    theme,
+                    title=i18n.t("settings.cooldown_warn.title"),
                     content=ft.Text(
-                        f"平均冷卻 {avg_val} 秒低於建議值 30 秒，\n可能被 Pixiv 風控偵測。確定要套用？"
+                        i18n.t("settings.cooldown_warn.body", avg=avg_val),
+                        color=theme.text_secondary,
                     ),
-                    actions=[
-                        ft.TextButton("取消", on_click=_cancel),
-                        ft.FilledButton("確定套用", on_click=_confirm),
-                    ],
+                    on_confirm=_confirm,
+                    confirm_text=i18n.t("settings.cooldown_warn.confirm"),
+                    on_cancel=_cancel,
                 ))
             except Exception:
                 # If dialog fails for any reason, fall back to direct save
@@ -484,110 +563,125 @@ class SettingsView:
             return
         self.save()
         with contextlib.suppress(Exception):
-            self._page.show_dialog(ft.SnackBar(ft.Text("設定已儲存"), duration=1500))
+            self._page.show_dialog(self._saved_snackbar())
 
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
 
     def build(self) -> ft.Column:
-        def _tile(title: str, controls: list) -> ft.ExpansionTile:
-            return ft.ExpansionTile(
-                title=ft.Text(title),
-                controls=[ft.Container(
-                    content=ft.Column(controls, spacing=8),
-                    padding=ft.Padding.only(left=16, top=10, bottom=12),
-                )],
-            )
+        theme = current_theme(self._page)
 
-        save_btn = ft.FilledButton("儲存設定", icon=ft.Icons.SAVE, on_click=self._save_and_notify)
+        save_btn = c.primary_button(i18n.t("settings.save"), icon=ft.Icons.SAVE, on_click=self._save_and_notify)
+
+        def _sec(key: str, controls: list) -> ft.Control:
+            # Every content section leads with a one-line purpose note (spec §B
+            # 顯示整理「每個主區塊都要有一句用途說明」), then its controls.
+            return c.section(theme, i18n.t(f"settings.section.{key}"),
+                             [c.note(theme, i18n.t(f"settings.note.{key}")), *controls])
 
         return ft.Column(
             controls=[
-                ft.Text("設定", size=20, weight=ft.FontWeight.BOLD),
-                _tile("帳號設定", [
+                c.page_title(theme, i18n.t("settings.title")),
+                c.section(theme, i18n.t("settings.section.interface"), [
+                    self._dd_language,
+                    c.note(theme, i18n.t("settings.lang.restart_hint")),
+                ]),
+                # 1. 帳號與連線（帳號 + User-Agent + Proxy）
+                _sec("account", [
+                    c.subhead(theme, i18n.t("settings.sub.pixiv_account")),
                     self._tf_account,
                     self._tf_password,
                     self._tf_userid,
-                    ft.Row([self._tf_path, ft.IconButton(
-                        icon=ft.Icons.FOLDER_OPEN,
-                        on_click=self._pick_folder,
-                    )]),
+                    c.subhead(theme, i18n.t("settings.sub.user_agent")),
+                    ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
+                    self._label_ua_status,
+                    c.subhead(theme, i18n.t("settings.sub.proxy")),
+                    self._tf_proxy_pool,
+                    ft.Row([
+                        c.secondary_button(i18n.t("settings.proxy.test_all"), on_click=self._on_test_proxies),
+                    ]),
+                    self._proxy_test_results,
                 ]),
-                _tile("過濾規則", [
-                    ft.Row([self._sw_hidefollow, self._sw_nogif, self._sw_notag, self._sw_notime], wrap=True),
-                    ft.Row([self._tf_like_num, self._tf_r18_like_num, self._tf_rescrape_within_days], spacing=16, wrap=True),
-                ]),
-                _tile("檔名範本", [
-                    ft.Text(
-                        "可用佔位符：{pid} {page} {ext} {tag} {hashtag} {timetag} {date} {time}\n"
-                        "留空時使用預設規則。檔名會自動清掉 Windows 不允許的字元。",
-                        size=11, color=ft.Colors.GREY_700,
-                    ),
-                    self._tf_filename_template,
-                    ft.Text("Tag 整理（套用於 {hashtag} 佔位符）", size=12),
+                # 2. 作品來源與抓取策略
+                _sec("source", [
+                    c.subhead(theme, i18n.t("settings.source.mode")),
+                    c.note(theme, i18n.t("settings.note.source_modes")),
                     ft.Row(
-                        [self._sw_tag_strip_brackets, self._sw_tag_strip_special_chars],
+                        [self._dd_source_mode, self._dd_following_scope, self._dd_bookmark_scope],
+                        spacing=16,
                         wrap=True,
                     ),
-                    ft.Text("下載順序", size=12),
-                    self._sw_author_order,
                     self._sw_combined_mode,
+                    ft.Row([self._tf_combined_workers], spacing=16, wrap=True),
+                    self._sw_author_order,
+                    self._sw_force_rescan,
                 ]),
-                _tile("資料夾分類", [
-                    ft.Text(
-                        "啟用後將在下載目錄底下，依作品屬性建立子資料夾。",
-                        size=11, color=ft.Colors.GREY_700,
-                    ),
+                # 3. 作品篩選（篩選條件 + 缺值處理）
+                _sec("filter", [
+                    ft.Row([self._sw_hidefollow, self._sw_nogif], wrap=True),
+                    ft.Row([self._tf_like_num, self._tf_r18_like_num, self._tf_rescrape_within_days], spacing=16, wrap=True),
+                    c.subhead(theme, i18n.t("settings.sub.missing_value")),
+                    ft.Row([self._sw_notag, self._sw_notime], wrap=True),
+                    c.subhead(theme, i18n.t("settings.sub.ban_tag")),
+                    self._ban_tag_row,
+                    ft.Row([self._tf_ban_input, c.icon_action(ft.Icons.ADD, on_click=self._add_ban_tag)]),
+                    c.subhead(theme, i18n.t("settings.sub.must_tag")),
+                    self._must_tag_row,
+                    ft.Row([self._tf_must_input, c.icon_action(ft.Icons.ADD, on_click=self._add_must_tag)]),
+                ]),
+                # 4. 下載與檔名（位置 + 資料夾分類 + 檔名 + 時間戳 + tag 整理）
+                _sec("download", [
+                    c.subhead(theme, i18n.t("settings.sub.download_path")),
+                    ft.Row([self._tf_path, c.icon_action(
+                        ft.Icons.FOLDER_OPEN,
+                        on_click=self._pick_folder,
+                    )]),
+                    c.subhead(theme, i18n.t("settings.sub.folder_classify")),
+                    c.note(theme, i18n.t("settings.note.folder_classify")),
                     self._sw_create_dir,
                     self._sw_r18_dir,
                     self._sw_r18g_dir,
                     self._sw_ai_dir,
+                    c.subhead(theme, i18n.t("settings.sub.filename_template")),
+                    c.note(theme, i18n.t("settings.note.filename_template")),
+                    self._tf_filename_template,
+                    c.subhead(theme, i18n.t("settings.sub.timestamp")),
+                    c.note(theme, i18n.t("settings.note.timestamp")),
+                    self._tf_download_time,
+                    self._sw_set_file_mtime,
+                    c.subhead(theme, i18n.t("settings.sub.tag_organize")),
+                    ft.Row(
+                        [self._sw_tag_strip_brackets, self._sw_tag_strip_special_chars],
+                        wrap=True,
+                    ),
                 ]),
-                _tile("標籤過濾", [
-                    ft.Text("禁止 tag", size=12),
-                    self._ban_tag_row,
-                    ft.Row([self._tf_ban_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_ban_tag)]),
-                    ft.Text("必須 tag", size=12),
-                    self._must_tag_row,
-                    ft.Row([self._tf_must_input, ft.IconButton(icon=ft.Icons.ADD, on_click=self._add_must_tag)]),
-                ]),
-                _tile("JXL 轉檔", [
+                # 5. 格式轉換、效能與自動化
+                _sec("advanced", [
+                    c.subhead(theme, i18n.t("settings.sub.jxl")),
                     self._sw_jxl,
-                    ft.Row([self._tf_jxl_path, ft.IconButton(
-                        icon=ft.Icons.FILE_OPEN,
+                    ft.Row([self._tf_jxl_path, c.icon_action(
+                        ft.Icons.FILE_OPEN,
                         on_click=self._pick_jxl_exe,
                     )]),
                     self._sw_jxl_delete,
-                    ft.Row([ft.Text("Effort（1-9）"), self._sl_jxl_effort]),
-                ]),
-                _tile("冷卻設定", [
+                    self._sw_jxl_skip_gif,
+                    ft.Row([ft.Text(i18n.t("settings.adv.jxl_effort"), color=theme.text_primary), self._sl_jxl_effort]),
+                    c.subhead(theme, i18n.t("settings.sub.cooldown")),
                     ft.Row([self._tf_cooldown, self._label_cooldown_hint], spacing=12),
                     self._sl_cooldown,
                     ft.Row(
-                        [ft.Text("同 PID 頁間等待（秒）", size=13),
-                         self._tf_intra_min, ft.Text("~"), self._tf_intra_max],
+                        [c.inline_label(theme, i18n.t("settings.adv.intra_wait")),
+                         self._tf_intra_min, ft.Text("~", color=theme.text_secondary), self._tf_intra_max],
                         spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     ft.Row(
-                        [ft.Text("免 Cookie 請求等待（秒）", size=13),
-                         self._tf_nocookie_min, ft.Text("~"), self._tf_nocookie_max],
+                        [c.inline_label(theme, i18n.t("settings.adv.nocookie_wait")),
+                         self._tf_nocookie_min, ft.Text("~", color=theme.text_secondary), self._tf_nocookie_max],
                         spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     self._sw_single_thread,
-                ]),
-                _tile("Proxy 設定", [
-                    self._tf_proxy_pool,
-                    ft.Row([
-                        ft.OutlinedButton("測試全部 Proxy", on_click=self._on_test_proxies),
-                    ]),
-                    self._proxy_test_results,
-                ]),
-                _tile("User-Agent 設定", [
-                    ft.Row([self._tf_agent, self._btn_detect_ua], spacing=8),
-                    self._label_ua_status,
-                ]),
-                _tile("排程", [
+                    c.subhead(theme, i18n.t("settings.sub.schedule")),
                     self._sw_schedule_enabled,
                     self._dd_schedule_mode,
                     self._tf_schedule_time,
@@ -596,6 +690,6 @@ class SettingsView:
                 ft.Container(content=save_btn, padding=ft.Padding.only(top=8)),
             ],
             scroll=ft.ScrollMode.AUTO,
-            spacing=0,
+            spacing=theme.gap,
             expand=True,
         )

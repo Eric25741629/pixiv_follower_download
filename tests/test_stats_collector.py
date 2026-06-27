@@ -65,6 +65,97 @@ def test_reset_session():
     assert s["jxl_src"] == 0
 
 
+class _FakeClock:
+    """Controllable stand-in for the ``time`` module (only ``monotonic`` used)."""
+
+    def __init__(self, t: float = 1000.0):
+        self.t = t
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+def test_elapsed_zero_before_any_run():
+    sc = StatsCollector()
+    # No reset_session() yet -> timer never started.
+    assert sc.get_session_stats()["elapsed"] == 0.0
+
+
+def test_elapsed_counts_while_running(monkeypatch):
+    import app.core.stats_collector as mod
+    clock = _FakeClock(1000.0)
+    monkeypatch.setattr(mod, "time", clock)
+    sc = StatsCollector()
+    sc.reset_session()
+    clock.t = 1007.0
+    assert sc.get_session_stats()["elapsed"] == 7.0
+
+
+def test_mark_session_end_freezes_elapsed(monkeypatch):
+    import app.core.stats_collector as mod
+    clock = _FakeClock(1000.0)
+    monkeypatch.setattr(mod, "time", clock)
+    sc = StatsCollector()
+    sc.reset_session()
+    clock.t = 1005.0
+    sc.mark_session_end()           # freeze at 5s
+    clock.t = 1100.0                # wall clock keeps moving...
+    assert sc.get_session_stats()["elapsed"] == 5.0  # ...but elapsed is frozen
+
+
+def test_mark_session_end_is_idempotent(monkeypatch):
+    import app.core.stats_collector as mod
+    clock = _FakeClock(1000.0)
+    monkeypatch.setattr(mod, "time", clock)
+    sc = StatsCollector()
+    sc.reset_session()
+    clock.t = 1005.0
+    sc.mark_session_end()
+    clock.t = 1009.0
+    sc.mark_session_end()           # second call must not advance the frozen end
+    assert sc.get_session_stats()["elapsed"] == 5.0
+
+
+def test_resume_session_continues_from_original_start(monkeypatch):
+    import app.core.stats_collector as mod
+    clock = _FakeClock(1000.0)
+    monkeypatch.setattr(mod, "time", clock)
+    sc = StatsCollector()
+    sc.reset_session()              # start at 1000
+    clock.t = 1005.0
+    sc.mark_session_end()           # freeze (intermediate Run-All step end)
+    clock.t = 1006.0
+    sc.resume_session()             # Run All chains into next step
+    clock.t = 1020.0
+    # Spans the whole run from 1000, not just the resumed leg.
+    assert sc.get_session_stats()["elapsed"] == 20.0
+
+
+def test_reset_session_clears_frozen_end(monkeypatch):
+    import app.core.stats_collector as mod
+    clock = _FakeClock(1000.0)
+    monkeypatch.setattr(mod, "time", clock)
+    sc = StatsCollector()
+    sc.reset_session()
+    clock.t = 1005.0
+    sc.mark_session_end()
+    clock.t = 2000.0
+    sc.reset_session()              # fresh run restarts at 2000
+    clock.t = 2003.0
+    assert sc.get_session_stats()["elapsed"] == 3.0
+
+
+def test_mark_end_and_resume_noop_without_start(monkeypatch):
+    import app.core.stats_collector as mod
+    clock = _FakeClock(1000.0)
+    monkeypatch.setattr(mod, "time", clock)
+    sc = StatsCollector()
+    # Never started: both are safe no-ops, elapsed stays 0.
+    sc.mark_session_end()
+    sc.resume_session()
+    assert sc.get_session_stats()["elapsed"] == 0.0
+
+
 def test_save_and_load(tmp_path):
     path = str(tmp_path / "stats.json")
     sc = StatsCollector(path)

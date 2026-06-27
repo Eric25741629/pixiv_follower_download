@@ -1,86 +1,49 @@
 from __future__ import annotations
+import asyncio
 import atexit
+import contextlib
 import os
 import queue
+import signal
 import sqlite3
 import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 import flet as ft
 
 from app.core.app_logging import init_logging, get_logger
 from app.gui.dispatcher import EventDispatcher
+from app.gui.glass import (
+    FONT_ASSET_PATH, FONT_FALLBACK, FONT_FAMILY,
+    aurora_background, current_theme, glass_nav,
+)
 from app.gui.run_actions import RunController
 from app.gui.views.main_view import MainView
 from app.gui.views.settings_view import SettingsView
 from app.gui.views.cookies_view import CookiesView
 from app.gui.views.stats_view import StatsView
 from app.core.stats_collector import StatsCollector
-from app.core.settings_store import SettingsStore
 from app.core.worker_event import WorkerEvent
+from app import i18n
+# Stateless bootstrap helpers (settings/theme persistence + the two small view
+# helpers) moved to app.gui.bootstrap_helpers (file-size refactor) and
+# re-imported here so call sites in main() and the tests that access
+# ``flet_app._activate_view`` / ``flet_app._handle_page_progress_event`` keep
+# resolving. The crash-hook installers + _PERSISTENT_* state stay below — they
+# are mutated via ``global`` inside main()/its closures and cannot move.
+from app.gui.bootstrap_helpers import (
+    _activate_view,
+    _event_log_kwargs,
+    _handle_page_progress_event,
+    _load_theme_mode,
+    _save_theme_mode,
+    _settings_store,
+)
 
 _log = get_logger("pixiv.gui")
 
-
-def _settings_store() -> SettingsStore:
-    path = os.getenv("APPDATA") + r"/pixiv_download/"
-    os.makedirs(path, exist_ok=True)
-    return SettingsStore(path)
-
-
-def _event_log_kwargs() -> dict:
-    """Read othersettings.event_log durability/rotation knobs for EventLog.
-
-    Defaults batch the fsync (200 events / 1s) so the common write path no
-    longer pays a per-mutation disk barrier; anchor kinds and close() still
-    fsync. Missing/invalid values fall back to the defaults.
-    """
-    try:
-        cfg = _settings_store().get_section("event_log")
-    except Exception:
-        cfg = {}
-    if not isinstance(cfg, dict):
-        cfg = {}
-
-    def _i(key, default):
-        try:
-            return int(cfg.get(key, default))
-        except (TypeError, ValueError):
-            return default
-
-    def _f(key, default):
-        try:
-            return float(cfg.get(key, default))
-        except (TypeError, ValueError):
-            return default
-
-    return {
-        "retention_days": _i("retention_days", 60),
-        "fsync_every_n": _i("fsync_every_n", 200),
-        "fsync_interval_sec": _f("fsync_interval_sec", 1.0),
-        "max_total_bytes": _i("max_total_bytes", 4 * 1024 * 1024 * 1024),
-        "rotate_size_bytes": _i("rotate_size_bytes", 128 * 1024 * 1024),
-    }
-
-
-def _load_theme_mode() -> ft.ThemeMode:
-    try:
-        name = _settings_store().get_section("ui").get("theme_mode", "SYSTEM")
-    except Exception:
-        return ft.ThemeMode.SYSTEM
-    if name == "DARK":
-        return ft.ThemeMode.DARK
-    if name == "LIGHT":
-        return ft.ThemeMode.LIGHT
-    return ft.ThemeMode.SYSTEM
-
-
-def _save_theme_mode(mode: ft.ThemeMode) -> None:
-    try:
-        _settings_store().update_fields("ui", {"theme_mode": mode.name})
-    except Exception:
-        _log.exception("failed to persist theme_mode")
 
 # ── cross-session persistence ──────────────────────────────────────────────
 # Flet 0.84 desktop GCs the server-side session if the flutter client
@@ -125,17 +88,8 @@ _PERSISTENT_UI_STATE: dict = {
 }
 
 
-def _activate_view(views: list, idx: int) -> int:
-    """Show one view while keeping every view mounted in the Flet tree."""
-    try:
-        active_idx = int(idx)
-    except (TypeError, ValueError):
-        active_idx = 0
-    if active_idx < 0 or active_idx >= len(views):
-        active_idx = 0
-    for i, view in enumerate(views):
-        view.visible = i == active_idx
-    return active_idx
+# _activate_view / _handle_page_progress_event moved to bootstrap_helpers
+# (file-size refactor) and re-imported at module top.
 
 # ── crash-safe flush ───────────────────────────────────────────────────────
 # Without this, an unhandled exception (in main thread, in any worker, or
@@ -148,6 +102,41 @@ def _activate_view(views: list, idx: int) -> int:
 _HOOKS_INSTALLED = False
 _EMERGENCY_FLUSH_LOCK = threading.Lock()
 _EMERGENCY_FLUSH_DONE = False
+
+# ── shutdown watchdog ───────────────────────────────────────────────────────
+# Guaranteed floor for "the app must always be closeable". A worker wedged in a
+# non-interruptible syscall (stalled F: write / recv with no socket timeout) or
+# a flush that hangs can keep the process alive after the user asks to close;
+# and after a Flet 0.84 session GC the window X never re-enters Python (it hits
+# the dead "Working..." shell). This watchdog, armed at the first sign of a
+# close request, os._exit(0)s after a hard deadline regardless of session /
+# event-loop / worker state. It imports nothing from flet and joins nothing, so
+# it cannot itself wedge; workers are daemon=True so os._exit needs no join.
+_SHUTDOWN_WATCHDOG_LOCK = threading.Lock()
+_SHUTDOWN_WATCHDOG_ARMED = False
+
+
+def _arm_shutdown_watchdog(timeout: float = 8.0, reason: str = "window_close") -> None:
+    """Start (at most once) a daemon thread that force-exits after ``timeout`` s.
+
+    The graceful shutdown path arms this first, then runs flush/checkpoint/
+    destroy and reaches its own ``os._exit(0)``; on a healthy disk that wins the
+    race in well under a second and the watchdog never reaches its deadline. The
+    watchdog only matters when a graceful step wedges.
+    """
+    global _SHUTDOWN_WATCHDOG_ARMED
+    with _SHUTDOWN_WATCHDOG_LOCK:
+        if _SHUTDOWN_WATCHDOG_ARMED:
+            return
+        _SHUTDOWN_WATCHDOG_ARMED = True
+
+    def _kill() -> None:
+        time.sleep(max(0.0, float(timeout)))
+        with contextlib.suppress(Exception):
+            _log.warning("shutdown watchdog firing after %ss: %s", timeout, reason)
+        os._exit(0)
+
+    threading.Thread(target=_kill, name="shutdown-watchdog", daemon=True).start()
 
 
 def _emergency_flush(reason: str = "unknown") -> None:
@@ -240,17 +229,71 @@ def _install_crash_hooks() -> None:
     atexit.register(_emergency_flush, "atexit")
 
 
+_SIGNALS_INSTALLED = False
+
+
+def _install_signal_handlers() -> None:
+    """Install console SIGINT/SIGBREAK -> flush + watchdog + os._exit(0).
+
+    Kept SEPARATE from _install_crash_hooks (which several unit tests call
+    directly) so the tests never leak a process-global signal handler that
+    would turn a later interactive Ctrl+C into an abrupt os._exit. Called once
+    from main(). This is the out-of-band kill channel for a dead post-GC
+    "Working..." window whose X no longer reaches Python. Guarded because
+    signal.signal only works on the main thread (main(page) runs there under
+    ft.app, but stay defensive).
+    """
+    global _SIGNALS_INSTALLED
+    if _SIGNALS_INSTALLED:
+        return
+    _SIGNALS_INSTALLED = True
+
+    def _signal_shutdown(signum, _frame):  # pragma: no cover - needs a real signal
+        _emergency_flush(reason=f"signal:{signum}")
+        _arm_shutdown_watchdog(reason=f"signal:{signum}")
+        os._exit(0)
+
+    for _signame in ("SIGINT", "SIGBREAK"):
+        _sig = getattr(signal, _signame, None)
+        if _sig is not None:
+            with contextlib.suppress(Exception):
+                signal.signal(_sig, _signal_shutdown)
+
+
 def main(page: ft.Page) -> None:
     init_logging()
     _install_crash_hooks()
+    _install_signal_handlers()
+    # GUI locale (apply-on-restart): set BEFORE any view is built so every
+    # control reads the right language at build time. Unknown/missing -> zh-TW.
+    with contextlib.suppress(Exception):
+        i18n.set_locale(_settings_store().get_section("ui").get("language"))
+    # Per-event UI trace (ui_events.log) is opt-in: skip its per-event regex +
+    # synchronous file write on the dispatcher hot path unless explicitly enabled.
+    with contextlib.suppress(Exception):
+        from app.core import diag_log
+        diag_log.configure_ui_trace(
+            bool(_settings_store().get_section("diagnostics").get("verbose_logs", False))
+        )
     _log.info(
         "main(page) session start: web=%s platform=%s",
         getattr(page, "web", "?"),
         getattr(page, "platform", "?"),
     )
-    page.title = "Pixiv 下載器"
+    page.title = i18n.t("appbar.title")
     page.theme_mode = _load_theme_mode()
-    page.theme = ft.Theme(color_scheme_seed="#0096FA")
+    # 全域字型：repo 附帶的思源黑體（assets/fonts/NotoSansTC.ttf，經
+    # app/entry/main.py 的 assets_dir 提供）。檔案不在（例如以其他進入點
+    # 啟動、assets 沒帶到）就退回微軟正黑體 UI，不影響版面。
+    _font_file = Path(__file__).resolve().parents[2] / "assets" / "fonts" / "NotoSansTC.ttf"
+    if _font_file.is_file():
+        page.fonts = {FONT_FAMILY: FONT_ASSET_PATH}
+        _font_family = FONT_FAMILY
+    else:
+        _font_family = FONT_FALLBACK
+    page.theme = ft.Theme(color_scheme_seed="#0096FA", font_family=_font_family)
+    page.dark_theme = ft.Theme(color_scheme_seed="#0096FA", font_family=_font_family)
+    theme = current_theme(page)
     page.window.width = 1100
     page.window.height = 750
     page.padding = 0
@@ -328,18 +371,19 @@ def main(page: ft.Page) -> None:
         try:
             event_q.put(WorkerEvent(
                 "output",
-                f"<p><font color='gray'>偵測到上次未正常結束，已自動補齊 {_rc} 筆事件</font></p>",
+                f"<p><font color='gray'>{i18n.t('app.recover_notice', n=_rc)}</font></p>",
             ))
         except Exception:
             pass
 
     main_view = MainView(page, event_q)
-    settings_view = SettingsView(page)
-    cookies_view = CookiesView(page, event_q)
-    stats_view = StatsView(page, stats_collector)
-
     run_controller = RunController(main_view, event_q, stats_collector, event_log=event_log)
     main_view._run_controller = run_controller
+    # SettingsView notifies the controller on every save so a running task can
+    # apply in-scope settings live (and log what needs the next run).
+    settings_view = SettingsView(page, on_saved=run_controller.notify_settings_saved)
+    cookies_view = CookiesView(page, event_q)
+    stats_view = StatsView(page, stats_collector)
 
     # In-app scheduler: fire Run All on the configured schedule. The service
     # reads settings live and skips when a run is already active.
@@ -387,10 +431,13 @@ def main(page: ft.Page) -> None:
             # runs and is swallowed by the surrounding try/except.
             cd = int(_PERSISTENT_UI_STATE.get("countdown", 0) or 0)
             if cd > 0:
-                main_view._countdown_text.value = f"倒數：{cd} 秒"
+                main_view._countdown_text.value = i18n.t("main.countdown", r=cd)
             if bool(_PERSISTENT_UI_STATE.get("is_paused", False)):
                 main_view._is_paused = True
-                main_view._btn_pause.content = "▶ 繼續"
+                # 控制膠囊 content 是 Row[Image, Text] — 走 glass 的 helper。
+                from app.gui.glass import set_pill_icon, set_pill_label
+                set_pill_label(main_view._btn_pause, i18n.t("main.btn.resume"))
+                set_pill_icon(main_view._btn_pause, "play")
         except Exception:
             _log.exception("failed to restore persisted UI state")
         main_view.set_running(True)
@@ -412,8 +459,11 @@ def main(page: ft.Page) -> None:
     # leaves us with a handle to pause/stop it after the new main()
     # reattaches.
     _orig_start_step = run_controller._start_step
-    def _start_step_with_tracking(n: int) -> None:
-        _orig_start_step(n)
+    def _start_step_with_tracking(n: int, *args, **kwargs) -> None:
+        # Forward *args/**kwargs (e.g. require_idle=) so this wrapper stays
+        # signature-compatible with RunController._start_step — run_step/run_all
+        # call it with require_idle=True.
+        _orig_start_step(n, *args, **kwargs)
         global _PERSISTENT_ACTIVE_THREAD
         _PERSISTENT_ACTIVE_THREAD = main_view._active_thread
         # Snapshot the step-state list right after the new step's "running"
@@ -439,19 +489,21 @@ def main(page: ft.Page) -> None:
 
     async def _reload_views_on_loop(idx: int) -> None:
         try:
-            if idx == 1:
+            if idx == 0:
+                main_view.refresh_source_mode()
+                main_view.refresh_combined_mode()
+            elif idx == 1:
                 settings_view.reload_cookie_count()
             elif idx == 2:
                 cookies_view.reload_from_settings()
         except Exception:
             _log.exception("nav async reload failed for idx=%s", idx)
 
-    def on_nav_change(e: ft.ControlEvent) -> None:
+    def on_nav_change(idx: int) -> None:
         # Exceptions here must not bubble into Flet's event loop — Flet may
         # respond to an unhandled error by resetting the session, which
         # silently kills any running download. Log and swallow instead.
         try:
-            idx = e.control.selected_index
             now = time.monotonic()
             with _nav_lock:
                 if idx == _nav_state["idx"] and (now - _nav_state["ts"]) < 0.15:
@@ -465,7 +517,7 @@ def main(page: ft.Page) -> None:
             # These helpers update Flet controls, so they must run on the
             # event-loop page thread. Running them on a daemon thread can
             # enqueue patches from the wrong thread and trigger session GC.
-            if idx in (1, 2):
+            if idx in (0, 1, 2):
                 page.run_task(_reload_views_on_loop, idx)
         except Exception:
             _log.exception("on_nav_change failed")
@@ -475,33 +527,31 @@ def main(page: ft.Page) -> None:
     # removing/re-adding the statistics controls.
     stats_view.start_auto_refresh()
 
-    nav_rail = ft.NavigationRail(
-        selected_index=0,
-        label_type=ft.NavigationRailLabelType.ALL,
-        on_change=on_nav_change,
-        destinations=[
-            ft.NavigationRailDestination(
-                icon=ft.Icons.HOME_OUTLINED,
-                selected_icon=ft.Icons.HOME,
-                label="主頁",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.SETTINGS_OUTLINED,
-                selected_icon=ft.Icons.SETTINGS,
-                label="設定",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.COOKIE_OUTLINED,
-                selected_icon=ft.Icons.COOKIE,
-                label="Cookie",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.BAR_CHART_OUTLINED,
-                selected_icon=ft.Icons.BAR_CHART,
-                label="統計",
-            ),
-        ],
-    )
+    # ── floating glass nav (replaces ft.NavigationRail) ──────────────────
+    _nav_items = [
+        (ft.Icons.HOME_OUTLINED, i18n.t("nav.home")),
+        (ft.Icons.SETTINGS_OUTLINED, i18n.t("nav.settings")),
+        (ft.Icons.COOKIE_OUTLINED, i18n.t("nav.cookies")),
+        (ft.Icons.BAR_CHART_OUTLINED, i18n.t("nav.stats")),
+    ]
+    _nav_selected = [0]
+    nav_holder = ft.Container()
+
+    def _rebuild_nav() -> None:
+        nav_holder.content = glass_nav(
+            _nav_items, _nav_selected[0], _on_glass_nav, current_theme(page)
+        )
+        # `.page` raises RuntimeError when detached (Flet 0.84); `.parent`
+        # is None until the control is mounted, so guard on that instead.
+        if nav_holder.parent is not None:
+            nav_holder.update()
+
+    def _on_glass_nav(idx: int) -> None:
+        _nav_selected[0] = idx
+        on_nav_change(idx)  # existing debounce + _activate_view logic, unchanged
+        _rebuild_nav()
+
+    _rebuild_nav()
 
     def handle_output(data: str) -> None:
         # Buffer log lines so a session-GC'd successor main() can replay
@@ -523,6 +573,9 @@ def main(page: ft.Page) -> None:
         _PERSISTENT_UI_STATE["progress_total"] = main_view._progress_total
         _PERSISTENT_UI_STATE["progress_started_at"] = main_view._progress_started_at
 
+    def handle_page_progress(data) -> None:
+        _handle_page_progress_event(main_view, data)
+
     def handle_countdown(data: int) -> None:
         main_view.update_countdown(data)
         try:
@@ -536,6 +589,11 @@ def main(page: ft.Page) -> None:
         for i, st in enumerate(main_view._step_states):
             if st == "running":
                 main_view.set_step_state(i, "done")
+        # Freeze the "本次執行" elapsed timer. In Run All an intermediate step
+        # emits 'finished' too, but the following 'next N' resumes the timer
+        # (via _start_step) within the same dispatcher drain, so only the final
+        # step's freeze sticks.
+        stats_collector.mark_session_end()
         main_view.set_running(False)
         _PERSISTENT_ACTIVE_THREAD = None
         # Run finished — reset persisted state so a future new main()
@@ -549,6 +607,7 @@ def main(page: ft.Page) -> None:
         _PERSISTENT_UI_STATE["is_paused"] = False
         _PERSISTENT_UI_STATE["loading_open"] = False
         _PERSISTENT_UI_STATE["loading_message"] = ""
+        main_view.clear_page_progress()
 
     def handle_next(data: int) -> None:
         global _PERSISTENT_ACTIVE_THREAD
@@ -556,6 +615,9 @@ def main(page: ft.Page) -> None:
             for i, st in enumerate(main_view._step_states):
                 if st == "running":
                     main_view.set_step_state(i, "error")
+            # Terminal (step error or combined-mode end): freeze the elapsed
+            # timer. No-op if a preceding 'finished' already froze it.
+            stats_collector.mark_session_end()
             _PERSISTENT_ACTIVE_THREAD = None
             main_view.set_running(False)
             _PERSISTENT_UI_STATE["step_states"] = list(main_view._step_states)
@@ -567,6 +629,7 @@ def main(page: ft.Page) -> None:
             _PERSISTENT_UI_STATE["loading_message"] = ""
             _PERSISTENT_UI_STATE["countdown"] = 0
             _PERSISTENT_UI_STATE["phase"] = ""
+            main_view.clear_page_progress()
             return
         for i, st in enumerate(main_view._step_states):
             if st == "running":
@@ -577,7 +640,7 @@ def main(page: ft.Page) -> None:
     def handle_loading(data) -> None:
         if isinstance(data, tuple) and len(data) == 2:
             busy, message = data
-            msg_str = str(message) if message else "正在啟動..."
+            msg_str = str(message) if message else i18n.t("main.loading.default")
             main_view.set_loading(bool(busy), msg_str)
             _PERSISTENT_UI_STATE["loading_open"] = bool(busy)
             _PERSISTENT_UI_STATE["loading_message"] = msg_str if bool(busy) else ""
@@ -605,6 +668,17 @@ def main(page: ft.Page) -> None:
                 cookie, status = data
                 cookies_view.apply_cookie_test_result(str(cookie), str(status))
 
+    def handle_timechanged(data) -> None:
+        # Persist the advanced download_time cursor so the next run does not
+        # reuse the same timestamp prefix for thousands of files.
+        try:
+            text = str(data).strip() if data is not None else ""
+            if not text:
+                return
+            _settings_store().update_fields("download", {"download_time": text})
+        except Exception:
+            pass  # never crash the dispatcher
+
     def handle_phase(data) -> None:
         text = str(data) if data else ""
         main_view.set_phase(text)
@@ -613,6 +687,7 @@ def main(page: ft.Page) -> None:
     disp = EventDispatcher(page, event_q, {
         "output":        handle_output,
         "progress":      handle_progress,
+        "page_progress": handle_page_progress,
         "countdown":     handle_countdown,
         "finished":      handle_finished,
         "next":          handle_next,
@@ -620,41 +695,79 @@ def main(page: ft.Page) -> None:
         "cookie_status": handle_cookie_status,
         "phase":         handle_phase,
         "pause_state":   handle_pause_state,
+        "timechanged":   handle_timechanged,
     })
 
+    # ── aurora background + floating layout ──────────────────────────────
+    root = ft.Row(
+        controls=[
+            ft.Container(nav_holder, padding=ft.Padding(16, 16, 0, 16)),
+            ft.Container(content_area, expand=True, padding=16),
+        ],
+        expand=True,
+        spacing=0,
+    )
+    aurora = aurora_background(theme, root)
+    # aurora.content is ft.Stack([orb1, orb2, root]); keep orb handles so the
+    # theme toggle can recolor them in place without rebuilding the tree.
+    _orb1, _orb2 = aurora.content.controls[0], aurora.content.controls[1]
+
+    _appbar_title = ft.Text(i18n.t("appbar.title"), color=theme.text_primary)
+    _theme_button = ft.IconButton(
+        icon=ft.Icons.LIGHT_MODE,
+        icon_color=theme.text_primary,
+        tooltip=i18n.t("theme.toggle_tooltip"),
+        on_click=lambda e: toggle_theme(e),
+    )
+
+    # 防抖：切主題是整頁重排（貴），快速連點會在 event loop 排隊一串
+    # 全頁重繪 → UI 卡死數秒。窗口內的重複點擊直接忽略。
+    _theme_toggle_last = [0.0]
+
     def toggle_theme(e: ft.ControlEvent) -> None:
+        now = time.monotonic()
+        if now - _theme_toggle_last[0] < 0.6:
+            return
+        _theme_toggle_last[0] = now
         page.theme_mode = (
             ft.ThemeMode.DARK
             if page.theme_mode == ft.ThemeMode.LIGHT
             else ft.ThemeMode.LIGHT
         )
-        _save_theme_mode(page.theme_mode)
+        # 設定寫檔是磁碟 I/O — 不能在 event loop 上做（會凍住 UI）。
+        threading.Thread(
+            target=_save_theme_mode, args=(page.theme_mode,), daemon=True,
+        ).start()
+        # Recompute the glass theme and repaint theme-bound chrome in place.
+        new_theme = current_theme(page)
+        aurora.gradient = ft.LinearGradient(
+            begin=ft.Alignment(-0.6, -1), end=ft.Alignment(0.6, 1),
+            colors=list(new_theme.bg_gradient), stops=[0.0, 0.5, 1.0],
+        )
+        _orb1.gradient = ft.RadialGradient(colors=[new_theme.orb1_color, "#00000000"])
+        _orb2.gradient = ft.RadialGradient(colors=[new_theme.orb2_color, "#00000000"])
+        _appbar_title.color = new_theme.text_primary
+        _theme_button.icon_color = new_theme.text_primary
+        page.appbar.color = new_theme.text_primary
+        _rebuild_nav()
         for view in (main_view, stats_view):
             try:
                 view.refresh_theme()
             except Exception:
                 pass
         page.update()
+        # 全頁重排會把 log 捲回頂部 — 跟隨中就跳回底部。
+        main_view._log_panel.notify_relayout()
 
     page.appbar = ft.AppBar(
-        title=ft.Text("Pixiv 下載器"),
+        title=_appbar_title,
         center_title=False,
-        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
-        actions=[
-            ft.IconButton(
-                icon=ft.Icons.LIGHT_MODE,
-                tooltip="切換深淺色",
-                on_click=toggle_theme,
-            ),
-        ],
+        bgcolor="#00000000",
+        color=theme.text_primary,
+        actions=[_theme_button],
     )
 
-    page.add(
-        ft.Row(
-            controls=[nav_rail, ft.VerticalDivider(width=1), content_area],
-            expand=True,
-        )
-    )
+    page.add(aurora)
 
     # platform_brightness becomes reliable only after page.add(), so re-apply
     # step-card / stats colors once the page is mounted — covers the SYSTEM
@@ -672,7 +785,7 @@ def main(page: ft.Page) -> None:
     # we need to put it back on the new page; otherwise the buttons stay
     # disabled-looking and the user thinks the app is frozen.
     if bool(_PERSISTENT_UI_STATE.get("loading_open", False)):
-        msg = str(_PERSISTENT_UI_STATE.get("loading_message", "") or "正在啟動...")
+        msg = str(_PERSISTENT_UI_STATE.get("loading_message", "") or i18n.t("main.loading.default"))
         try:
             main_view.set_loading(True, msg)
         except Exception:
@@ -684,12 +797,36 @@ def main(page: ft.Page) -> None:
     # thread and only flush when the user pokes the UI (drag, click).
     page.run_task(disp.run)
 
+    # ── aurora orb drift ────────────────────────────────────────────────────
+    # 7s round-trip: flip each orb's anchor offsets ±20px; animate_position on
+    # the orbs (set in glass.aurora_background) smooths the transition. Runs on
+    # the asyncio event loop via page.run_task — never a bare thread.
+    async def _drift_orbs() -> None:
+        toward = False
+        while True:
+            await asyncio.sleep(7)
+            toward = not toward
+            d = 20 if toward else 0
+            _orb1.top, _orb1.right = -140 + d, -100 - d
+            _orb2.bottom, _orb2.left = -110 + d, -80 - d
+            try:
+                _orb1.update()
+                _orb2.update()
+            except Exception:
+                break  # page/session gone — stop drifting
+
+    page.run_task(_drift_orbs)
+
     # ── shutdown handling ───────────────────────────────────────────────────
     # Without this, closing the window leaves the dispatcher polling and any
     # in-flight worker thread (incl. its concurrent.futures pool with 30 s
     # request timeouts) blocking interpreter exit via atexit hooks.
     async def _shutdown_and_destroy(reason: str) -> None:
         _log.warning("_shutdown_and_destroy entered: reason=%s", reason)
+        # Arm the guaranteed-exit floor BEFORE any flush/destroy that could
+        # wedge. The graceful os._exit(0) below wins the race on a healthy disk;
+        # the watchdog only fires if a step hangs.
+        _arm_shutdown_watchdog(reason=reason)
         try:
             t = getattr(main_view, "_active_thread", None)
             if t is not None:

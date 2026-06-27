@@ -59,3 +59,14 @@ def test_empty_string():
 def test_double_quote_attribute():
     spans = html_to_spans('<font color="green">ok</font>')
     assert spans[0].style.color == COLOR_MAP["green"]
+
+
+def test_hex_color_passed_through():
+    spans = html_to_spans("<font color='#ff8800'>hex</font>")
+    assert spans[0].text == "hex"
+    assert spans[0].style.color == "#ff8800"
+
+
+def test_hex_color_uppercase_lowercased():
+    spans = html_to_spans("<font color='#ABCDEF'>x</font>")
+    assert spans[0].style.color == "#abcdef"

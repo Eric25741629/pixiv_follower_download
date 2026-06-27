@@ -1,5 +1,4 @@
 from __future__ import annotations
-import math
 import random
 import threading
 import time
@@ -16,6 +15,7 @@ class AccountState:
     proxy_url: str | None = None
     cooldown_until: float = 0.0          # time.monotonic() timestamp
     disabled_reason: str | None = None   # None = active; 'proxy_dead' = disabled
+    held: bool = False                   # checked out by a worker, not yet released
 
     @property
     def proxies(self) -> dict | None:
@@ -27,12 +27,24 @@ _THROUGHPUT_JITTER = 0.10  # ±10% on inter-request gap (anti-detection)
 
 
 class AccountScheduler:
-    """Round-robin per-account cooldown scheduler with a throughput gate.
+    """Idle-weighted per-account cooldown scheduler with a throughput gate.
 
-    Per-account cooldown is the deterministic ``avg × ln(N+1)`` (no
-    jitter on it), so account rest time stays predictable. Randomness
-    lives on the throughput gate: each successful acquire pushes
-    ``next_emit_at`` forward by ``throughput × random(0.9, 1.1)``,
+    Selection among the currently-ready accounts is a *weighted random*
+    pick favouring the account that has been idle longest (see
+    ``_pick_weighted_by_idle``). This spreads load across the whole pool —
+    request counts land in a balanced spread around the mean instead of a
+    steep front-of-list skew — while guaranteeing no account starves: an
+    account that keeps getting skipped accumulates idle time, so its pick
+    weight keeps rising until it wins. (The earlier implementation picked
+    ``available[0]`` in fixed list order, which under any demand slack let
+    the front of the list satisfy every request and left the tail at zero.)
+
+    Per-account cooldown is the deterministic setting value itself
+    (``pid_cooldown_avg`` seconds, fixed regardless of account count —
+    the user dials "each account rests N seconds"), so account rest
+    time stays predictable. Throughput is therefore ``avg / N``.
+    Randomness lives on the throughput gate: each successful acquire
+    pushes ``next_emit_at`` forward by ``throughput × random(0.9, 1.1)``,
     bounding the inter-request gap to ~±10% around throughput.
 
     Initial per-account cooldowns are staggered by one throughput
@@ -40,8 +52,10 @@ class AccountScheduler:
     cadence and the UI countdown reflects "when will the next request
     fire" rather than the longer per-account wait.
 
-    Single-consumer: one worker thread calls acquire(), runs a unit of
-    work, and calls release(). Thread-safe via internal lock.
+    Multi-consumer safe: acquire() marks the account ``held`` so a
+    concurrent worker can never check out the same account before it is
+    released; release() (or release_neutral()) clears the flag.
+    Thread-safe via internal lock.
     """
 
     def __init__(
@@ -53,7 +67,7 @@ class AccountScheduler:
         emit: Callable[[str], None] | None = None,
         q: Any = None,
         on_disable: Callable[[AccountState], None] | None = None,
-        on_first_success: Callable[[AccountState], None] | None = None,
+        on_success: Callable[[AccountState], None] | None = None,
     ) -> None:
         self._accounts = list(accounts)
         self._get_cooldown_avg = get_cooldown_avg
@@ -65,12 +79,16 @@ class AccountScheduler:
         # caller can persist the cookie's status (e.g., "失效") to settings
         # — the next run won't trust the cached "有效" any more.
         self._on_disable = on_disable
-        # Called the first time each cookie succeeds in a run, so the caller
-        # can refresh last_tested_at — extending the 30-day trust window.
-        self._on_first_success = on_first_success
-        self._used_cookies: set[str] = set()
+        # Called after EVERY successful release so the caller can refresh the
+        # cookie's last_tested_at. Firing on every success (not just the first)
+        # keeps the cookies view's 「檢查：」 time advancing throughout a run
+        # instead of freezing at each cookie's first-use time, and continuously
+        # extends the 30-day trust window.
+        self._on_success = on_success
         self._lock = threading.Lock()
         self._next_emit_at = 0.0  # global throughput gate
+        self._empty_pool_emitted = False
+        self._last_countdown_emit = 0.0  # monotonic ts of last non-zero countdown tick
         self._stagger_initial_cooldowns()
 
     def _stagger_initial_cooldowns(self) -> None:
@@ -87,7 +105,7 @@ class AccountScheduler:
             return
         if avg <= 0:
             return
-        throughput = avg * math.log(n + 1) / n
+        throughput = avg / n
         now = time.monotonic()
         for i, acc in enumerate(active):
             acc.cooldown_until = now + i * throughput
@@ -103,8 +121,9 @@ class AccountScheduler:
         return not self._stop_event.is_set()
 
     def _empty_active_pool_response(self) -> None:
-        """When no active accounts remain, log a final message if any existed."""
-        if self._accounts:
+        """When no active accounts remain, log a final message once."""
+        if self._accounts and not self._empty_pool_emitted:
+            self._empty_pool_emitted = True
             self._emit(
                 "<p><font color='red'>所有 Cookie 都已禁用，任務停止</font></p>"
             )
@@ -112,19 +131,45 @@ class AccountScheduler:
 
     def _try_pickup_ready_account(self, active, now):
         """Return an account ready to pick up (and advance the throughput gate),
-        or None if every active account is still in cooldown."""
-        available = [a for a in active if a.cooldown_until <= now]
+        or None if every active account is still in cooldown or held."""
+        available = [a for a in active if not a.held and a.cooldown_until <= now]
         if not available:
             return None
         throughput = self._throughput_seconds(active)
         jitter = 1.0 + random.uniform(-_THROUGHPUT_JITTER, _THROUGHPUT_JITTER)
         self._next_emit_at = now + max(0.5, throughput * jitter)
+        picked = self._pick_weighted_by_idle(available, now, throughput)
+        picked.held = True
         self._emit_countdown(0)
-        return available[0]
+        return picked
+
+    def _pick_weighted_by_idle(self, available, now, throughput):
+        """Weighted-random choice among ready accounts, favouring the one
+        idle longest.
+
+        Weight = ``(now - cooldown_until) + base`` where ``base`` is one
+        throughput interval (floored at 0.5 s). ``now - cooldown_until`` is
+        the time the account has sat ready (``>= 0``; the caller already
+        filtered to ``cooldown_until <= now``), so a long-neglected account
+        gets a proportionally larger share and can never be starved, while
+        the base keeps a just-ready account pickable and guarantees the
+        total weight is positive. Counts therefore form a balanced spread
+        around the mean rather than the old fixed-list-order skew.
+        """
+        if len(available) == 1:
+            return available[0]
+        base = max(0.5, throughput)
+        weights = [(now - a.cooldown_until) + base for a in available]
+        return random.choices(available, weights=weights, k=1)[0]
 
     def _compute_wait(self, active, now) -> float:
         """How long to sleep before the next acquire attempt; 0 means ready now."""
-        earliest_acc = min(a.cooldown_until for a in active)
+        free = [a for a in active if not a.held]
+        if not free:
+            # Every active account is checked out by another worker; poll
+            # until one of them is released.
+            return 0.5
+        earliest_acc = min(a.cooldown_until for a in free)
         acc_wait = max(0.0, earliest_acc - now)
         gate_wait = max(0.0, self._next_emit_at - now)
         return max(acc_wait, gate_wait)
@@ -159,15 +204,27 @@ class AccountScheduler:
 
     def _throughput_seconds(self, active: list[AccountState]) -> float:
         n = max(1, len(active))
-        return self._get_cooldown_avg() * math.log(n + 1) / n
+        return self._get_cooldown_avg() / n
 
     def _emit_countdown(self, remaining: int) -> None:
-        """Push a countdown event to the queue if available."""
-        if self._q is not None:
-            try:
-                self._q.put(WorkerEvent("countdown", remaining))
-            except Exception:
-                pass
+        """Push a countdown event to the queue if available.
+
+        Non-zero ticks are throttled to one per second across all workers
+        (multiple pool workers poll acquire() concurrently — unthrottled
+        each would emit its own remaining-seconds value and the UI countdown
+        would jump between them)."""
+        if self._q is None:
+            return
+        if remaining > 0:
+            now = time.monotonic()
+            with self._lock:
+                if now - self._last_countdown_emit < 1.0:
+                    return
+                self._last_countdown_emit = now
+        try:
+            self._q.put(WorkerEvent("countdown", remaining))
+        except Exception:
+            pass
 
     def _mark_failure_locked(self, account: AccountState) -> Callable[[AccountState], None] | None:
         """Disable + emit; caller must hold ``self._lock``. Returns the
@@ -183,15 +240,13 @@ class AccountScheduler:
 
     def _mark_success_locked(self, account: AccountState) -> Callable[[AccountState], None] | None:
         """Schedule per-account cooldown; caller must hold ``self._lock``.
-        Returns on_first_success callback the first time this cookie wins."""
-        avg = self._get_cooldown_avg()
-        n = max(1, len([a for a in self._accounts if a.disabled_reason is None]))
-        per_account = max(1.0, avg * math.log(n + 1))
+        Returns the on_success callback (fired on EVERY successful release) so
+        the caller refreshes the cookie's last_tested_at each time — the cookies
+        view 「檢查：」 time then advances live during a run instead of freezing
+        at first use."""
+        per_account = max(1.0, self._get_cooldown_avg())
         account.cooldown_until = time.monotonic() + per_account
-        if account.cookie in self._used_cookies:
-            return None
-        self._used_cookies.add(account.cookie)
-        return self._on_first_success
+        return self._on_success
 
     @staticmethod
     def _safe_call(cb: Callable[[AccountState], None] | None, account: AccountState) -> None:
@@ -205,21 +260,36 @@ class AccountScheduler:
     def release(self, account: AccountState, ok: bool = True) -> None:
         """Record outcome after a unit of work completes.
 
-        ok=True  -> schedule per-account cooldown to exactly
-                    ``avg × ln(N+1)`` seconds (no jitter on per-account;
-                    randomness is applied at the throughput gate in
-                    acquire() so inter-request gap stays bounded).
+        ok=True  -> schedule per-account cooldown to exactly the setting
+                    value (``pid_cooldown_avg`` seconds; no jitter on
+                    per-account; randomness is applied at the throughput
+                    gate in acquire() so inter-request gap stays bounded).
         ok=False -> disable account (proxy unreachable).
         """
         with self._lock:
+            account.held = False
             cb = self._mark_failure_locked(account) if not ok else self._mark_success_locked(account)
         # Callback runs outside the lock — it does file I/O and we don't
         # want to block other acquire/release threads.
         self._safe_call(cb, account)
 
+    def release_neutral(self, account: AccountState) -> None:
+        """Return the account without judging the work's outcome.
+
+        Used when the unit of work was aborted (user stop) or failed for a
+        reason unrelated to the account (disk error, decode error): the
+        account is neither disabled nor credited with a success — but it
+        still gets the normal per-account cooldown so an abort can't be
+        used to hammer the same account immediately.
+        """
+        with self._lock:
+            account.held = False
+            account.cooldown_until = time.monotonic() + max(1.0, self._get_cooldown_avg())
+
     def disable(self, account: AccountState, reason: str) -> None:
         with self._lock:
             account.disabled_reason = reason
+            account.held = False
 
     def _all_disabled(self) -> bool:
         """Internal: caller must hold ``self._lock``."""
@@ -231,9 +301,14 @@ class AccountScheduler:
         with self._lock:
             return self._all_disabled()
 
+    def active_account_count(self) -> int:
+        """How many accounts are not disabled (usable for concurrent pickup)."""
+        with self._lock:
+            return sum(1 for a in self._accounts if a.disabled_reason is None)
+
     def average_cooldown(self) -> float:
         """Average inter-request throughput in seconds — i.e., the
         expected gap until the next request fires across all accounts.
-        Equals ``avg × ln(N+1) / N`` where N is the active account count."""
+        Equals ``avg / N`` where N is the active account count."""
         n = max(1, len([a for a in self._accounts if a.disabled_reason is None]))
-        return self._get_cooldown_avg() * math.log(n + 1) / n
+        return self._get_cooldown_avg() / n

@@ -138,4 +138,42 @@ def test_partial_download_failure_keeps_pid_pending():
     assert db.page_status_counts().get("downloaded", 0) == 0
     assert db.page_status_counts().get("pending", 0) == 2
     assert not db.is_pid_closed("44401")
-    assert released["ok"] is False
+    # Ordinary page failures keep the PID pending but should not disable a
+    # healthy cookie; this mirrors standalone Step 4's scheduler release path.
+    assert released["ok"] is True
+
+
+def test_partial_download_failure_still_refreshes_cookie_first_success():
+    """Combined mode should not treat ordinary page failures as a dead cookie.
+
+    Standalone Step 4 releases the scheduler as successful when the download
+    callable returns a failed-page list; only proxy/network exhaustion disables
+    the account. Combined mode needs the same release path so AccountScheduler's
+    on_first_success callback refreshes auth.cookies_entries[].last_tested_at.
+    """
+    from app.core.account_scheduler import AccountScheduler, AccountState
+
+    t = _thread()
+    urls = ["https://i.pximg.net/img/66601_p0.jpg"]
+    refreshed = []
+    disabled = []
+
+    acc = AccountState(cookie="c1", alias="A")
+    scheduler = AccountScheduler(
+        accounts=[acc],
+        get_cooldown_avg=lambda: 0,
+        pause_event=t._pause_event,
+        stop_event=t._stop_event,
+        on_success=lambda account: refreshed.append(account.cookie),
+        on_disable=lambda account: disabled.append(account.cookie),
+    )
+    t._scheduler = scheduler
+    t._run_with_network_retry = _retry_router((True, urls, None))
+    t.downloader._download_pid_group = lambda pid, dl_urls: [[urls[0], "disk full"]]
+    t.downloader._maybe_flush_exist_pid = lambda pid: None
+
+    failed = t._process_one_pid("66601", needs_query=True)
+
+    assert failed == [[urls[0], "disk full"]]
+    assert refreshed == ["c1"]
+    assert disabled == []

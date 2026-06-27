@@ -7,6 +7,7 @@ implemented by reacting to WorkerEvent("next", N) inside on_next().
 """
 from __future__ import annotations
 import os
+import threading
 from datetime import datetime
 from queue import Queue
 
@@ -15,10 +16,13 @@ from app.core.worker_event import WorkerEvent
 from app.core.account_scheduler import AccountState, AccountScheduler
 from app.core.proxy_utils import parse_proxy_url
 from app.core.pixiv_thread_utils import (
-    safe_read_json, normalize_cookie_entries, sync_exist_pid_with_download_folder,
+    safe_read_json, sync_exist_pid_with_download_folder,
 )
 from app.core.metadata_db import DB_FILENAME, MetadataDB
+from app.core.live_settings import LiveSettings
 from app.core import thread_following, thread_pid_scan, thread_url_fetch, thread_download
+from app.gui.cookie_validation import _RETEST_INTERVAL_SEC, _CookieValidationMixin
+from app import i18n
 import contextlib
 
 DEFAULT_AGENT = (
@@ -26,10 +30,12 @@ DEFAULT_AGENT = (
     "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0"
 )
 
-# Trust a "有效" cookie status without re-testing if it was checked within
-# this window. Cookies that hit a runtime error (proxy_dead) get marked
-# 失效 in settings, so the cache invalidates itself when something breaks.
-_RETEST_INTERVAL_SEC = 30 * 86400  # 30 days
+# Cookie validation + auth persistence (incl. _RETEST_INTERVAL_SEC, re-exported
+# above for tests) moved to cookie_validation._CookieValidationMixin (file-size
+# refactor); RunController inherits it. _RETEST_INTERVAL_SEC is kept importable
+# from here (tests do ``from app.gui.run_actions import _RETEST_INTERVAL_SEC``);
+# listing it in __all__ marks it as a deliberate re-export.
+__all__ = ["RunController", "DEFAULT_AGENT", "_RETEST_INTERVAL_SEC"]
 
 
 def _coerce_int(value, default: int) -> int:
@@ -87,7 +93,7 @@ def _load_author_list() -> list[str]:
     return []
 
 
-class RunController:
+class RunController(_CookieValidationMixin):
     """Wires step buttons to worker threads and chains them in Run-All mode."""
 
     # Class-level default so tests that do ``RunController.__new__(RunController)``
@@ -96,12 +102,33 @@ class RunController:
 
     force_combined = False  # CLI 'combined' step sets this to force combined mode
 
+    # Baseline settings snapshot captured when the active run's thread was built;
+    # notify_settings_saved() diffs against it. Class default so __new__-based
+    # tests can read it without AttributeError.
+    _active_snapshot = None
+
     def __init__(self, main_view, event_q: Queue, stats_collector=None, event_log=None):
         self._main_view = main_view
         self._event_q = event_q
         self._run_all_mode = False
         self._stats_collector = stats_collector
         self._event_log = event_log
+        # Shared live-settings reader: lets a mid-run 「儲存設定」 take effect on
+        # the next item for in-scope settings. Degrades to None (snapshot-only)
+        # if the data dir is unavailable.
+        try:
+            self._live = LiveSettings(_data_path())
+        except Exception:
+            self._live = None
+        self._active_snapshot = None
+        # Serialises _start_step's idle-check + _active_thread assignment so a
+        # scheduler tick and a user click (or two scheduler ticks) can't both
+        # launch a run that then writes the same on-disk state concurrently.
+        self._start_lock = threading.Lock()
+
+    def _is_run_active(self) -> bool:
+        t = getattr(self._main_view, "_active_thread", None)
+        return t is not None and t.is_alive()
 
     def _backup_db(self) -> None:
         """Run at most once per local-time day. Persists last-success date via
@@ -155,247 +182,114 @@ class RunController:
     def run_step(self, n: int) -> None:
         self._run_all_mode = False
         self._backup_db()
-        self._start_step(n)
+        self._start_step(n, require_idle=True)
 
     def run_all(self) -> None:
         self._run_all_mode = True
         self._backup_db()
-        self._start_step(1)
+        try:
+            source_mode = _store().get_section("download").get("source_mode", "following")
+        except Exception:
+            source_mode = "following"
+        self._start_step(2 if source_mode == "bookmarks" else 1, require_idle=True)
 
     def on_next(self, n: int) -> None:
         if n == -1 or not self._run_all_mode:
             return
         if 1 <= n <= 4:
+            # Chaining: the previous step's worker may still be alive (about to
+            # return) when this fires, so do NOT require idle here — that is a
+            # legitimate hand-off, not a duplicate run.
             self._start_step(n)
 
     def _log(self, html: str) -> None:
         self._event_q.put(WorkerEvent("output", html))
 
-    def _extract_cookie_entries(self, auth: dict) -> list[dict]:
-        """Pull configured cookie entries (cookie + alias + status +
-        last_tested_at) from auth settings, normalising whatever shape
-        the user has saved.
-
-        Entries explicitly disabled (``enabled is False``) are dropped
-        from the result so disabled accounts never reach the validator
-        or scheduler, and a gray skip notice is logged for each one.
-        """
-        raw = auth.get("cookies_entries") or auth.get("cookies_pool") or []
-        if not raw:
-            single = str(auth.get("cookies", "") or "").strip()
-            if single:
-                raw = [single]
-        alias_map = auth.get("cookies_aliases") or {}
-        if not isinstance(alias_map, dict):
-            alias_map = {}
-        entries = normalize_cookie_entries(raw, alias_map=alias_map)
-        kept: list[dict] = []
-        for e in entries:
-            if e.get("enabled") is False:
-                alias = (e.get("alias") or "").strip() or "Cookie"
-                self._log(
-                    f"<p><font color='gray'>Cookie「{alias}」已停用，本次跳過</font></p>"
-                )
-                continue
-            kept.append(e)
-        return kept
+    # ── Live-apply on save ───────────────────────────────────────────────────
+    # Which settings.json keys take effect mid-run (green notice, applied on the
+    # next item by the worker's _apply_live_settings_if_changed) vs which need a
+    # fresh run because they pick the pipeline shape at construction (grey).
+    _LIVE_KEY_LABELS = {
+        "download.like_num": "最低讚數",
+        "download.ban_tag": "排除標籤",
+        "download.must_tag": "必含標籤",
+        "download.special_like_rules": "標籤讚數規則",
+        "download.download_time": "下載日期門檻",
+        "download.rescrape_within_days": "重抓天數",
+        "download.path": "下載路徑",
+        "download.filename_template": "檔名範本",
+        "download.tag_strip_brackets": "Tag 過濾括號",
+        "download.tag_strip_special_chars": "Tag 過濾特殊符號",
+        "filter.nogif": "過濾 GIF",
+        "filter.notag": "無 tag 不下載",
+        "filter.notime": "無時間不下載",
+        "directory.create_dir": "依作者建資料夾",
+        "directory.no_R18G_dir": "R-18G 分資料夾",
+        "directory.no_R18_dir": "R-18 分資料夾",
+        "directory.ai_gen_dir": "AI 生成分資料夾",
+        "performance.pid_cooldown_avg": "帳號冷卻時間",
+        "performance.pid_wait_nocookie_min": "無 Cookie 等待下限",
+        "performance.pid_wait_nocookie_max": "無 Cookie 等待上限",
+        "performance.intra_pid_wait_min": "頁間等待下限",
+        "performance.intra_pid_wait_max": "頁間等待上限",
+        "jxl.enable": "JXL 轉換",
+        "jxl.effort": "JXL 壓縮等級",
+        "jxl.delete_original": "JXL 刪除原檔",
+        "jxl.cjxl_path": "cjxl 路徑",
+    }
+    _NEXT_RUN_KEY_LABELS = {
+        "download.combined_mode": "邊查邊下",
+        "download.source_mode": "作品來源",
+        "download.following_scope": "追隨範圍",
+        "download.bookmark_scope": "收藏範圍",
+        "performance.single_thread_mode": "單執行緒",
+        "download.author_order": "依作者順序下載",
+        "download.force_full_rescan": "強制完整重掃",
+    }
 
     @staticmethod
-    def _cookie_cache_is_fresh(entry, now):
-        """Return True iff this entry has status=有效 and was tested within the retest window."""
-        if entry.get("status") != "有效":
-            return False
-        tested_at = entry.get("last_tested_at")
-        try:
-            tested_f = float(tested_at) if tested_at is not None else None
-        except (TypeError, ValueError):
-            return False
-        if tested_f is None:
-            return False
-        return (now - tested_f) < _RETEST_INTERVAL_SEC
+    def _diff_setting_labels(baseline: dict, current: dict, labels: dict) -> list[str]:
+        """Labels for the keys whose value differs between baseline and current."""
+        changed = []
+        for key, label in labels.items():
+            section, _, field = key.partition(".")
+            before = (baseline.get(section) or {}).get(field)
+            after = (current.get(section) or {}).get(field)
+            if before != after:
+                changed.append(label)
+        return changed
 
-    def _partition_cookies_by_cache(self, entries, now):
-        """Split entries into (cached_valid_cookies, entries_needing_network_test).
-
-        Empty cookie strings are dropped entirely. For each cached-valid hit a
-        gray "信任快取" log line is emitted with the staleness in days.
-        """
-        valid: list[str] = []
-        needs_test: list[dict] = []
-        for e in entries:
-            cookie = str(e.get("cookie", "") or "").strip()
-            if not cookie:
-                continue
-            if self._cookie_cache_is_fresh(e, now):
-                valid.append(cookie)
-                tested_f = float(e.get("last_tested_at"))
-                days = max(0, int((now - tested_f) / 86400))
-                alias = e.get("alias", "") or "Cookie"
-                self._log(
-                    f"<p><font color='gray'>{alias} 信任快取（{days} 天前驗證）</font></p>"
-                )
-            else:
-                needs_test.append(e)
-        return valid, needs_test
-
-    def _run_one_cookie_test(self, cookie, idx, total, agent, pixiv_api_module):
-        """Run a single cookie network test, emit progress + status events, return ok."""
-        self._event_q.put(WorkerEvent(
-            "loading", (True, f"測試 Cookie {idx}/{total}...")
-        ))
-        self._event_q.put(WorkerEvent("cookie_status", (cookie, "測試中", None)))
-        try:
-            count, _ = pixiv_api_module.Test_cookies([cookie], agent)
-            ok = int(count) > 0
-        except Exception:
-            ok = False
-        return ok
-
-    def _test_cookies(self, entries: list[dict], agent: str) -> list[str]:
-        """Validate each cookie, returning the valid cookie strings.
-
-        Skips the network test for entries whose cached status is 有效
-        and was checked within ``_RETEST_INTERVAL_SEC`` (30 days). For
-        anything else (失效 / 未知 / stale / no timestamp), runs
-        ``Test_cookies`` and persists the result.
-
-        Pushes cookie_status events to the cookies view so the table
-        reflects the newest state live, and writes status +
-        last_tested_at back to settings."""
-        if not entries:
-            return []
-        import time as _time
-        from app.core import pixiv_api
-
-        now = _time.time()
-        valid, needs_test = self._partition_cookies_by_cache(entries, now)
-        if not needs_test:
-            return valid
-
-        total = len(needs_test)
-        self._log(f"<p><font color='blue'>啟動前測試 {total} 個 Cookie...</font></p>")
-        tested_results: dict[str, bool] = {}
-        for idx, e in enumerate(needs_test, start=1):
-            cookie = str(e.get("cookie", "") or "").strip()
-            ok = self._run_one_cookie_test(cookie, idx, total, agent, pixiv_api)
-            tested_results[cookie] = ok
-            status = "有效" if ok else "失效"
-            self._event_q.put(WorkerEvent("cookie_status", (cookie, status, _time.time())))
-            if ok:
-                valid.append(cookie)
-                self._log(f"<p><font color='green'>Cookie {idx}/{total} 有效</font></p>")
-            else:
-                self._log(
-                    f"<p><font color='red'>Cookie {idx}/{total} 失效，已從本次任務排除</font></p>"
-                )
-        self._persist_cookie_statuses(tested_results, _time.time())
-        return valid
-
-    def _persist_cookie_statuses(
-        self, tested_results: dict[str, bool], tested_at: float,
-    ) -> None:
-        """Write the latest test results (cookie -> ok bool) and shared
-        timestamp back to cookies_entries[].status / last_tested_at so
-        the cookies view reflects them on next reload. Untested entries
-        keep their existing status untouched."""
-        if not tested_results:
+    def notify_settings_saved(self) -> None:
+        """Emit a notice after a mid-run save: what applied live (next item) vs
+        what needs the next run. No-op when no task is currently running."""
+        active = getattr(self._main_view, "_active_thread", None)
+        if active is None or not active.is_alive():
             return
-        try:
-            store = _store()
-            auth = store.get_section("auth")
-            entries = auth.get("cookies_entries") or []
-            if not isinstance(entries, list):
-                return
-            new_entries = []
-            for e in entries:
-                if not isinstance(e, dict):
-                    new_entries.append(e)
-                    continue
-                c = str(e.get("cookie", "")).strip()
-                if c in tested_results:
-                    new_entries.append({
-                        **e,
-                        "status": "有效" if tested_results[c] else "失效",
-                        "last_tested_at": tested_at,
-                    })
-                else:
-                    new_entries.append(e)
-            store.update_section("auth", {**auth, "cookies_entries": new_entries})
-        except Exception:
-            pass
-
-    def _refresh_cookie_timestamp(self, cookie: str) -> None:
-        """Extend the trust-cache window for a cookie that just had its
-        first successful network request this run.  Only touches
-        last_tested_at — never changes status — so a subsequent
-        _invalidate_cookie_status() call still overwrites with 失效."""
-        if not cookie:
+        live = getattr(self, "_live", None)
+        if live is None:
             return
-        import time as _time
-        try:
-            store = _store()
-            auth = store.get_section("auth")
-            entries = auth.get("cookies_entries") or []
-            if not isinstance(entries, list):
-                return
-            now = _time.time()
-            new_entries = []
-            for e in entries:
-                if not isinstance(e, dict):
-                    new_entries.append(e)
-                    continue
-                c = str(e.get("cookie", "")).strip()
-                if c == cookie.strip() and e.get("status") == "有效":
-                    new_entries.append({**e, "last_tested_at": now})
-                else:
-                    new_entries.append(e)
-            store.update_section("auth", {**auth, "cookies_entries": new_entries})
-        except Exception:
-            pass
+        current = live.sections()
+        baseline = getattr(self, "_active_snapshot", None) or {}
+        live_changed = self._diff_setting_labels(baseline, current, self._LIVE_KEY_LABELS)
+        next_changed = self._diff_setting_labels(baseline, current, self._NEXT_RUN_KEY_LABELS)
+        if live_changed:
+            self._log(
+                "<p><font color='green'>已即時套用（下一個項目起生效）："
+                + "、".join(live_changed) + "</font></p>"
+            )
+        if next_changed:
+            self._log(
+                "<p><font color='gray'>"
+                + "、".join(next_changed) + " 將於下次執行套用</font></p>"
+            )
+        self._active_snapshot = current
 
-    def _invalidate_cookie_status(self, cookie: str) -> None:
-        """Mark a single cookie as 失效 in settings (called from the
-        scheduler's on_disable callback when proxy/auth fails at
-        runtime). Sets last_tested_at=now so the cache is treated as
-        fresh-but-bad — next run re-tests instead of trusting it."""
-        if not cookie:
-            return
-        import time as _time
-        try:
-            store = _store()
-            auth = store.get_section("auth")
-            entries = auth.get("cookies_entries") or []
-            if not isinstance(entries, list):
-                return
-            now = _time.time()
-            new_entries = []
-            for e in entries:
-                if not isinstance(e, dict):
-                    new_entries.append(e)
-                    continue
-                c = str(e.get("cookie", "")).strip()
-                if c == cookie.strip():
-                    new_entries.append({**e, "status": "失效", "last_tested_at": now})
-                else:
-                    new_entries.append(e)
-            store.update_section("auth", {**auth, "cookies_entries": new_entries})
-        except Exception:
-            pass
-
-    def _attach_aliases(
-        self, valid_cookies: list[str], auth: dict,
-    ) -> list[dict]:
-        """Pair each validated cookie with its alias from
-        ``auth.cookies_aliases`` so worker threads can resolve aliases
-        for log lines and stats (otherwise ``cookie_usage_label`` falls
-        back to ``Cookie{n}``)."""
-        alias_map = auth.get("cookies_aliases") or {}
-        if not isinstance(alias_map, dict):
-            alias_map = {}
-        return [
-            {"cookie": c, "alias": str(alias_map.get(c, "") or "").strip()}
-            for c in valid_cookies
-        ]
+    # Cookie test/validation + auth persistence (_extract_cookie_entries /
+    # _cookie_cache_is_fresh / _partition_cookies_by_cache / _run_one_cookie_test
+    # / _test_cookies / _persist_cookie_statuses / _refresh_cookie_timestamp /
+    # _invalidate_cookie_status / _attach_aliases / _validate_cookies_for_step)
+    # moved to cookie_validation._CookieValidationMixin (file-size refactor);
+    # inherited.
 
     def _build_scheduler(
         self,
@@ -430,43 +324,61 @@ class RunController:
             emit=self._log,
             q=self._event_q,
             on_disable=lambda acc: self._invalidate_cookie_status(acc.cookie),
-            on_first_success=lambda acc: self._refresh_cookie_timestamp(acc.cookie),
+            on_success=lambda acc: self._refresh_cookie_timestamp(acc.cookie),
         )
 
-    def _start_step(self, n: int) -> None:
-        try:
-            t = self._build_thread(n)
-        except Exception as err:
-            self._log(f"<p><font color='red'>步驟 {n} 建立執行緒失敗：{err}</font></p>")
-            self._main_view.set_running(False)
-            self._main_view.set_step_state(n - 1, "error")
-            return
-        if t is None:
-            self._main_view.set_running(False)
-            return
-        self._main_view._active_thread = t
-        self._main_view.set_running(True)
-        for i in range(4):
-            self._main_view.set_step_state(i, "idle")
-        self._main_view.set_step_state(n - 1, "running")
-        self._log(f"<p><font color='gray'>--- 步驟 {n} 開始 ---</font></p>")
-        t.start()
+    def _start_step(self, n: int, *, require_idle: bool = False) -> None:
+        # The idle-check and the _active_thread assignment must be one atomic
+        # critical section, else a scheduler tick and a user click both pass the
+        # check and both start a run. require_idle is True only for the entry
+        # points (run_step / run_all); chaining (on_next) passes False because
+        # the previous step's worker is legitimately still finishing.
+        with self._start_lock:
+            if require_idle and self._is_run_active():
+                self._log(f"<p><font color='gray'>{i18n.t('log.run.already_running')}</font></p>")
+                return
+            try:
+                t = self._build_thread(n)
+            except Exception as err:
+                self._log(f"<p><font color='red'>{i18n.t('log.run.build_fail', n=n, err=err)}</font></p>")
+                self._main_view.set_running(False)
+                self._main_view.set_step_state(n - 1, "error")
+                # No worker thread started -> emit a terminal event so a headless
+                # _pump unblocks immediately (exit 1) instead of waiting out its
+                # 600s queue-starvation timeout. on_next(-1) is a no-op in the GUI.
+                self._event_q.put(WorkerEvent("next", -1))
+                return
+            if t is None:
+                self._main_view.set_running(False)
+                # Same terminal event for the "build returned None" path (invalid
+                # cookies / missing User ID / empty following list).
+                self._event_q.put(WorkerEvent("next", -1))
+                return
+            self._main_view._active_thread = t
+            self._main_view.set_running(True)
+            # Drive the "本次執行" elapsed timer from the run lifecycle, not from
+            # inside Step 4: a fresh run (require_idle) resets it; a chained
+            # Run-All step resumes the same timer so elapsed spans the whole run
+            # (combined mode + Step 1/2/3-only runs are covered too — they never
+            # reach download_thread.run() where the reset used to live).
+            if self._stats_collector is not None:
+                if require_idle:
+                    self._stats_collector.reset_session()
+                else:
+                    self._stats_collector.resume_session()
+            for i in range(4):
+                self._main_view.set_step_state(i, "idle")
+            self._main_view.set_step_state(n - 1, "running")
+            self._log(f"<p><font color='gray'>{i18n.t('log.run.step_start', n=n)}</font></p>")
+            t.start()
 
-    def _validate_cookies_for_step(self, auth, agent, step_num):
-        """Test cookies and return the valid list, or None on failure (with log)."""
-        cookie_entries = self._extract_cookie_entries(auth)
-        valid_cookies = self._test_cookies(cookie_entries, agent)
-        if not valid_cookies:
-            self._log(
-                f"<p><font color='red'>所有 Cookie 都無效，無法啟動步驟 {step_num}</font></p>"
-            )
+    def _build_step1(self, auth, agent, dl, flt):
+        if str(dl.get("source_mode", "following") or "following") == "bookmarks":
+            self._log(f"<p><font color='gray'>{i18n.t('log.run.skip_step1')}</font></p>")
             return None
-        return valid_cookies
-
-    def _build_step1(self, auth, agent, flt):
         userid = str(auth.get("userid", "")).strip()
         if not userid:
-            self._log("<p><font color='red'>請先在「設定」填入 User ID</font></p>")
+            self._log(f"<p><font color='red'>{i18n.t('log.run.need_userid')}</font></p>")
             return None
         valid_cookies = self._validate_cookies_for_step(auth, agent, 1)
         if not valid_cookies:
@@ -476,19 +388,28 @@ class RunController:
             userid,
             valid_cookies[0],
             agent,
-            bool(flt.get("hidefollow", False)),
+            str(dl.get("following_scope", "all") or "all"),
         )
 
-    def _build_step2(self, auth, agent, perf, path):
-        authors = _load_author_list()
-        if not authors:
+    def _build_step2(self, auth, agent, dl, perf, path):
+        source_mode = str(dl.get("source_mode", "following") or "following")
+        authors = [] if source_mode == "bookmarks" else _load_author_list()
+        if source_mode != "bookmarks" and not authors:
             self._log(
-                "<p><font color='red'>找不到 following 清單，請先執行步驟 1</font></p>"
+                f"<p><font color='red'>{i18n.t('log.run.need_following')}</font></p>"
             )
+            return None
+        bookmark_user_id = str(auth.get("userid", "") or "").strip()
+        if source_mode == "bookmarks" and not bookmark_user_id:
+            self._log(f"<p><font color='red'>{i18n.t('log.run.need_userid')}</font></p>")
             return None
         valid_cookies = self._validate_cookies_for_step(auth, agent, 2)
         if not valid_cookies:
             return None
+        force_rescan = (
+            bool(dl.get("force_full_rescan", False))
+            or bool(getattr(self, "force_rescan", False))
+        )
         t = thread_pid_scan.get_pixiv_author_imgID_Thread(
             self._event_q,
             authors,
@@ -499,7 +420,18 @@ class RunController:
             bool(perf.get("single_thread_mode", False)),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
+            author_order=bool(dl.get("author_order", False)),
+            force_rescan=force_rescan,
+            source_mode=source_mode,
+            bookmark_scope=str(dl.get("bookmark_scope", "all") or "all"),
+            bookmark_user_id=bookmark_user_id,
         )
+        # One-shot: consume the GUI flag so later Step 2 runs stop ignoring the
+        # 30-day skip. (The CLI --force-rescan path sets self.force_rescan, which
+        # is per-invocation and needs no reset.)
+        if dl.get("force_full_rescan", False):
+            with contextlib.suppress(Exception):
+                _store().update_fields("download", {"force_full_rescan": False})
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
 
@@ -575,6 +507,7 @@ class RunController:
             ban_tag=list(dl.get("ban_tag", [])),
             must_tag=list(dl.get("must_tag", [])),
             like_num=int(dl.get("like_num", 0)),
+            r18_like_num=int(dl.get("r18_like_num", 0)),
             no_to_check=[],
             base_path=path,
             single_thread_mode=bool(perf.get("single_thread_mode", False)),
@@ -584,6 +517,7 @@ class RunController:
             stats_collector=self._stats_collector,
             event_log=self._event_log,
             rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
+            live=self._live,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
@@ -595,7 +529,7 @@ class RunController:
             return None
         dl_path = str(dl.get("path", "")).strip()
         if not dl_path:
-            self._log("<p><font color='red'>請先在「設定」指定下載路徑</font></p>")
+            self._log(f"<p><font color='red'>{i18n.t('log.run.need_path')}</font></p>")
             return None
         self._sync_exist_pid_from_download_folder(dl_path, path, step_num=3)
         from app.core import thread_combined
@@ -605,7 +539,8 @@ class RunController:
             exist_pid=MetadataDB(path).closed_artwork_set(),
             ban_tag=list(dl.get("ban_tag", [])),
             must_tag=list(dl.get("must_tag", [])),
-            like_num=int(dl.get("like_num", 0)), no_to_check=[], base_path=path,
+            like_num=int(dl.get("like_num", 0)),
+            r18_like_num=int(dl.get("r18_like_num", 0)), no_to_check=[], base_path=path,
             single_thread_mode=bool(perf.get("single_thread_mode", False)),
             download_path=dl_path,
             download_time=self._parse_download_time(dl.get("download_time")),
@@ -622,13 +557,18 @@ class RunController:
             jxl_cjxl_path=str(jxl.get("cjxl_path", "")),
             jxl_delete_original=bool(jxl.get("delete_original", False)),
             jxl_effort=int(jxl.get("effort", 7)),
+            jxl_skip_gif=bool(jxl.get("skip_gif", True)),
             ai_gen_dir=bool(directory.get("ai_gen_dir", False)),
             filename_template=str(dl.get("filename_template", "") or ""),
             tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
             tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
             author_order=bool(dl.get("author_order", False)),
+            combined_workers=_coerce_int(dl.get("combined_workers", 1), 1),
+            set_file_mtime=bool(dl.get("set_file_mtime", True)),
+            download_deadline_sec=float(perf.get("download_deadline_sec", 120) or 120),
             rescrape_within_days=_coerce_int(dl.get("rescrape_within_days", 365), 365),
             stats_collector=self._stats_collector, event_log=self._event_log,
+            live=self._live,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
@@ -647,7 +587,7 @@ class RunController:
     def _build_step4(self, auth, agent, dl, flt, perf, directory, jxl):
         dl_path = str(dl.get("path", "")).strip()
         if not dl_path:
-            self._log("<p><font color='red'>請先在「設定」指定下載路徑</font></p>")
+            self._log(f"<p><font color='red'>{i18n.t('log.run.need_path')}</font></p>")
             return None
         dt = self._parse_download_time(dl.get("download_time"))
         valid_cookies = self._validate_cookies_for_step(auth, agent, 4)
@@ -673,7 +613,9 @@ class RunController:
             jxl_cjxl_path=str(jxl.get("cjxl_path", "")),
             jxl_delete_original=bool(jxl.get("delete_original", False)),
             jxl_effort=int(jxl.get("effort", 7)),
+            jxl_skip_gif=bool(jxl.get("skip_gif", True)),
             like_num=int(dl.get("like_num", 0)),
+            r18_like_num=int(dl.get("r18_like_num", 0)),
             ban_tag=list(dl.get("ban_tag", [])),
             must_tag=list(dl.get("must_tag", [])),
             special_like_rules=[],
@@ -682,8 +624,11 @@ class RunController:
             tag_strip_brackets=bool(dl.get("tag_strip_brackets", False)),
             tag_strip_special_chars=bool(dl.get("tag_strip_special_chars", False)),
             author_order=bool(dl.get("author_order", False)),
+            set_file_mtime=bool(dl.get("set_file_mtime", True)),
+            download_deadline_sec=float(perf.get("download_deadline_sec", 120) or 120),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
+            live=self._live,
         )
         t._scheduler = self._build_scheduler(auth, valid_cookies, t._pause_event, t._stop_event)
         return t
@@ -699,10 +644,15 @@ class RunController:
         agent = _agent(auth)
         path = _data_path()
 
+        # Baseline for the live-apply save notice (what this run was built from).
+        if self._live is not None:
+            with contextlib.suppress(Exception):
+                self._active_snapshot = self._live.sections()
+
         if n == 1:
-            return self._build_step1(auth, agent, flt)
+            return self._build_step1(auth, agent, dl, flt)
         if n == 2:
-            return self._build_step2(auth, agent, perf, path)
+            return self._build_step2(auth, agent, dl, perf, path)
         if n == 3:
             if bool(dl.get("combined_mode", False)) or getattr(self, "force_combined", False):
                 return self._build_combined(auth, agent, dl, flt, perf, directory, jxl, path)

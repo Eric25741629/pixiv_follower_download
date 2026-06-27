@@ -28,14 +28,14 @@ from app.core.metadata_db import MetadataDB
 def test_upsert_and_get_pending_urls(tmp_path):
     db = MetadataDB(str(tmp_path))
     entries = [
-        ("https://i.pximg.net/img-original/img/2024/01/01/12/00/00/111_p0.jpg", "111"),
-        ("https://i.pximg.net/img-original/img/2024/01/01/12/00/00/222_p0.jpg", "222"),
+        ("https://i.pximg.net/img-original/img/2024/01/01/12/00/00/11100001_p0.jpg", "11100001"),
+        ("https://i.pximg.net/img-original/img/2024/01/01/12/00/00/22200001_p0.jpg", "22200001"),
     ]
     db.upsert_pending_urls(entries)
     rows = db.get_pending_urls()
     urls = [r[0] for r in rows]
-    assert "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/111_p0.jpg" in urls
-    assert "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/222_p0.jpg" in urls
+    assert "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/11100001_p0.jpg" in urls
+    assert "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/22200001_p0.jpg" in urls
 
 
 def test_upsert_pending_urls_empty_is_noop(tmp_path):
@@ -46,23 +46,23 @@ def test_upsert_pending_urls_empty_is_noop(tmp_path):
 
 # ── 2. INSERT OR IGNORE: re-insert does not overwrite status ──────────────────
 
-def test_mark_url_done_deletes_row(tmp_path):
+def test_mark_url_done_marks_downloaded(tmp_path):
     db = MetadataDB(str(tmp_path))
-    url = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/333_p0.jpg"
-    db.upsert_pending_urls([(url, "333")])
+    url = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/33300001_p0.jpg"
+    db.upsert_pending_urls([(url, "33300001")])
     db.mark_url_done(url)
-    # Row deleted — table is empty
-    assert db.url_row_count() == 0
+    # Pages row persists but is no longer pending.
     assert db.pending_url_count() == 0
+    assert db.url_row_count() == 1  # row exists, status=downloaded
 
 
 # ── 3. mark_urls_done ─────────────────────────────────────────────────────────
 
 def test_mark_urls_done_removes_from_pending(tmp_path):
     db = MetadataDB(str(tmp_path))
-    url_a = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/444_p0.jpg"
-    url_b = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/555_p0.jpg"
-    db.upsert_pending_urls([(url_a, "444"), (url_b, "555")])
+    url_a = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/44400001_p0.jpg"
+    url_b = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/55500001_p0.jpg"
+    db.upsert_pending_urls([(url_a, "44400001"), (url_b, "55500001")])
     db.mark_urls_done([url_a])
     pending = [r[0] for r in db.get_pending_urls()]
     assert url_a not in pending
@@ -71,8 +71,8 @@ def test_mark_urls_done_removes_from_pending(tmp_path):
 
 def test_mark_urls_done_empty_list_is_noop(tmp_path):
     db = MetadataDB(str(tmp_path))
-    url = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/666_p0.jpg"
-    db.upsert_pending_urls([(url, "666")])
+    url = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/66600001_p0.jpg"
+    db.upsert_pending_urls([(url, "66600001")])
     db.mark_urls_done([])
     assert db.pending_url_count() == 1
 
@@ -82,17 +82,17 @@ def test_mark_urls_done_empty_list_is_noop(tmp_path):
 def test_filtered_out_url_stays_pending_for_next_run(tmp_path):
     """Simulate: run 1 downloads url_a, skips url_b (filter); run 2 finds url_b."""
     db = MetadataDB(str(tmp_path))
-    url_a = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/777_p0.jpg"
-    url_b = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/888_p0.jpg"
-    db.upsert_pending_urls([(url_a, "777"), (url_b, "888")])
+    url_a = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/77700001_p0.jpg"
+    url_b = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/88800001_p0.jpg"
+    db.upsert_pending_urls([(url_a, "77700001"), (url_b, "88800001")])
 
-    # Run 1: download url_a (deleted from table), skip url_b (still pending)
+    # Run 1: download url_a (page status → downloaded), skip url_b (still pending)
     db.mark_urls_done([url_a])
 
-    # Run 2: url_b still visible, url_a is gone (deleted)
+    # Run 2: url_b still visible, url_a is gone from v_pending_pages
     pending = [r[0] for r in db.get_pending_urls()]
     assert url_b in pending
-    assert url_a not in pending  # deleted, not just status-changed
+    assert url_a not in pending  # status=downloaded, excluded from v_pending_pages
 
 
 # ── 5. pending_pids ───────────────────────────────────────────────────────────
@@ -129,61 +129,17 @@ def test_upsert_pending_pids_empty_is_noop(tmp_path):
     assert db.pending_pid_count() == 0
 
 
-# ── 6. import_pending_urls_from_file ─────────────────────────────────────────
+# ── 6. url_row_count ──────────────────────────────────────────────────────────
 
-def test_import_pending_urls_from_file(tmp_path):
-    url_file = tmp_path / "all_url.txt"
-    url_file.write_text(
-        "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/999_p0.jpg\n"
-        "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/999_p1.jpg\n"
-        "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/1001_p0.jpg\n",
-        encoding="utf-8",
-    )
-    db = MetadataDB(str(tmp_path))
-    n = db.import_pending_urls_from_file(str(url_file))
-    assert n == 3
-    pending = db.get_pending_urls()
-    pids = {pid for _, pid in pending}
-    assert "999" in pids
-    assert "1001" in pids
-
-
-def test_import_pending_urls_missing_file_returns_zero(tmp_path):
-    db = MetadataDB(str(tmp_path))
-    n = db.import_pending_urls_from_file(str(tmp_path / "nonexistent.txt"))
-    assert n == 0
-
-
-# ── 7. import_pending_pids_from_file ─────────────────────────────────────────
-
-def test_import_pending_pids_from_file(tmp_path):
-    pid_file = tmp_path / "pictures_id.txt"
-    pid_file.write_text("12345\n67890\n11111\n", encoding="utf-8")
-    db = MetadataDB(str(tmp_path))
-    n = db.import_pending_pids_from_file(str(pid_file))
-    assert n == 3
-    pids = db.get_pending_pids()
-    assert "12345" in pids
-    assert "67890" in pids
-
-
-def test_import_pending_pids_missing_file_returns_zero(tmp_path):
-    db = MetadataDB(str(tmp_path))
-    n = db.import_pending_pids_from_file(str(tmp_path / "nonexistent.txt"))
-    assert n == 0
-
-
-# ── 8. url_row_count ──────────────────────────────────────────────────────────
-
-def test_url_row_count_after_delete(tmp_path):
+def test_url_row_count_after_mark_done(tmp_path):
     db = MetadataDB(str(tmp_path))
     url_a = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/2001_p0.jpg"
     url_b = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/2002_p0.jpg"
     db.upsert_pending_urls([(url_a, "2001"), (url_b, "2002")])
     db.mark_url_done(url_a)
-    # url_a was deleted; only url_b remains
-    assert db.url_row_count() == 1
-    assert db.pending_url_count() == 1
+    # url_a row persists in pages as status=downloaded; url_b still pending.
+    assert db.url_row_count() == 2    # both pages rows exist
+    assert db.pending_url_count() == 1  # only url_b is pending
 
 
 # ── 9. get_pending_urls_filtered ────────────────────────────────────────────��─

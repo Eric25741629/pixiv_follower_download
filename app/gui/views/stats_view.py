@@ -7,76 +7,20 @@ from typing import Any
 import flet as ft
 
 from app.core.stats_collector import StatsCollector
-
-_CARD_COLORS_LIGHT = [
-    ft.Colors.BLUE_100,
-    ft.Colors.GREEN_100,
-    ft.Colors.ORANGE_100,
-    ft.Colors.PURPLE_100,
-]
-_CARD_COLORS_DARK = [
-    ft.Colors.BLUE_GREY_800,
-    ft.Colors.GREEN_900,
-    ft.Colors.DEEP_ORANGE_900,
-    ft.Colors.PURPLE_900,
-]
-
-# Bar chart colors stay 400-level (mid-saturation reads fine on both bgs),
-# but we swap to 300-level in dark mode to soften the contrast.
-_BAR_COLORS_LIGHT = [
-    ft.Colors.BLUE_400,
-    ft.Colors.GREEN_400,
-    ft.Colors.ORANGE_400,
-    ft.Colors.PURPLE_400,
-    ft.Colors.RED_400,
-    ft.Colors.TEAL_400,
-    ft.Colors.PINK_400,
-    ft.Colors.AMBER_400,
-]
-_BAR_COLORS_DARK = [
-    ft.Colors.BLUE_300,
-    ft.Colors.GREEN_300,
-    ft.Colors.ORANGE_300,
-    ft.Colors.PURPLE_300,
-    ft.Colors.RED_300,
-    ft.Colors.TEAL_300,
-    ft.Colors.PINK_300,
-    ft.Colors.AMBER_300,
-]
+from app.gui import components as c
+from app.gui.glass import current_theme, glass_panel
+from app import i18n
 
 _MAX_BAR_PX = 300
 
-
-def _is_dark_mode(page: ft.Page) -> bool:
-    mode = getattr(page, "theme_mode", None)
-    if mode == ft.ThemeMode.DARK:
-        return True
-    if mode == ft.ThemeMode.LIGHT:
-        return False
-    try:
-        return page.platform_brightness == ft.Brightness.DARK
-    except Exception:
-        return False
+# Bar-track fill behind each bar (low-alpha white, reads on both themes).
+_BAR_TRACK_BG = "#1FFFFFFF"
 
 
-def _card_palette(page: ft.Page) -> list[str]:
-    return _CARD_COLORS_DARK if _is_dark_mode(page) else _CARD_COLORS_LIGHT
-
-
-def _bar_palette(page: ft.Page) -> list[str]:
-    return _BAR_COLORS_DARK if _is_dark_mode(page) else _BAR_COLORS_LIGHT
-
-
-def _card_label_color(page: ft.Page) -> str:
-    return ft.Colors.GREY_300 if _is_dark_mode(page) else ft.Colors.GREY_700
-
-
-def _empty_text_color(page: ft.Page) -> str:
-    return ft.Colors.GREY_500
-
-
-def _free_cookie_color(page: ft.Page) -> str:
-    return ft.Colors.TEAL_300 if _is_dark_mode(page) else ft.Colors.TEAL_700
+def _accent_cycle(page: ft.Page) -> list[str]:
+    """Theme accent-family colors cycled by stat cards and chart bars."""
+    t = current_theme(page)
+    return [t.accent, t.info, t.success, t.warning]
 
 
 class StatsView:
@@ -95,16 +39,18 @@ class StatsView:
             ft.Text("0:00:00", size=20, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER),
         ]
 
-        self._chart_container = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO)
+        # No scroll here — the outer build() Column already scrolls; nesting a
+        # second unbounded scrollable inside it is layout-fragile on Flet 0.84.
+        self._chart_container = ft.Column(spacing=6)
 
         # Flet 0.84's Tabs requires TabBar+TabBarView with separate content
         # bodies. Both modes here share one body, so a plain button toggle
         # is cleaner than forcing the new Tabs structure.
-        self._btn_session = ft.FilledButton(
-            "本次執行", on_click=lambda e: self._switch_mode("session"),
+        self._btn_session = c.primary_button(
+            i18n.t("stats.mode.session"), on_click=lambda e: self._switch_mode("session"),
         )
-        self._btn_lifetime = ft.OutlinedButton(
-            "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
+        self._btn_lifetime = c.secondary_button(
+            i18n.t("stats.mode.lifetime"), on_click=lambda e: self._switch_mode("lifetime"),
         )
         self._mode_toggle = ft.Row(
             controls=[self._btn_session, self._btn_lifetime], spacing=8,
@@ -118,15 +64,15 @@ class StatsView:
         # Swap which side is FilledButton (active). Flet 0.84 doesn't let
         # us morph button types, so we just toggle them as filled/outlined
         # via Row controls reassignment.
-        self._btn_session = ft.FilledButton(
-            "本次執行", on_click=lambda e: self._switch_mode("session"),
-        ) if is_session else ft.OutlinedButton(
-            "本次執行", on_click=lambda e: self._switch_mode("session"),
+        self._btn_session = c.primary_button(
+            i18n.t("stats.mode.session"), on_click=lambda e: self._switch_mode("session"),
+        ) if is_session else c.secondary_button(
+            i18n.t("stats.mode.session"), on_click=lambda e: self._switch_mode("session"),
         )
-        self._btn_lifetime = ft.OutlinedButton(
-            "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
-        ) if is_session else ft.FilledButton(
-            "歷史累計", on_click=lambda e: self._switch_mode("lifetime"),
+        self._btn_lifetime = c.secondary_button(
+            i18n.t("stats.mode.lifetime"), on_click=lambda e: self._switch_mode("lifetime"),
+        ) if is_session else c.primary_button(
+            i18n.t("stats.mode.lifetime"), on_click=lambda e: self._switch_mode("lifetime"),
         )
         self._mode_toggle.controls = [self._btn_session, self._btn_lifetime]
         try:
@@ -136,10 +82,11 @@ class StatsView:
         self._refresh_now()
 
     def build(self) -> ft.Container:
+        theme = current_theme(self._page)
         cards = self._build_cards()
         chart_section = ft.Column(
             controls=[
-                ft.Text("Cookie 請求次數", size=14, weight=ft.FontWeight.BOLD),
+                ft.Text(i18n.t("stats.chart.title"), size=14, weight=ft.FontWeight.BOLD),
                 self._chart_container,
             ],
             spacing=8,
@@ -147,7 +94,7 @@ class StatsView:
         return ft.Container(
             content=ft.Column(
                 controls=[
-                    ft.Text("統計資料", size=20, weight=ft.FontWeight.BOLD),
+                    c.page_title(theme, i18n.t("stats.title")),
                     self._mode_toggle,
                     cards,
                     ft.Divider(),
@@ -161,32 +108,36 @@ class StatsView:
         )
 
     def _build_cards(self) -> ft.Row:
-        labels = ["總下載流量", "JXL 節省空間", "HTTP 請求數", "執行時間"]
-        card_palette = _card_palette(self._page)
-        label_color = _card_label_color(self._page)
+        labels = [i18n.t("stats.card.bytes"), i18n.t("stats.card.jxl_saved"),
+                  i18n.t("stats.card.http"), i18n.t("stats.card.elapsed")]
+        theme = current_theme(self._page)
+        value_colors = _accent_cycle(self._page)
         self._card_containers: list[ft.Container] = []
         self._card_labels: list[ft.Text] = []
-        cards: list[ft.Card] = []
+        cards: list[ft.Container] = []
         for i, label in enumerate(labels):
             label_text = ft.Text(
-                label, size=12, color=label_color, text_align=ft.TextAlign.CENTER,
+                label, size=12, color=theme.text_secondary, text_align=ft.TextAlign.CENTER,
             )
-            container = ft.Container(
-                content=ft.Column(
+            self._card_values[i].color = value_colors[i % len(value_colors)]
+            panel = glass_panel(
+                ft.Column(
                     controls=[label_text, self._card_values[i]],
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     spacing=4,
                 ),
+                theme,
                 padding=16,
-                bgcolor=card_palette[i],
-                border_radius=8,
-                width=160,
-                alignment=ft.Alignment(x=0, y=0),
+                radius=theme.radius_sm,
+                expand=1,
             )
-            self._card_containers.append(container)
+            self._card_containers.append(panel)
             self._card_labels.append(label_text)
-            cards.append(ft.Card(content=container))
-        return ft.Row(controls=cards, wrap=True, spacing=12)
+            cards.append(panel)
+        # wrap=True here rendered the whole row as an opaque gray block on
+        # Flet 0.84 (Wrap + glass Containers inside the scrollable Column);
+        # equal-expand cards in a plain Row sidestep it and scale with width.
+        return ft.Row(controls=cards, spacing=12)
 
     def start_auto_refresh(self) -> None:
         if self._refresh_task is not None:
@@ -245,7 +196,7 @@ class StatsView:
         cookie_counts = data.get("cookie_request_counts", {})
         total_req = sum(cookie_counts.values())
         self._card_values[2].value = str(total_req)
-        self._card_values[3].value = str(data.get("lifetime_sessions", 0)) + " 次"
+        self._card_values[3].value = i18n.t("stats.sessions_count", n=data.get("lifetime_sessions", 0))
         for t in self._card_values:
             try:
                 t.update()
@@ -261,16 +212,21 @@ class StatsView:
             return []
         sorted_items = sorted(cookie_requests.items(), key=lambda kv: kv[1], reverse=True)
         max_count = max(1, sorted_items[0][1])
-        palette = _bar_palette(self._page)
+        palette = _accent_cycle(self._page)
         rows: list[ft.Control] = []
         for idx, (label, count) in enumerate(sorted_items):
             bar_w = max(2, int(count / max_count * _MAX_BAR_PX))
             color = palette[idx % len(palette)]
+            bar = ft.Container(
+                content=ft.Container(bgcolor=color, width=bar_w, height=18, border_radius=4),
+                width=_MAX_BAR_PX, height=18, bgcolor=_BAR_TRACK_BG, border_radius=4,
+                alignment=ft.Alignment(x=-1, y=0),
+            )
             rows.append(
                 ft.Row(
                     controls=[
                         ft.Text(label, size=11, width=120, overflow=ft.TextOverflow.ELLIPSIS, no_wrap=True),
-                        ft.Container(bgcolor=color, width=bar_w, height=18, border_radius=4),
+                        bar,
                         ft.Text(str(count), size=11, width=60),
                     ],
                     spacing=8,
@@ -280,9 +236,10 @@ class StatsView:
         return rows
 
     def _update_chart(self, requests: dict[str, int]) -> None:
+        theme = current_theme(self._page)
         if not requests:
             self._chart_container.controls = [
-                ft.Text("尚無資料", size=12, color=_empty_text_color(self._page))
+                ft.Text(i18n.t("stats.empty"), size=12, color=theme.text_muted)
             ]
             self._safe_chart_update()
             return
@@ -292,30 +249,31 @@ class StatsView:
         rows = self._build_cookie_bar_rows(cookie_requests)
         if free_count > 0:
             rows.append(ft.Text(
-                f"免 Cookie：{free_count} 次", size=12, color=_free_cookie_color(self._page),
+                i18n.t("stats.free_cookie", count=free_count), size=12, color=theme.info,
             ))
         if not rows:
-            rows = [ft.Text("尚無資料", size=12, color=_empty_text_color(self._page))]
+            rows = [ft.Text(i18n.t("stats.empty"), size=12, color=theme.text_muted)]
 
         self._chart_container.controls = rows
         self._safe_chart_update()
 
     def refresh_theme(self) -> None:
         """Re-apply theme-dependent colors after a light/dark toggle."""
-        card_palette = _card_palette(self._page)
-        label_color = _card_label_color(self._page)
-        for i, container in enumerate(getattr(self, "_card_containers", []) or []):
-            container.bgcolor = card_palette[i]
-            try:
+        theme = current_theme(self._page)
+        value_colors = _accent_cycle(self._page)
+        for container in getattr(self, "_card_containers", []) or []:
+            container.bgcolor = theme.panel_bg if theme.blur_enabled else theme.panel_bg_opaque
+            container.border = ft.Border.all(1, theme.panel_border)
+            with contextlib.suppress(Exception):
                 container.update()
-            except Exception:
-                pass
         for label in getattr(self, "_card_labels", []) or []:
-            label.color = label_color
-            try:
+            label.color = theme.text_secondary
+            with contextlib.suppress(Exception):
                 label.update()
-            except Exception:
-                pass
+        for i, value in enumerate(self._card_values):
+            value.color = value_colors[i % len(value_colors)]
+            with contextlib.suppress(Exception):
+                value.update()
         # Re-render the chart so bar colors and any inline text picks up
         # the new palette without waiting for the next 1 s tick.
         self._refresh_now()

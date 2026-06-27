@@ -68,7 +68,7 @@ def test_proxy(proxy_url: str | None, timeout: int = 10) -> tuple[bool, str]:
             "https://www.pixiv.net",
             proxies=proxies,
             timeout=timeout,
-            verify=False,
+            verify=True,
             allow_redirects=True,
         )
         return True, f"HTTP {resp.status_code}"

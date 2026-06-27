@@ -30,6 +30,8 @@ def _stub(tmp_path=None):
     t.download_path = str(tmp_path) if tmp_path else "/tmp"
     t._attempted_urls = set()
     t._attempted_urls_lock = threading.Lock()
+    t._completed_urls = set()
+    t._completed_urls_lock = threading.Lock()
     t.allurl = []
     t.q = Queue()
     return t
@@ -65,7 +67,7 @@ def test_finalize_downloads_zero_items_ignored(tmp_path):
     assert isinstance(remaining, list)
 
 
-# ── _refresh_and_write_exist_pid ─────────────────────────────────────────────
+# ── _sync_exist_pid_to_db ────────────────────────────────────────────────────
 
 def _stub_with_download_dir(tmp_path):
     t = _stub(tmp_path)
@@ -73,43 +75,30 @@ def _stub_with_download_dir(tmp_path):
     return t
 
 
-def test_refresh_exist_pid_from_json(tmp_path):
+def test_sync_exist_pid_writes_to_db(tmp_path):
+    from app.core.metadata_db import MetadataDB
     t = _stub_with_download_dir(tmp_path)
-    pids = ["111", "222", "333"]
-    (tmp_path / "exist_pid.json").write_text(
-        json.dumps(pids), encoding="utf-8"
-    )
-    t._refresh_and_write_exist_pid()
-    assert "111" in t.exist_pid
-    assert "222" in t.exist_pid
+    t.exist_pid = {"11100001", "22200001"}
+    t._metadata_db = MetadataDB(str(tmp_path))
+    t._sync_exist_pid_to_db()
+    assert t._metadata_db.is_downloaded("11100001") is True
+    assert t._metadata_db.is_downloaded("22200001") is True
 
 
-def test_refresh_exist_pid_fallback_to_legacy_json(tmp_path):
+def test_sync_exist_pid_no_db_does_not_raise(tmp_path):
     t = _stub_with_download_dir(tmp_path)
-    pids = ["444", "555"]
-    (tmp_path / "exist.json").write_text(
-        json.dumps(pids), encoding="utf-8"
-    )
-    t._refresh_and_write_exist_pid()
-    assert "444" in t.exist_pid
-
-
-def test_refresh_exist_pid_empty_dir(tmp_path):
-    t = _stub_with_download_dir(tmp_path)
-    t._refresh_and_write_exist_pid()
-    # No crash, exist_pid is a set (possibly empty)
+    t.exist_pid = {"11100001"}
+    t._metadata_db = None
+    t._sync_exist_pid_to_db()  # must not raise
     assert isinstance(t.exist_pid, set)
 
 
-def test_refresh_exist_pid_writes_back_json(tmp_path):
+def test_sync_exist_pid_empty_set_is_noop(tmp_path):
     t = _stub_with_download_dir(tmp_path)
-    pids = ["111", "222"]
-    (tmp_path / "exist_pid.json").write_text(json.dumps(pids), encoding="utf-8")
-    t._refresh_and_write_exist_pid()
-    # Written back
-    written = json.loads((tmp_path / "exist_pid.json").read_text(encoding="utf-8"))
-    assert "111" in written
-    assert "222" in written
+    t.exist_pid = set()
+    t._metadata_db = None
+    t._sync_exist_pid_to_db()
+    assert isinstance(t.exist_pid, set)
 
 
 # ── _group_urls_by_pid ────────────────────────────────────────────────────────
@@ -164,7 +153,8 @@ def test_download_pid_group_uses_account_proxy_session(monkeypatch):
     t.q = __import__("queue").Queue()
     t._attempted_urls = set()
     t._attempted_urls_lock = __import__("threading").Lock()
-    t._current_account = AccountState(
+    t._current_account_local = __import__("threading").local()
+    t._current_account_local.account = AccountState(
         cookie="test_cookie", alias="A1", proxy_url="http://1.2.3.4:8080"
     )
     t.exist_pid = set()
@@ -228,3 +218,54 @@ def test_gif_download_propagates_proxy_error(monkeypatch):
             "https://i.pximg.net/img-original/img/1/777_ugoira0.zip",
             session=FailGet(),
         )
+
+
+# ── completed-vs-attempted marking (data-loss regression, B1/B2) ──────────────
+
+def _stub_with_pending_db(tmp_path, url, pid):
+    from app.core.metadata_db import MetadataDB
+    t = _stub(tmp_path)
+    (tmp_path / "all_url.txt").write_text("", encoding="utf-8")
+    t.allurl = [url]
+    t._metadata_db = MetadataDB(str(tmp_path))
+    t._metadata_db.upsert_pending_urls([(url, pid)])
+    return t
+
+
+def test_attempted_but_failed_url_stays_pending_not_downloaded(tmp_path):
+    """A page that was attempted but never confirmed on disk (network-retry
+    exhausted -> empty fail list) must NOT be marked downloaded and must stay in
+    the remaining set. Regression for the attempted==completed data-loss bug."""
+    url = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/96000001_p0.jpg"
+    t = _stub_with_pending_db(tmp_path, url, "96000001")
+    # URL was attempted (progress advanced) but NOT completed, and the
+    # network-exhaustion path produced no fail record (empty failed list).
+    t._attempted_urls = {url}
+    remaining = t._finalize_downloads([])
+    assert url in remaining, "exhausted URL must stay queued for retry"
+    assert t._metadata_db.pending_url_count() == 1, "page must stay pending"
+
+
+def test_stop_interrupted_url_stays_pending_not_downloaded(tmp_path):
+    """A page handed back via the stop-queue (user pressed Stop before the fetch)
+    must NOT be marked downloaded. Regression for 'a stopped loop must not mark
+    unattempted items done'."""
+    url = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/96000002_p0.jpg"
+    t = _stub_with_pending_db(tmp_path, url, "96000002")
+    t._attempted_urls = {url}
+    t.q.put(url)  # gif_or_jpg's stop path hands the URL back here
+    remaining = t._finalize_downloads([])
+    assert url in remaining
+    assert t._metadata_db.pending_url_count() == 1
+
+
+def test_completed_url_is_marked_downloaded(tmp_path):
+    """Positive case: a confirmed-on-disk URL IS marked downloaded and drops out
+    of the remaining set."""
+    url = "https://i.pximg.net/img-original/img/2024/01/01/12/00/00/96000003_p0.jpg"
+    t = _stub_with_pending_db(tmp_path, url, "96000003")
+    t._record_completed(url)
+    remaining = t._finalize_downloads([])
+    assert url not in remaining
+    assert t._metadata_db.pending_url_count() == 0
+    assert t._metadata_db.url_row_count() == 1

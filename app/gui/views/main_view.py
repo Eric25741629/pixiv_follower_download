@@ -1,51 +1,56 @@
 from __future__ import annotations
-import asyncio
+import contextlib
 import queue
 import threading
-import time
 import flet as ft
 
 from app.core.worker_event import WorkerEvent
+from app import i18n
+from app.gui import components as c
+from app.gui.glass import (
+    current_theme,
+    glass_dialog,
+    glass_panel,
+    glass_pill,
+    set_pill_icon,
+    set_pill_label,
+    state_colors,
+    style_pill,
+)
+from app.gui.log_panel import LogPanel
+from app.gui.views.main_mode_row import (
+    bookmark_step_labels,
+    merged_step3_label,
+    source_tooltips,
+    _MainModeRowMixin,
+    _settings_base_path,
+    step_labels,
+)
+from app.gui.views.main_progress import _PROG_LEAD_W, _MainProgressMixin
 
+# Label helpers moved to the mixin modules (file-size refactor) and re-exported
+# above: step_labels() / merged_step3_label() etc. so call sites here
+# (_make_step_card) and tests that ``from app.gui.views.main_view import
+# step_labels`` keep working. They are i18n.t()-backed functions (resolved at
+# call time, after the locale is set). The progress-bar geometry (_PROG_*) and
+# ETA logic live in main_progress; source/scope/combined logic in main_mode_row.
 
-STEP_LABELS = ["步驟 1\n抓追蹤", "步驟 2\n抓 PID", "步驟 3\n抓 URL", "步驟 4\n下載"]
-
-# Two palettes — light uses saturated 600-level bg + white text; dark uses
-# softer 400/800-level bg + dark text so colors don't look neon on black.
-_STATE_COLORS_LIGHT: dict[str, tuple[str, str]] = {
-    "idle":    (ft.Colors.GREY_300,  ft.Colors.BLACK),
-    "running": (ft.Colors.BLUE_600,  ft.Colors.WHITE),
-    "done":    (ft.Colors.GREEN_700, ft.Colors.WHITE),
-    "error":   (ft.Colors.RED_600,   ft.Colors.WHITE),
-}
-_STATE_COLORS_DARK: dict[str, tuple[str, str]] = {
-    "idle":    (ft.Colors.GREY_800,         ft.Colors.GREY_300),
-    "running": (ft.Colors.BLUE_400,         ft.Colors.BLACK),
-    "done":    (ft.Colors.TEAL_400,         ft.Colors.BLACK),
-    "error":   (ft.Colors.DEEP_ORANGE_400,  ft.Colors.BLACK),
-}
-
-
-def _is_dark_mode(page: ft.Page) -> bool:
-    mode = getattr(page, "theme_mode", None)
-    if mode == ft.ThemeMode.DARK:
-        return True
-    if mode == ft.ThemeMode.LIGHT:
-        return False
-    try:
-        return page.platform_brightness == ft.Brightness.DARK
-    except Exception:
-        return False
+__all__ = [
+    "MainView",
+    "step_labels",
+    "bookmark_step_labels",
+    "merged_step3_label",
+    "source_tooltips",
+    "_settings_base_path",
+]
 
 
 def _state_palette(page: ft.Page) -> dict[str, tuple[str, str]]:
-    return _STATE_COLORS_DARK if _is_dark_mode(page) else _STATE_COLORS_LIGHT
+    """Step-card state colors from the glass design system (call sites unchanged)."""
+    return state_colors(current_theme(page))
 
 
-_MAX_LOG_LINES = 2000
-
-
-class MainView:
+class MainView(_MainProgressMixin, _MainModeRowMixin):
     """The primary workflow view: step cards, controls, progress, log."""
 
     def __init__(self, page: ft.Page, event_q: queue.Queue):
@@ -58,27 +63,70 @@ class MainView:
         self._step_card_containers: list[ft.Container] = []
         self._step_card_texts: list[ft.Text] = []
         self._step_cards = [self._make_step_card(i) for i in range(4)]
+        # Whether the step 3+4 cards are merged (邊查邊下); applied in build()
+        # from settings and refreshed when the user returns to the 主頁 tab.
+        self._combined_mode = False
 
-        self._btn_run_all = ft.FilledButton("▶ 一鍵執行", on_click=self._on_run_all)
-        self._btn_pause = ft.OutlinedButton("⏸ 暫停", on_click=self._on_pause_toggle, disabled=True)
-        self._btn_stop = ft.OutlinedButton("⏹ 停止", on_click=self._on_stop, disabled=True)
+        # 控制鈕＝glass_pill 膠囊（與模式列同語彙），內嵌自繪 SVG 圖標
+        # （play/pause/stop）。標籤改字走 set_pill_label、換圖標走
+        # set_pill_icon（content 是 Row[Image, Text]，不可對 content 指派
+        # 字串）；啟用/停用走 _set_pill_enabled（disabled + 半透明）。
+        self._btn_run_all = self._make_action_pill(
+            i18n.t("main.btn.run_all"), icon="play", primary=True, on_click=self._on_run_all,
+        )
+        self._btn_pause = self._make_action_pill(
+            i18n.t("main.btn.pause"), icon="pause", on_click=self._on_pause_toggle, enabled=False,
+        )
+        self._btn_stop = self._make_action_pill(
+            i18n.t("main.btn.stop"), icon="stop", on_click=self._on_stop, enabled=False,
+        )
         self._is_paused = False
         self._cards_disabled = False
 
-        self._progress_bar = ft.ProgressBar(value=0, expand=True)
-        self._progress_text = ft.Text("", size=12, color=ft.Colors.GREY_600, width=120)
+        # ── 整體進度 / 本作分頁 bars ─────────────────────────────────────────
+        # Built by ONE shared helper so the two rows are IDENTICAL in both
+        # construction and update path (see _make_progress_row /
+        # _render_progress_row). Both start hidden and are revealed on their
+        # first real update. The reveal (visible False -> True) is load-bearing:
+        # it forces Flet to lay the row out with real content. An always-visible
+        # row first laid out with EMPTY children renders degenerate and later
+        # .value patches never reflow it — that was the 整體進度 freeze (本作分頁
+        # never froze precisely because it was visible-gated; now both are).
+        # 雙色：整體進度=accent、本作分頁=info — 兩條必須一眼可區分
+        # （邊查邊下同時跑 PID 進度與單 PID 多頁進度）。
+        self._progress_bar, self._progress_text, self._progress_row = (
+            self._make_progress_row(i18n.t("main.progress.overall"), current_theme(page).accent)
+        )
+        self._page_progress_bar, self._page_progress_text, self._page_progress_row = (
+            self._make_progress_row(i18n.t("main.progress.page"), current_theme(page).info)
+        )
+        self._page_progress_value = 0
+        self._page_progress_total = 0
+        self._page_progress_pid = ""
+
+        # ── meta line (正在下載 PID + ETA + cooldown countdown) ──────────────
+        # 獨立於第二進度條：單頁作品會隱藏分頁條（t<=1），但「正在下載：PID」
+        # 與倒數計時必須照常顯示，所以放在永遠可見的 meta 列上。
+        self._downloading_text = ft.Text(
+            "", size=12, color=current_theme(page).info,
+            weight=ft.FontWeight.W_600,
+        )
         self._eta_text = ft.Text(
-            "",
-            size=12,
-            color=ft.Colors.BLUE_GREY_500,
-            width=160,
+            "", size=12, color=current_theme(page).text_secondary
         )
         self._countdown_text = ft.Text(
-            "",
-            size=13,
-            color=ft.Colors.ORANGE_600,
+            "", size=12, color=current_theme(page).warning,
             weight=ft.FontWeight.BOLD,
-            width=140,
+        )
+        self._meta_row = ft.Row(
+            controls=[
+                ft.Container(width=_PROG_LEAD_W),
+                self._downloading_text,
+                self._eta_text,
+                self._countdown_text,
+            ],
+            spacing=18,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         self._progress_value = 0
         self._progress_total = 0
@@ -88,7 +136,7 @@ class MainView:
         self._phase_label = ft.Text(
             "",
             size=11,
-            color=ft.Colors.BLUE_300 if _is_dark_mode(page) else ft.Colors.BLUE_700,
+            color=current_theme(page).info,
             expand=True,
         )
         self._phase_row = ft.Row(
@@ -98,75 +146,136 @@ class MainView:
         )
 
         # Modal overlay shown while a step is launching or stopping.
-        self._loading_msg = ft.Text("正在啟動...", size=15, weight=ft.FontWeight.BOLD)
-        self._loading_dialog = ft.AlertDialog(
-            modal=True,
-            content=ft.Column(
+        self._loading_msg = ft.Text(
+            i18n.t("main.loading.default"), size=15, weight=ft.FontWeight.BOLD,
+            color=current_theme(page).text_primary,
+        )
+        self._loading_dialog = glass_dialog(
+            current_theme(page),
+            "",
+            ft.Column(
                 controls=[
-                    ft.ProgressRing(width=56, height=56, stroke_width=4),
+                    ft.ProgressRing(
+                        width=56, height=56, stroke_width=4,
+                        color=current_theme(page).accent,
+                    ),
                     self._loading_msg,
-                    ft.Text("請勿關閉視窗", size=12, color=ft.Colors.GREY_600),
+                    ft.Text(
+                        i18n.t("main.loading.dont_close"), size=12,
+                        color=current_theme(page).text_secondary,
+                    ),
                 ],
                 tight=True,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 spacing=14,
             ),
         )
+        self._loading_dialog.modal = True
         self._loading_open = False
         self._loading_lock = threading.Lock()
 
-        self._log_lines: list[ft.Text] = []
-        self._auto_scroll_enabled = True
-        self._scroll_pending = False
-        self._last_scroll_pixels: float | None = None
-        self._last_max_scroll_extent: float | None = None
-        # auto_scroll stays False forever — we manually call scroll_to(offset=-1)
-        # via _schedule_scroll_to_bottom().  Toggling auto_scroll at runtime
-        # rebuilds Flutter's ScrollController and breaks mouse-wheel scrolling
-        # mid-session.  build_controls_on_demand=False is required for
-        # scroll_to to work on a ListView (the Flet docstring explicitly says
-        # scroll_to is ineffective when items are built lazily).
-        self._log_list = ft.ListView(
-            controls=self._log_lines,
-            expand=True,
-            spacing=1,
-            auto_scroll=False,
-            build_controls_on_demand=False,
-            on_scroll=self._on_log_scroll,
-            scroll_interval=200,
+        # Log 面板（單一 selectable Text + 意圖驅動跟隨狀態機 + 膠囊）
+        # 全部封裝在 LogPanel（app/gui/log_panel.py）。
+        self._log_panel = LogPanel()
+
+        # ── 模式列：單一可換行膠囊列（取代舊的粉/藍實色帶） ──────────────────
+        # 「來源」[抓追隨][抓收藏]・「範圍」[公開][非公開][全部]
+        # 兩個群組各自 tight，外層 Row wrap=True：視窗縮小時整組換行，
+        # 不會像舊 expand-slot 版那樣文字壓到按鈕。模式說明改為 pill tooltip。
+        self._source_mode = "following"
+        self._following_scope = "all"
+        self._bookmark_scope = "all"
+        self._active_scope = "all"
+        self._source_label = ft.Text(
+            i18n.t("main.source_label"), size=12, weight=ft.FontWeight.BOLD,
+            color=current_theme(page).text_muted,
         )
-        # The pill overlay used to be an expand=True Container with alignment,
-        # but that wrapped a transparent Container over the full Stack area —
-        # Flet's Container always supports on_hover so Flutter wraps it in a
-        # MouseRegion that absorbs pointer events (including mouse wheel and
-        # click), blocking the ListView underneath AND the inner pill.
-        # Solution: use a Row positioned only along the bottom strip via
-        # Stack positioning (left/right/bottom).  Row doesn't paint nor hit
-        # test its empty space, so wheel events above the strip reach the
-        # ListView, and clicks on either side of the pill pass through too.
-        self._pill_overlay = ft.Row(
-            [
-                ft.Container(
-                    content=ft.Text("↓ 跳到最新", size=11, color=ft.Colors.WHITE),
-                    bgcolor=ft.Colors.with_opacity(0.75, ft.Colors.BLUE_GREY_700),
-                    border_radius=20,
-                    padding=ft.Padding.symmetric(horizontal=16, vertical=7),
-                    on_click=self._on_scroll_to_bottom,
-                    ink=True,
-                ),
+        self._scope_label = ft.Text(
+            i18n.t("main.scope_label.following"),
+            size=12,
+            weight=ft.FontWeight.BOLD,
+            color=current_theme(page).text_secondary,
+        )
+        _tips = source_tooltips()
+        self._btn_source_following = self._make_mode_button(
+            i18n.t("main.source.following"), False, lambda e: self._on_source_mode_change("following"),
+            tooltip=_tips["following"],
+        )
+        self._btn_source_bookmarks = self._make_mode_button(
+            i18n.t("main.source.bookmarks"), False, lambda e: self._on_source_mode_change("bookmarks"),
+            tooltip=_tips["bookmarks"],
+        )
+        self._btn_scope_public = self._make_mode_button(
+            i18n.t("main.scope.public"), False, lambda e: self._on_scope_change("public")
+        )
+        self._btn_scope_private = self._make_mode_button(
+            i18n.t("main.scope.private"), False, lambda e: self._on_scope_change("private")
+        )
+        self._btn_scope_all = self._make_mode_button(
+            i18n.t("main.scope.all"), False, lambda e: self._on_scope_change("all")
+        )
+        self._scope_row = ft.Row(
+            controls=[
+                self._scope_label,
+                self._btn_scope_public,
+                self._btn_scope_private,
+                self._btn_scope_all,
             ],
-            alignment=ft.MainAxisAlignment.CENTER,
-            left=0,
-            right=0,
-            bottom=15,
-            visible=False,
+            spacing=6,
+            tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        # Backward-compatible alias for older tests / callers.
+        self._bookmark_scope_row = self._scope_row
+        self._source_mode_controls = ft.Row(
+            controls=[self._btn_source_following, self._btn_source_bookmarks],
+            spacing=6,
+            tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        self._source_group = ft.Row(
+            controls=[self._source_label, self._source_mode_controls],
+            spacing=8,
+            tight=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        self._mode_row = ft.Row(
+            controls=[self._source_group, self._scope_row],
+            spacing=24,
+            run_spacing=8,
+            wrap=True,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
-    def _make_step_card(self, index: int) -> ft.Card:
+    def _make_action_pill(
+        self, label: str, *, icon: str | None = None, primary: bool = False,
+        on_click=None, enabled: bool = True,
+    ) -> ft.Container:
+        """glass_pill for the run/pause/stop controls.
+
+        With ``icon`` the pill's ``content`` is a ``Row[Image, Text]``;
+        change its label via :func:`set_pill_label`, its icon via
+        :func:`set_pill_icon` (never assign a string to ``content``).
+        """
+        pill = glass_pill(
+            label, current_theme(self._page), icon=icon, primary=primary,
+            on_click=on_click,
+        )
+        self._set_pill_enabled(pill, enabled)
+        return pill
+
+    @staticmethod
+    def _set_pill_enabled(pill: ft.Container, enabled: bool) -> None:
+        """Toggle a glass pill's clickability + the dimmed disabled look."""
+        pill.disabled = not enabled
+        pill.opacity = 1.0 if enabled else 0.45
+
+    def _make_step_card(self, index: int) -> ft.Container:
+        theme = current_theme(self._page)
         palette = _state_palette(self._page)
         bg, fg = palette["idle"]
         text = ft.Text(
-            STEP_LABELS[index],
+            step_labels()[index],
             text_align=ft.TextAlign.CENTER,
             size=13,
             color=fg,
@@ -175,15 +284,17 @@ class MainView:
             content=text,
             padding=12,
             bgcolor=bg,
-            border_radius=8,
+            border_radius=theme.radius_sm,
+            border=ft.Border.all(1, theme.panel_border),
             width=110,
             alignment=ft.Alignment(x=0, y=0),
             ink=True,
+            animate=ft.Animation(150, ft.AnimationCurve.EASE_OUT),
             on_click=lambda e, n=index + 1: self._on_run_step(n),
         )
         self._step_card_containers.append(container)
         self._step_card_texts.append(text)
-        return ft.Card(content=container)
+        return container
 
     def set_step_state(self, index: int, state: str) -> None:
         """Update step card color. state: 'idle'|'running'|'done'|'error'"""
@@ -197,16 +308,33 @@ class MainView:
         """Re-apply theme-dependent colors after a light/dark toggle.
 
         Step cards, phase label — anything that picks colors from
-        ``_is_dark_mode(page)`` rather than auto-themed Flet components.
+        ``current_theme(page)`` rather than auto-themed Flet components.
         Best-effort: swallows ``update()`` errors on detached controls.
         """
+        theme = current_theme(self._page)
         palette = _state_palette(self._page)
         for i, state in enumerate(self._step_states):
             bg, fg = palette.get(state, palette["idle"])
             self._step_card_containers[i].bgcolor = bg
             self._step_card_texts[i].color = fg
-        self._phase_label.color = (
-            ft.Colors.BLUE_300 if _is_dark_mode(self._page) else ft.Colors.BLUE_700
+        self._phase_label.color = theme.info
+        # 進度條雙色 + meta 列 + 控制鈕/模式列膠囊就地重染。
+        self._progress_bar.color = theme.accent
+        self._page_progress_bar.color = theme.info
+        self._downloading_text.color = theme.info
+        self._eta_text.color = theme.text_secondary
+        self._countdown_text.color = theme.warning
+        style_pill(self._btn_run_all, theme, primary=True)
+        style_pill(self._btn_pause, theme)
+        style_pill(self._btn_stop, theme)
+        self._source_label.color = theme.text_muted
+        self._scope_label.color = theme.text_secondary
+        # 模式 pills 由 apply_source_mode 以新 theme 重建。
+        self.refresh_source_mode()
+        self._safe_update(
+            self._progress_row, self._page_progress_row, self._meta_row,
+            self._btn_run_all, self._btn_pause, self._btn_stop,
+            self._source_label,
         )
         for c in self._step_card_containers:
             try:
@@ -223,162 +351,57 @@ class MainView:
         except Exception:
             pass
 
+    # Source / scope / combined mode pills + persistence + step-card relabel
+    # moved to main_mode_row._MainModeRowMixin (file-size refactor); inherited.
+
     def append_log(self, html_line: str) -> None:
-        from app.gui.log_format import html_to_spans
-        spans = html_to_spans(html_line)
-        if not spans:
-            return
-        self._log_lines.append(ft.Text(spans=spans, size=12))
-        if len(self._log_lines) > _MAX_LOG_LINES:
-            self._log_lines.pop(0)
-        # Only schedule a scroll_to when the ListView is still attached to a
-        # live page tree. After a nav-rail switch the MainView is detached
-        # (its subtree was replaced inside content_area); calling scroll_to
-        # then sends an _invoke_method round-trip to a widget the client no
-        # longer renders, which piles awaited tasks on the event loop and
-        # makes the rapid-tab-switch session-GC scenario worse. Re-attach
-        # happens transparently on the next log line after the user returns
-        # to MainView.
-        # If the last known scroll position was at/near the bottom, treat
-        # new lines as wanting to follow — appending shifts max_scroll_extent
-        # so the user can be at the visual bottom while extent_after silently
-        # grows, leaving the pill stuck even though they're already there.
-        if (not self._auto_scroll_enabled
-                and self._last_scroll_pixels is not None
-                and self._last_max_scroll_extent is not None
-                and self._last_max_scroll_extent - self._last_scroll_pixels <= 30):
-            self._auto_scroll_enabled = True
-            self._pill_overlay.visible = False
-        if self._auto_scroll_enabled and getattr(self._log_list, "page", None) is not None:
-            self._schedule_scroll_to_bottom()
+        self._log_panel.append_log(html_line)
 
-    def _schedule_scroll_to_bottom(self) -> None:
-        """Coalesce scroll requests within one event-loop tick — many
-        log lines can land in the same dispatcher poll, but we only need
-        one scroll_to per render."""
-        if self._scroll_pending:
-            return
-        self._scroll_pending = True
-        try:
-            asyncio.create_task(self._do_scroll_to_bottom())
-        except RuntimeError:
-            # No running loop (called outside event loop) — drop quietly.
-            self._scroll_pending = False
+    @staticmethod
+    def _safe_update(*controls) -> None:
+        """update() each control, swallowing detached-control errors.
 
-    async def _do_scroll_to_bottom(self) -> None:
-        try:
-            await self._log_list.scroll_to(offset=-1, duration=0)
-        except Exception:
-            pass
-        finally:
-            self._scroll_pending = False
+        Detached controls (e.g. during build() before mount, or after a session
+        GC) raise from update(); we swallow that so painting restored state is
+        always safe.
+        """
+        for c in controls:
+            with contextlib.suppress(Exception):
+                c.update()
 
-    def _on_log_scroll(self, e: ft.OnScrollEvent) -> None:
-        # Don't trust ScrollType.USER + direction for wheel events — Flutter's
-        # pointerScroll path does not always fire UserScrollNotification, and
-        # when it does the direction enum value is unreliable across platforms.
-        # Use UPDATE events with pixel-delta tracking instead.
-        if e.event_type != ft.ScrollType.UPDATE:
-            return
-        prev = self._last_scroll_pixels
-        self._last_scroll_pixels = e.pixels
-        self._last_max_scroll_extent = e.max_scroll_extent
-        if self._auto_scroll_enabled:
-            # User scrolled up if pixels decreased by >10px AND we're now
-            # more than 30px from the bottom.  The pixel-delta filter rules
-            # out the spurious decreases caused by pop(0) when the log hits
-            # _MAX_LOG_LINES (those shift content up but stay near bottom).
-            if prev is not None and e.pixels < prev - 10 and e.extent_after > 30:
-                self._auto_scroll_enabled = False
-                self._pill_overlay.visible = True
-        else:
-            # Re-enable when the user is near the bottom. The previous
-            # ≤20 threshold was tight enough that scroll_interval=200
-            # throttling could leave the final event at extent_after≈25,
-            # stranding the pill visible at the visual bottom. A scroll-down
-            # nudge that lands ≤80px from the edge also counts as intent.
-            scrolling_down = prev is not None and e.pixels > prev
-            if e.extent_after <= 50 or (scrolling_down and e.extent_after <= 80):
-                self._enable_auto_scroll()
+    # Dual progress-bar machinery (_make_progress_row / _render_progress_row /
+    # _paint_progress / update_progress / update_page_progress /
+    # _hide_page_progress_bar / clear_page_progress / _format_eta /
+    # update_countdown) moved to main_progress._MainProgressMixin (file-size
+    # refactor); inherited. _set_downloading_pid / _set_downloading_status stay
+    # here (they own the meta-row status slot the mixin calls into).
 
-    def _enable_auto_scroll(self) -> None:
-        self._auto_scroll_enabled = True
-        self._pill_overlay.visible = False
-        # Actively jump to bottom — setting a flag alone won't move the
-        # viewport until the next log line arrives.
-        self._schedule_scroll_to_bottom()
+    def _set_downloading_pid(self, pid_text: str) -> None:
+        self._set_downloading_status(i18n.t("main.downloading_pid", pid=pid_text) if pid_text else "")
 
-    def _on_scroll_to_bottom(self, e: ft.ControlEvent) -> None:
-        self._enable_auto_scroll()
-
-    def update_progress(self, delta: int, total: int) -> None:
-        # Workers emit (delta, total) per step, with delta == 0 marking a reset
-        # at the start of a phase. We accumulate locally so the bar grows.
-        try:
-            d = int(delta)
-            t = int(total)
-        except (TypeError, ValueError):
-            return
-        now = time.monotonic()
-        if d <= 0:
-            self._progress_value = 0
-            self._progress_started_at = now
-        else:
-            self._progress_value += d
-            if self._progress_started_at is None:
-                self._progress_started_at = now
-        self._progress_total = t
-        if t > 0:
-            ratio = self._progress_value / t
-            self._progress_bar.value = max(0.0, min(1.0, ratio))
-            self._progress_text.value = f"{self._progress_value}/{t}"
-            self._eta_text.value = self._format_eta(now)
-        else:
-            self._progress_bar.value = 0
-            self._progress_text.value = ""
-            self._eta_text.value = ""
-        try:
-            self._progress_bar.update()
-            self._progress_text.update()
-            self._eta_text.update()
-        except Exception:
-            pass
-
-    def _format_eta(self, now: float) -> str:
-        if self._progress_started_at is None:
-            return ""
-        if self._progress_value <= 0 or self._progress_total <= 0:
-            return ""
-        if self._progress_value >= self._progress_total:
-            return "預計剩餘：完成"
-        elapsed = now - self._progress_started_at
-        if elapsed <= 0:
-            return ""
-        remaining_items = self._progress_total - self._progress_value
-        eta_sec = int(remaining_items * elapsed / self._progress_value)
-        if eta_sec <= 0:
-            return ""
-        if eta_sec >= 3600:
-            h, rem = divmod(eta_sec, 3600)
-            m, s = divmod(rem, 60)
-            return f"預計剩餘：{h}:{m:02d}:{s:02d}"
-        m, s = divmod(eta_sec, 60)
-        return f"預計剩餘：{m:02d}:{s:02d}"
-
-    def update_countdown(self, remaining: int) -> None:
-        try:
-            r = int(remaining)
-        except (TypeError, ValueError):
-            r = 0
-        self._countdown_text.value = f"倒數：{r} 秒" if r > 0 else ""
-        try:
-            self._countdown_text.update()
-        except Exception:
-            pass
+    def _set_downloading_status(self, value: str) -> None:
+        """Single render slot for the current-PID status (查詢中/下載中)."""
+        if self._downloading_text.value != value:
+            self._downloading_text.value = value
+            self._safe_update(self._meta_row)
 
     def set_phase(self, text: str) -> None:
-        """Update the phase indicator row below the progress bar."""
-        has_text = bool(text and text.strip())
+        """Update the phase indicator row below the progress bar.
+
+        「正在查詢/正在下載」 per-PID messages are routed to the meta row's
+        正在下載 slot instead — the meta row (next to ETA/倒數) is where the
+        current PID already shows, so rendering them in the phase row too
+        would duplicate the same PID on two lines. Detection uses the localized
+        prefixes (workers emit these via i18n.t), so it still works under en.
+        """
+        t = (text or "").strip()
+        # Strip everything from the {pid} placeholder onward to get the prefix.
+        q_pre = i18n.t("log.phase.querying", pid="\x00").split("\x00", 1)[0]
+        d_pre = i18n.t("log.phase.downloading", pid="\x00").split("\x00", 1)[0]
+        if (q_pre and t.startswith(q_pre)) or (d_pre and t.startswith(d_pre)):
+            self._set_downloading_status(t)
+            return
+        has_text = bool(t)
         self._phase_label.value = text if has_text else ""
         self._phase_row.visible = has_text
         try:
@@ -386,11 +409,11 @@ class MainView:
         except Exception:
             pass
 
-    def set_loading(self, busy: bool, message: str = "正在啟動...") -> None:
+    def set_loading(self, busy: bool, message: str = "") -> None:
         """Show / hide the modal preparing overlay (dim + spinner + message)."""
         with self._loading_lock:
             if busy and not self._loading_open:
-                self._loading_msg.value = message
+                self._loading_msg.value = message or i18n.t("main.loading.default")
                 try:
                     self._page.show_dialog(self._loading_dialog)
                 except Exception:
@@ -406,27 +429,29 @@ class MainView:
             self._page.update()
         except Exception:
             pass
+        # show_dialog/pop_dialog 引發的整頁重排會把 log 捲回最上方（按下停止
+        # 時最明顯）— 跟隨中就排程跳回底部，且 pending 旗標會吃掉重排產生的
+        # 「離底 END」事件，避免跟隨被誤關。
+        self._log_panel.notify_relayout()
 
     def set_running(self, is_running: bool) -> None:
-        self._btn_pause.disabled = not is_running
-        self._btn_stop.disabled = not is_running
-        self._btn_run_all.disabled = is_running
+        self._set_pill_enabled(self._btn_pause, is_running)
+        self._set_pill_enabled(self._btn_stop, is_running)
+        self._set_pill_enabled(self._btn_run_all, not is_running)
         self._cards_disabled = is_running
         # Reset pause toggle to "暫停" whenever the worker stops or a fresh
         # run starts, otherwise the button could keep saying "繼續" with no
         # active worker to resume.
+        self._is_paused = False
+        set_pill_label(self._btn_pause, i18n.t("main.btn.pause"))
+        set_pill_icon(self._btn_pause, "pause")
         if not is_running:
-            self._is_paused = False
-            self._btn_pause.content = "⏸ 暫停"
             self.set_phase("")
-        else:
-            self._is_paused = False
-            self._btn_pause.content = "⏸ 暫停"
 
     def _on_run_all(self, e: ft.ControlEvent) -> None:
         if self._run_controller is None:
             return
-        self._event_q.put(WorkerEvent("loading", (True, "正在啟動 一鍵執行...")))
+        self._event_q.put(WorkerEvent("loading", (True, i18n.t("main.loading.run_all"))))
         threading.Thread(
             target=self._run_in_background,
             args=(self._run_controller.run_all,),
@@ -438,7 +463,7 @@ class MainView:
             return
         if self._cards_disabled:
             return
-        self._event_q.put(WorkerEvent("loading", (True, f"正在啟動 步驟 {step}...")))
+        self._event_q.put(WorkerEvent("loading", (True, i18n.t("main.loading.step", step=step))))
         threading.Thread(
             target=self._run_in_background,
             args=(self._run_controller.run_step, step),
@@ -466,7 +491,8 @@ class MainView:
                 except Exception:
                     pass
             self._is_paused = False
-            self._btn_pause.content = "⏸ 暫停"
+            set_pill_label(self._btn_pause, i18n.t("main.btn.pause"))
+            set_pill_icon(self._btn_pause, "pause")
         else:
             if hasattr(t, "pause"):
                 try:
@@ -474,7 +500,8 @@ class MainView:
                 except Exception:
                     pass
             self._is_paused = True
-            self._btn_pause.content = "▶ 繼續"
+            set_pill_label(self._btn_pause, i18n.t("main.btn.resume"))
+            set_pill_icon(self._btn_pause, "play")
         try:
             self._btn_pause.update()
         except Exception:
@@ -495,11 +522,11 @@ class MainView:
         # show modal spinner until the worker finishes its finalize/cleanup
         # (writing pending PIDs, all_url snapshots, etc.).
         try:
-            self._btn_stop.disabled = True
+            self._set_pill_enabled(self._btn_stop, False)
             self._btn_stop.update()
         except Exception:
             pass
-        self._event_q.put(WorkerEvent("loading", (True, "正在停止，等待清理完成...")))
+        self._event_q.put(WorkerEvent("loading", (True, i18n.t("main.loading.stopping"))))
         try:
             t.stop()
         except Exception:
@@ -517,6 +544,13 @@ class MainView:
             self._event_q.put(WorkerEvent("loading", (False, "")))
 
     def build(self) -> ft.Column:
+        self.refresh_source_mode()
+        # Reflect 邊查邊下 in the initial card layout (merged 3+4 / step-4 hidden).
+        self.apply_combined_mode(self._read_combined_mode_setting())
+        # Paint any progress restored from a post-GC reattach so the bar shows
+        # "116 / 320" immediately instead of waiting for the next worker event.
+        self._paint_progress()
+        theme = current_theme(self._page)
         top_row = ft.Row(
             controls=[
                 self._btn_run_all,
@@ -529,39 +563,34 @@ class MainView:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             wrap=True,
         )
-        progress_row = ft.Row(
-            controls=[
-                self._progress_bar,
-                self._progress_text,
-                self._eta_text,
-                self._countdown_text,
-            ],
-            spacing=12,
+        control_area = glass_panel(
+            ft.Column(
+                controls=[
+                    self._mode_row,
+                    top_row,
+                    self._progress_row,
+                    self._page_progress_row,
+                    self._meta_row,
+                    self._phase_row,
+                ],
+                spacing=12,
+            ),
+            theme,
+        )
+        log_area = glass_panel(
+            ft.Column(
+                controls=[
+                    c.subhead(theme, i18n.t("main.log_title")),
+                    self._log_panel.control,
+                ],
+                expand=True,
+                spacing=8,
+            ),
+            theme,
+            expand=True,
         )
         return ft.Column(
-            controls=[
-                top_row,
-                progress_row,
-                self._phase_row,
-                ft.Divider(),
-                ft.Text("即時 Log", size=12, weight=ft.FontWeight.BOLD),
-                ft.Stack(
-                    controls=[
-                        ft.SelectionArea(
-                            content=ft.Container(
-                                content=self._log_list,
-                                expand=True,
-                                border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
-                                border_radius=4,
-                                padding=4,
-                            ),
-                        ),
-                        self._pill_overlay,
-                    ],
-                    expand=True,
-                    fit=ft.StackFit.EXPAND,
-                ),
-            ],
+            controls=[control_area, log_area],
             expand=True,
-            spacing=12,
+            spacing=theme.gap,
         )
