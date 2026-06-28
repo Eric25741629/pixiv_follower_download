@@ -208,12 +208,6 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         self.agent = agent
         self.download_time = (download_time if isinstance(download_time, datetime.datetime)
                               else datetime.datetime(1970, 1, 1))
-        # Last download_time value this worker knows the settings file holds
-        # (either loaded from it or emitted via "timechanged" for the GUI to
-        # persist). _apply_live_settings_if_changed only re-applies the
-        # setting when the stored raw differs from this — i.e. a real user
-        # edit — instead of rewinding the advancing counter on every save.
-        self._download_time_setting_raw = self.download_time.strftime('%Y-%m-%d %H:%M:%S')
         self.no_R18G_dir = no_R18G_dir
         self.no_R18_dir = no_R18_dir
         self.single_thread_mode = single_thread_mode
@@ -267,17 +261,6 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
         self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
         self._pid_filter_decision = {}
-
-    @staticmethod
-    def _parse_live_download_time(raw):
-        """Parse a settings ``download_time`` string into a datetime (epoch on error)."""
-        s = str(raw or "").strip()
-        if not s:
-            return datetime.datetime(1970, 1, 1)
-        try:
-            return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return datetime.datetime(1970, 1, 1)
 
     def _apply_live_settings_if_changed(self):
         """Re-pull in-scope settings when settings.json changed since last apply.
@@ -337,15 +320,12 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         self.nogif = bool(flt.get("nogif", False))
         self.notag = bool(flt.get("notag", False))
         self.notime = bool(flt.get("notime", False))
-        # Only re-apply download_time on a genuine user edit. The stored
-        # value also changes when the GUI persists our own "timechanged"
-        # emits — re-applying those would rewind the advancing counter and
-        # stamp duplicate timetags.
-        raw_dt = str(dl.get("download_time") or "").strip()
-        if raw_dt != getattr(self, "_download_time_setting_raw", None):
-            with self.timelock:
-                self.download_time = self._parse_live_download_time(raw_dt)
-            self._download_time_setting_raw = raw_dt
+        # download_time is deliberately NOT re-applied mid-run: stamps are
+        # pre-allocated per PID up front (assign_pid_timetags) and immutable for
+        # the run, so a live edit can't (and shouldn't) change already-assigned
+        # stamps — it is picked up at the next run's construction instead. (The
+        # old re-apply rewound the cursor to the stale file value because the
+        # up-front emit advances ahead of the GUI's write-back.)
 
         # output location (user opted in despite the split-output tradeoff)
         new_path = str(dl.get("path", "") or "").strip()
@@ -1227,10 +1207,11 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         else:
             sess = requests.Session()
         # Reserve ONE shared timetag for this PID so every page gets the same
-        # timestamp / filename prefix / mtime (an artwork = one moment). This is
-        # the single owner of the per-PID block for every Step 4 path (single /
-        # pool / scheduler) and combined mode, which all funnel through here.
-        self._begin_pid_timetag_block()
+        # timestamp / filename prefix / mtime (an artwork = one moment). Pre-
+        # allocated by assign_pid_timetags (keyed on pid), so this is an O(1)
+        # lookup with no lock. Single owner of the per-PID block for every Step 4
+        # path (single / pool / scheduler) and combined mode — all funnel here.
+        self._begin_pid_timetag_block(pid)
         try:
             with diag_log.span(diag_log.DOWNLOAD, f"PID {pid} 下載 ({len(urls)} 頁)"):
                 for idx, u in enumerate(urls):
@@ -1331,17 +1312,13 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
     def _emit_timechanged(self) -> None:
         """Push the advanced download_time so the GUI persists it.
 
-        Emitted at every PID completion (not just end-of-run): a crash, a
-        user stop, or combined mode (which never runs Step 4's finalize)
-        must not lose the advanced counter — that's how thousands of files
-        ended up sharing one timetag prefix.
+        Emitted once up front by ``assign_pid_timetags`` (which advances the
+        cursor past the whole pre-allocated block) and again at Step 4 finalize
+        to capture any lazy-fallback straggler advance. Since the cursor is
+        persisted before downloads start, a crash mid-run can never reuse stamps.
         """
         with self.timelock:
             value = self.download_time.strftime('%Y-%m-%d %H:%M:%S')
-        # Remember what we emitted: the GUI writes it back to settings, and
-        # _apply_live_settings_if_changed must not mistake that write-back
-        # for a user edit (re-applying it would rewind the live counter).
-        self._download_time_setting_raw = value
         with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("timechanged", value))
 
@@ -1493,7 +1470,6 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             total = getattr(self, "_step4_pid_total", len(pid_order))
             self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
             self._maybe_flush_url_meta_periodically(done)
-            self._emit_timechanged()
             if self._stop_event.is_set():
                 break
             # _sleep_between_downloads is a no-op when scheduler is set;
@@ -1547,7 +1523,6 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
                     self._step4_pid_done = done
                     self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
                     self._maybe_flush_url_meta_periodically(done)
-                    self._emit_timechanged()
         if pool_stopped:
             self._emit_output("<p><font color='orange'>下載池已停止：剩餘 PID 保留為未嘗試，下次執行續傳</font></p>")
         return failed_nested
@@ -1868,6 +1843,9 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             if getattr(self, "author_order", False):
                 self._emit_phase("步驟 4：依作者排序中...")
             pid_order, author_batches = self._resolve_execution_order(pid_order)
+            # Pre-allocate one timetag per PID by queue position (persists the
+            # advanced cursor once). Downloads then just look their stamp up.
+            self.assign_pid_timetags(pid_order)
             self._diag("step4_grouped", pid_count=len(pid_order), url_count=len(self.allurl))
             self._q.put(WorkerEvent("output",
                 f"<p><font color='gray'>[Step4] PID 分組完成：{len(pid_order)} 個 PID、{len(self.allurl)} 個 URL</font></p>"))

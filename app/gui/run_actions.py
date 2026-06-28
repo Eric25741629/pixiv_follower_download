@@ -575,14 +575,15 @@ class RunController(_CookieValidationMixin):
 
     @staticmethod
     def _parse_download_time(dt_str):
-        """Parse download_time setting; falls back to epoch on any error."""
+        """Parse download_time setting; falls back to the 2026 default start on
+        any error (empty / malformed), matching settings_store DEFAULTS."""
         s = str(dt_str or "").strip()
         if not s:
-            return datetime(1970, 1, 1)
+            return datetime(2026, 1, 1)
         try:
             return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
         except Exception:
-            return datetime(1970, 1, 1)
+            return datetime(2026, 1, 1)
 
     def _build_step4(self, auth, agent, dl, flt, perf, directory, jxl):
         dl_path = str(dl.get("path", "")).strip()

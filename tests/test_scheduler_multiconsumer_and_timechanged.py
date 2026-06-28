@@ -195,23 +195,27 @@ def test_non_network_exception_releases_neutral_and_propagates():
 
 # ── timechanged persistence ──────────────────────────────────────────────────
 
-def test_emit_timechanged_pushes_event_and_updates_tracker():
+def test_emit_timechanged_pushes_event():
     t = _make_thread(lambda label, fn: (True, fn(), None))
     t.download_time = datetime.datetime(2026, 6, 13, 12, 0, 5)
     t._emit_timechanged()
     evs = [e for e in t._q.events if e.type == "timechanged"]
     assert evs and evs[-1].data == "2026-06-13 12:00:05"
-    assert t._download_time_setting_raw == "2026-06-13 12:00:05"
 
 
-def test_pool_emits_timechanged_per_pid():
+def test_assign_persists_once_pool_does_not_emit_per_pid():
+    """Timetag persistence is now up-front (assign_pid_timetags), once — the pool
+    no longer emits a timechanged per PID."""
     t = _make_thread(lambda label, fn: (True, fn(), None))
     t._step4_pid_total = 1
     t._step4_pid_done = 0
     t._emit_phase = lambda *a: None
     t._maybe_flush_url_meta_periodically = lambda done: None
+    t._download_pid_group = lambda pid, urls: []  # isolate the emit cadence
+    t.assign_pid_timetags(["10"])
+    assert sum(1 for e in t._q.events if e.type == "timechanged") == 1
     t._execute_downloads_pool([["10"]], {"10": ["u"]})
-    assert any(e.type == "timechanged" for e in t._q.events)
+    assert sum(1 for e in t._q.events if e.type == "timechanged") == 1
 
 
 def test_pool_stop_skips_remaining_batches_and_does_not_count_success():

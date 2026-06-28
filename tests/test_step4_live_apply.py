@@ -100,7 +100,11 @@ def test_step4_apply_live_settings_refreshes_filters_paths_waits_and_jxl(tmp_pat
     assert t.nogif is True
     assert t.notag is True
     assert t.notime is True
-    assert t.download_time == datetime.datetime(2024, 1, 2, 3, 4, 5)
+    # download_time is deliberately NOT re-applied mid-run: stamps are
+    # pre-allocated per PID (assign_pid_timetags) and immutable for the run, so a
+    # live edit is ignored until the next run's construction. It stays at the
+    # value the thread was built with (epoch here), not the edited settings value.
+    assert t.download_time == datetime.datetime(1970, 1, 1)
     assert t.intra_pid_wait_min == 4
     assert t.intra_pid_wait_max == 4
     assert t._legacy_pid_cooldown_avg == 88

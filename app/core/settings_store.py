@@ -40,7 +40,7 @@ DEFAULTS = {
         "r18_like_num": 0,
         "ban_tag": [],
         "must_tag": [],
-        "download_time": "",
+        "download_time": "2026-01-01 00:00:00",
         "rule_tag_1": "",
         "rule_like_1": 0,
         "rule_tag_2": "",

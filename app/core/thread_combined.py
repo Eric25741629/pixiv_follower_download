@@ -388,6 +388,10 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             # progress denominator always matches what we actually iterate.
             order = self._resolve_combined_order(query_pids, download_only)
             total = len(order)
+            # Pre-allocate one timetag per PID by iteration position (persists the
+            # advanced cursor once). Combined never runs Step 4's finalize, so this
+            # up-front assign is the only place the cursor is advanced/persisted.
+            self.downloader.assign_pid_timetags([p for p, _ in order])
             self._q.put(WorkerEvent("progress", (0, total)))
             self._emit(
                 f"<p><font color='red'>待處理：查詢+下載 {len(query_pids)} 筆、"
@@ -439,11 +443,6 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             if needs_query and self._last_pid_ok:
                 self.fetcher._mark_pid_processed(pid)
             self._q.put(WorkerEvent("progress", (1, total)))
-            # Persist the advanced timetag counter after every PID — combined
-            # never runs Step 4's finalize, so without this the next run reuses
-            # the same download_time start and stamps duplicate filename prefixes.
-            with contextlib.suppress(Exception):
-                self.downloader._emit_timechanged()
         return failed_nested
 
     def _run_concurrent(self, order, total, workers):
@@ -518,8 +517,6 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                         self._handle_worker_result(result, failed_nested)
                         done += 1
                         self._q.put(WorkerEvent("progress", (1, total)))
-                        with contextlib.suppress(Exception):
-                            self.downloader._emit_timechanged()
                         self._emit_aggregate_phase(done, total, workers)
                     if stop_now or self._stop_event.is_set():
                         continue  # drain remaining in-flight, submit no more

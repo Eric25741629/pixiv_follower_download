@@ -293,8 +293,9 @@ class _Step4MediaMixin:
         return download_url, delay_info, need_cookie
 
     def gif_download(self, url, session=None):
-        with self.timelock:
-            my_time = self.download_time
+        # Inside _download_pid_group's block this returns the PID's pre-allocated
+        # shared stamp; outside a block it falls back to a lazy reserve.
+        my_time = self._reserve_one_timetag()
         try:
             pid, pid_cookie, need_cookie = self._resolve_pid_and_cookie(url, source="step4")
             normalized = self._load_artwork_metadata(pid, pid_cookie)
@@ -349,20 +350,44 @@ class _Step4MediaMixin:
         '(KHTML, like Gecko) Chrome/99.0.4844.82 Safari/537.36'
     )
 
-    def _begin_pid_timetag_block(self, n=1):
-        """Reserve ONE shared timetag for the calling thread's current PID.
+    def assign_pid_timetags(self, pid_order):
+        """Pre-allocate one timetag per PID, by queue position, BEFORE downloads.
 
-        Every page of the PID gets this single stamp (see ``_reserve_one_timetag``),
-        so an artwork's pages share one timestamp / filename prefix / mtime. The
-        global ``download_time`` advances by exactly 1 s under ``timelock``, so
-        the next PID gets a distinct stamp and concurrent PIDs on other threads
-        reserve disjoint stamps. Uniqueness of each file is carried by
-        ``PID{pid}{page_suffix}``, not the timetag, so a shared stamp is
-        collision-safe. ``n`` is accepted for back-compat and ignored.
+        Each PID gets ``base + (its index) seconds``; every page of the PID then
+        shares that one stamp via the O(1) lookup in ``_begin_pid_timetag_block``
+        — no lock, no global-counter race while concurrent PIDs download. The
+        global ``download_time`` is advanced past the whole block and persisted
+        ONCE here (``_emit_timechanged``), so a crash mid-run can never reuse
+        stamps. A partial run leaves the unused tail seconds as harmless gaps:
+        the timetag is only a sort key; filename uniqueness is carried by
+        ``PID{pid}{page_suffix}``.
         """
-        with self.timelock:
-            base = self.download_time
-            self.download_time = self.download_time + datetime.timedelta(seconds=1)
+        base = self.download_time
+        self._pid_timetag = {
+            str(pid): base + datetime.timedelta(seconds=i)
+            for i, pid in enumerate(pid_order)
+        }
+        if pid_order:
+            self.download_time = base + datetime.timedelta(seconds=len(pid_order))
+            self._emit_timechanged()
+
+    def _begin_pid_timetag_block(self, pid=None):
+        """Reserve this thread's shared timetag for the calling PID's pages.
+
+        Pre-allocated (``assign_pid_timetags``) -> O(1) map lookup, no lock.
+        Otherwise (a requeued / never-assigned straggler) fall back to the legacy
+        lazy +1 s reserve under ``timelock``. Either way every page of the PID
+        gets this single stamp (see ``_reserve_one_timetag``), so an artwork's
+        pages share one timestamp / filename prefix / mtime. Uniqueness of each
+        file is carried by ``PID{pid}{page_suffix}``, not the timetag, so a
+        shared (or even repeated) stamp is collision-safe.
+        """
+        mapping = getattr(self, "_pid_timetag", None)
+        base = mapping.get(str(pid)) if (mapping is not None and pid is not None) else None
+        if base is None:
+            with self.timelock:
+                base = self.download_time
+                self.download_time = self.download_time + datetime.timedelta(seconds=1)
         self._timetag_block_local.base = base
 
     def _end_pid_timetag_block(self):

@@ -33,6 +33,13 @@ def test_load_missing_returns_defaults(tmp_path):
     assert data["jxl"]["effort"] == 7
 
 
+def test_default_download_time_start_is_2026(tmp_path):
+    """Fresh installs default the timetag start to 2026-01-01, not the epoch."""
+    assert DEFAULTS["download"]["download_time"] == "2026-01-01 00:00:00"
+    data = SettingsStore(str(tmp_path)).load()
+    assert data["download"]["download_time"] == "2026-01-01 00:00:00"
+
+
 def test_load_existing_settings(tmp_path):
     _write(tmp_path, "settings.json", {"download": {"path": "/my/path", "like_num": 500}})
     store = SettingsStore(str(tmp_path))
