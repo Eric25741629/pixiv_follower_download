@@ -104,6 +104,14 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
         self._page_progress_total = 0
         self._page_progress_pid = ""
 
+        # ── per-worker lanes (parallel 邊查邊下): one row per concurrent worker,
+        # built dynamically from the lanes_init event; hidden otherwise. Scrolls
+        # with a height cap (set in init_lanes) so a high worker count can't push
+        # the log / pause-stop controls off-screen.
+        self._lane_rows = {}
+        self._lane_panel = ft.Column(controls=[], spacing=6, visible=False,
+                                     scroll=ft.ScrollMode.AUTO)
+
         # ── meta line (正在下載 PID + ETA + cooldown countdown) ──────────────
         # 獨立於第二進度條：單頁作品會隱藏分頁條（t<=1），但「正在下載：PID」
         # 與倒數計時必須照常顯示，所以放在永遠可見的 meta 列上。
@@ -570,6 +578,7 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
                     top_row,
                     self._progress_row,
                     self._page_progress_row,
+                    self._lane_panel,
                     self._meta_row,
                     self._phase_row,
                 ],

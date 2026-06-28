@@ -185,6 +185,99 @@ class _MainProgressMixin:
         self._hide_page_progress_bar()
         self._set_downloading_pid("")
 
+    # ── per-worker lanes (parallel combined mode) ────────────────────────────
+    # One row per concurrent worker: [cookie alias] [page bar] [PID 分頁 m/n].
+    # Driven by lanes_init / lane / lanes_clear events; the panel is hidden
+    # unless a concurrent run is active (sequential runs keep the single 本作分頁
+    # bar above).
+    def _make_lane_row(self):
+        theme = current_theme(self._page)
+        bar = GlassProgressBar(
+            color=theme.info, bar_height=_PROG_BAR_HEIGHT, radius=_PROG_BAR_RADIUS,
+        )
+        alias = ft.Text("", size=12, color=theme.text_secondary,
+                        width=_PROG_LEAD_W, no_wrap=True)
+        status = ft.Text("", size=13, color=theme.text_primary,
+                         weight=ft.FontWeight.W_600, width=_PROG_TRAIL_W,
+                         text_align=ft.TextAlign.LEFT)
+        # Start hidden: the visible False->True toggle on first real data forces
+        # Flet 0.84 to (re)lay out the row with content. A row first laid out with
+        # empty children renders degenerate and later .value patches never reflow
+        # it — the documented 整體進度/本作分頁 freeze (see _render_progress_row).
+        row = ft.Row(
+            controls=[alias, bar.track, status],
+            spacing=_PROG_ROW_SPACING,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            visible=False,
+        )
+        return {"bar": bar, "alias": alias, "status": status, "row": row,
+                "state": {"alias": "", "pid": "", "state": "", "page": 0, "total": 0}}
+
+    def init_lanes(self, count) -> None:
+        try:
+            n = int(count)
+        except (TypeError, ValueError):
+            return
+        self._lane_rows = {}
+        rows = []
+        for slot in range(max(0, n)):
+            lane = self._make_lane_row()
+            self._lane_rows[slot] = lane
+            rows.append(lane["row"])
+        self._lane_panel.controls = rows
+        self._lane_panel.visible = n > 0
+        # Cap the panel height past ~6 lanes so a large worker count scrolls
+        # instead of squeezing the log / controls off-screen (~34px per row).
+        self._lane_panel.height = (min(n, 6) * 34) if n > 6 else None
+        self._safe_update(self._lane_panel)
+
+    def update_lane(self, slot, **fields) -> None:
+        try:
+            s = int(slot)
+        except (TypeError, ValueError):
+            return
+        lane = (getattr(self, "_lane_rows", None) or {}).get(s)
+        if lane is None:
+            return
+        st = lane["state"]
+        for k in ("alias", "pid", "state", "page", "total"):
+            if k in fields and fields[k] is not None:
+                st[k] = fields[k]
+        self._render_lane(lane)
+
+    def _render_lane(self, lane) -> None:
+        st = lane["state"]
+        alias = str(st.get("alias") or "")
+        pid = str(st.get("pid") or "")
+        state = str(st.get("state") or "")
+        try:
+            page = int(st.get("page") or 0)
+            total = int(st.get("total") or 0)
+        except (TypeError, ValueError):
+            page, total = 0, 0
+        lane["alias"].value = alias or "—"
+        if state == "下載" and total > 0:
+            lane["bar"].value = max(0.0, min(1.0, page / total))
+            lane["status"].value = i18n.t("main.lane.downloading", pid=pid, page=page, total=total)
+        elif state == "下載":
+            lane["bar"].value = 0
+            lane["status"].value = i18n.t("main.lane.downloading_started", pid=pid)
+        elif state == "查詢":
+            lane["bar"].value = 0
+            lane["status"].value = i18n.t("main.lane.querying", pid=pid)
+        else:  # 等待 / cooldown between PIDs
+            lane["bar"].value = 0
+            lane["status"].value = i18n.t("main.lane.waiting")
+        # Reveal on first real data — the load-bearing reflow toggle.
+        lane["row"].visible = True
+        self._safe_update(lane["row"])
+
+    def clear_lanes(self) -> None:
+        self._lane_rows = {}
+        self._lane_panel.controls = []
+        self._lane_panel.visible = False
+        self._safe_update(self._lane_panel)
+
     def _format_eta(self, now: float) -> str:
         if self._progress_started_at is None:
             return ""

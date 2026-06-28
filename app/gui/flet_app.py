@@ -576,6 +576,19 @@ def main(page: ft.Page) -> None:
     def handle_page_progress(data) -> None:
         _handle_page_progress_event(main_view, data)
 
+    def handle_lanes_init(data) -> None:
+        count = data.get("count") if isinstance(data, dict) else data
+        main_view.init_lanes(count)
+
+    def handle_lane(data) -> None:
+        if isinstance(data, dict) and "slot" in data:
+            slot = data.get("slot")
+            fields = {k: v for k, v in data.items() if k != "slot"}
+            main_view.update_lane(slot, **fields)
+
+    def handle_lanes_clear(data) -> None:
+        main_view.clear_lanes()
+
     def handle_countdown(data: int) -> None:
         main_view.update_countdown(data)
         try:
@@ -608,6 +621,7 @@ def main(page: ft.Page) -> None:
         _PERSISTENT_UI_STATE["loading_open"] = False
         _PERSISTENT_UI_STATE["loading_message"] = ""
         main_view.clear_page_progress()
+        main_view.clear_lanes()
 
     def handle_next(data: int) -> None:
         global _PERSISTENT_ACTIVE_THREAD
@@ -630,6 +644,7 @@ def main(page: ft.Page) -> None:
             _PERSISTENT_UI_STATE["countdown"] = 0
             _PERSISTENT_UI_STATE["phase"] = ""
             main_view.clear_page_progress()
+            main_view.clear_lanes()
             return
         for i, st in enumerate(main_view._step_states):
             if st == "running":
@@ -688,6 +703,9 @@ def main(page: ft.Page) -> None:
         "output":        handle_output,
         "progress":      handle_progress,
         "page_progress": handle_page_progress,
+        "lanes_init":    handle_lanes_init,
+        "lane":          handle_lane,
+        "lanes_clear":   handle_lanes_clear,
         "countdown":     handle_countdown,
         "finished":      handle_finished,
         "next":          handle_next,

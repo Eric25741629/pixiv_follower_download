@@ -12,6 +12,7 @@ from app.core.combined_progress_queues import (
     _CombinedPageProgressQueue,
     _DropOverallProgressQueue,
     _DropProgressQueue,
+    _LaneProgressQueue,
 )
 from app.core.combined_work_lists import _CombinedWorkListsMixin
 import pixiv_api
@@ -115,6 +116,11 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         # Concurrent-mode bookkeeping (only used when combined_workers > 1).
         self._active_lock = threading.Lock()
         self._active_pids = {}
+        # Per-thread lane context for the parallel per-worker panel. Created here
+        # (not just in _run_concurrent) so sequential mode's finally `del
+        # self._lane_ctx_local.ctx` finds the attribute and is a clean no-op
+        # rather than a suppressed AttributeError on every PID.
+        self._lane_ctx_local = threading.local()
 
         self.fetcher = thread_url_fetch.get_img_url_thread(
             q=q, Author_list=Author_list, Agent=Agent, cookies=cookies,
@@ -190,8 +196,34 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         self._last_pid_ok = ok
         return failed
 
+    def _emit_lane(self, slot, **fields):
+        """Push a partial lane-row update (parallel mode per-worker panel).
+
+        No-op when ``slot is None`` (sequential mode). The UI merges the provided
+        fields into lane ``slot``'s row. Low volume (one per page / per state
+        change), keyed by slot, so K lanes can't flood the dispatcher."""
+        if slot is None:
+            return
+        data = {"slot": int(slot)}
+        data.update(fields)
+        with contextlib.suppress(Exception):
+            self._q.put(WorkerEvent("lane", data))
+
+    def _lane_download(self, pid, urls):
+        """Download one PID's pages, resetting this thread's lane page counter at
+        the START of each attempt. _run_with_network_retry re-invokes this on a
+        proxy/connection error, and _download_pid_group re-runs every url; without
+        the reset the _LaneProgressQueue would keep accumulating (capped at total)
+        and show ~100% for a PID that is actually re-downloading or will end
+        pending. Resetting per attempt keeps the lane bar honest."""
+        ctx = getattr(self._lane_ctx_local, "ctx", None)
+        if ctx is not None:
+            ctx["page"] = 0
+        return self.downloader._download_pid_group(pid, urls)
+
     def _process_one_pid_core(self, pid, needs_query, *, emit_phase,
-                              page_progress, drop_overall_inline, apply_live):
+                              page_progress, drop_overall_inline, apply_live,
+                              slot=None):
         """Core query+download for one PID. Returns ``(failed, ok)``.
 
         ``failed is None`` signals acquire returned no account (stop / all
@@ -215,6 +247,9 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 phase_key = "log.phase.querying" if needs_query else "log.phase.downloading"
                 self._q.put(WorkerEvent("phase", i18n.t(phase_key, pid=pid)))
         diag_log.log(diag_log.WORKER, f"PID {pid} 開始 (needs_query={needs_query})")
+        # Lane shows "等待 cookie" during the acquire wait — that wait IS the
+        # per-account cooldown, so the user sees each lane pause between PIDs.
+        self._emit_lane(slot, pid=str(pid), alias="", state="等待", page=0, total=0)
         # The acquire span's elapsed time IS the visible cooldown wait. When it
         # logs ~0.00s the account was ready immediately (cooldown absorbed by the
         # previous PID's download) — that is exactly why no 倒數 shows.
@@ -224,6 +259,10 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             diag_log.log(diag_log.WORKER, f"PID {pid} acquire -> None (stop/all-disabled)")
             return None, False  # stop / all disabled -> caller breaks
         diag_log.log(diag_log.WORKER, f"PID {pid} 取得帳號 alias={getattr(acc, 'alias', '?')}")
+        # Lane now shows which cookie this worker holds + whether it is querying.
+        if slot is not None:
+            self._emit_lane(slot, pid=str(pid), alias=getattr(acc, "alias", ""),
+                            state="查詢" if needs_query else "下載", page=0, total=0)
         sess = pixiv_api.make_session(acc.proxy_url)
         failed = []
         ok = True
@@ -278,7 +317,21 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 # it over acc's IP — a mismatch Pixiv anti-fraud flags. Mirrors
                 # standalone Step 4 (_download_pid_with_scheduler).
                 self.downloader._pid_cookie_selection[normalize_pid(pid) or str(pid)] = acc.cookie
-                if page_progress:
+                if slot is not None:
+                    # Per-worker lane: seed the bar at 0/total, then set this
+                    # thread's ctx so the phase-wide _LaneProgressQueue streams
+                    # per-file progress into this slot's row. Downloads call the
+                    # shared downloader directly — NO per-PID queue swap (that
+                    # would race on the shared downloader._q across K workers).
+                    _alias = getattr(acc, "alias", "")
+                    self._emit_lane(slot, pid=str(pid), alias=_alias,
+                                    state="下載", page=0, total=len(urls))
+                    self._lane_ctx_local.ctx = {
+                        "slot": slot, "pid": str(pid), "alias": _alias,
+                        "total": len(urls), "page": 0,
+                    }
+                    _download_call = lambda: self._lane_download(pid, urls)
+                elif page_progress:
                     _download_call = lambda: self._download_pid_group_with_page_progress(pid, urls)
                 else:
                     _download_call = lambda: self.downloader._download_pid_group(pid, urls)
@@ -313,10 +366,18 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             else:
                 if page_progress:
                     self._clear_page_progress()
+                # A PID that resolved to zero usable urls (revoked / filtered /
+                # query exhausted) must not leave its lane stuck on 查詢/下載.
+                if slot is not None:
+                    self._emit_lane(slot, pid="", alias="", state="等待", page=0, total=0)
         except Exception:
             neutral = True  # non-network failure: not the cookie's fault
             raise
         finally:
+            # Drop this thread's lane ctx so a later stray "progress" can't be
+            # mis-attributed to the finished PID.
+            with contextlib.suppress(AttributeError):
+                del self._lane_ctx_local.ctx
             self.downloader._clear_current_download_account()
             # Stop mid-PID or a non-network error releases NEUTRALLY: don't credit
             # the cookie with a success (ok=True would refresh its trust window for
@@ -449,29 +510,46 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         """K-way concurrent variant of :meth:`_run_sequential`.
 
         Each worker queries+downloads one PID on its own account (the
-        scheduler's ``held`` flag guarantees distinct cookies). Workers emit NO
-        progress/phase events (the engines' queues are swapped to a drop filter
-        for the whole phase, and the core runs with the suppress flags); this
-        run() thread is the sole coordinator — it owns overall progress, the
-        pending-tracker retire, timetag persistence, and the lightweight
-        aggregate phase line. That single-producer discipline is what prevents
-        the event flood that froze the GUI in the reverted Phase 1.
+        scheduler's ``held`` flag guarantees distinct cookies). The coordinator
+        (this run() thread) stays the SOLE producer of OVERALL progress (one tick
+        per finished PID), the pending-tracker retire, and the aggregate phase
+        line — so the 整體進度 bar can never be raced. Workers emit only their own
+        low-rate, slot-keyed ``lane`` events (one per page, throttled in
+        :class:`_LaneProgressQueue`) for the per-worker panel; the fetcher's query
+        ``progress`` is still dropped (``_DropProgressQueue``). This bounded,
+        single-overall-producer discipline is what keeps the GUI responsive
+        (the reverted Phase 1 flooded the dispatcher with unbounded per-page
+        events from every engine).
         """
         failed_nested = []
         self._active_pids = {}
+        # Per-worker lane slots: each in-flight PID claims a distinct index in
+        # [0, workers) for its UI row; freed on the worker's exit and reused.
+        self._free_slots = list(range(workers))
+        self._slot_lock = threading.Lock()
+        # self._lane_ctx_local (created in __init__) is the per-thread lane ctx
+        # read by the shared _LaneProgressQueue — thread-local so K workers
+        # sharing one downloader._q never clobber each other's page counters.
+        self._q.put(WorkerEvent("lanes_init", {"count": workers}))
         # Apply mid-run settings ONCE up front; workers skip the per-PID re-apply
         # to avoid concurrent mutation of the shared engines.
         with contextlib.suppress(Exception):
             self.fetcher._apply_live_settings_if_changed()
             self.downloader._apply_live_settings_if_changed()
-        # Swap both engines' queues to drop progress/page_progress for the whole
-        # concurrent phase (restored in finally). Other events pass through.
+        # Phase-wide queue swaps (restored in finally). The fetcher's overall
+        # query "progress" is dropped. The downloader's queue is set ONCE to a
+        # _LaneProgressQueue that turns each per-file "progress" into a slot-keyed
+        # "lane" event using the CALLING THREAD's ctx — set/cleared by each worker
+        # around its own download. Installing it once (not per-PID) avoids racing
+        # on the shared downloader._q. Other events (output / countdown / lane /
+        # phase / finished / next) pass through.
         prev_fq, prev_dq = self.fetcher._q, self.downloader._q
         self.fetcher._q = _DropProgressQueue(prev_fq)
-        self.downloader._q = _DropProgressQueue(prev_dq)
+        self.downloader._q = _LaneProgressQueue(
+            prev_dq, lambda: getattr(self._lane_ctx_local, "ctx", None))
         done = 0
         try:
-            items = iter(list(enumerate(order)))
+            items = enumerate(order)
 
             def _next_item():
                 for ordinal, (pid, needs) in items:
@@ -525,21 +603,34 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                             break
         finally:
             self.fetcher._q, self.downloader._q = prev_fq, prev_dq
+            with contextlib.suppress(Exception):
+                self._q.put(WorkerEvent("lanes_clear", None))
         return failed_nested
+
+    def _claim_slot(self):
+        with self._slot_lock:
+            return self._free_slots.pop(0) if self._free_slots else None
+
+    def _release_slot(self, slot):
+        if slot is None:
+            return
+        with self._slot_lock:
+            self._free_slots.append(slot)
 
     def _process_one_pid_worker(self, pid, needs_query, ordinal):
         """Concurrent worker body. Returns ``(pid, needs_query, failed, ok)`` or
-        ``None`` (acquire -> stop/all-disabled). Emits no progress/phase; the
-        coordinator handles those from the returned result."""
+        ``None`` (acquire -> stop/all-disabled). Emits per-worker lane events
+        (keyed by a claimed slot); the coordinator owns overall progress."""
         if self._stop_event.is_set():
             return None
+        slot = self._claim_slot()
         with self._active_lock:
             self._active_pids[str(pid)] = "查詢" if needs_query else "下載"
         try:
             failed, ok = self._process_one_pid_core(
                 pid, needs_query,
                 emit_phase=False, page_progress=False, drop_overall_inline=False,
-                apply_live=False,
+                apply_live=False, slot=slot,
             )
             if failed is None:
                 return None
@@ -547,6 +638,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         finally:
             with self._active_lock:
                 self._active_pids.pop(str(pid), None)
+            self._release_slot(slot)
 
     def _handle_worker_result(self, result, failed_nested):
         """Coordinator-side per-PID bookkeeping (run thread only — serialized)."""
