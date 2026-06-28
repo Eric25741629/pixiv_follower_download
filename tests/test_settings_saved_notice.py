@@ -47,8 +47,7 @@ def test_settings_saved_notice_emits_live_and_next_run_messages(tmp_path):
 
     _write_settings(
         tmp_path,
-        download={"like_num": 99},
-        performance={"single_thread_mode": True},
+        download={"like_num": 99, "combined_workers": 3},
     )
 
     rc.notify_settings_saved()
@@ -59,7 +58,7 @@ def test_settings_saved_notice_emits_live_and_next_run_messages(tmp_path):
     assert "已即時套用" in html
     assert "最低讚數" in html
     assert "將於下次執行套用" in html
-    assert "單執行緒" in html
+    assert "同時處理作品數" in html
 
 
 def test_settings_saved_notice_skips_when_no_active_thread(tmp_path):

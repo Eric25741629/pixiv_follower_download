@@ -50,6 +50,13 @@ def _coerce_int(value, default: int) -> int:
         return default
 
 
+def _single_thread_from_workers(dl) -> bool:
+    """Single concurrency dial: 「同時處理作品數」(download.combined_workers) <= 1
+    means run every step (2/3/4 + combined) single-threaded. Replaces the old
+    standalone performance.single_thread_mode switch."""
+    return _coerce_int(dl.get("combined_workers", 1), 1) <= 1
+
+
 def _data_path() -> str:
     p = os.getenv("APPDATA") + r"/pixiv_download/"
     os.makedirs(p, exist_ok=True)
@@ -242,7 +249,7 @@ class RunController(_CookieValidationMixin):
         "download.source_mode": "作品來源",
         "download.following_scope": "追隨範圍",
         "download.bookmark_scope": "收藏範圍",
-        "performance.single_thread_mode": "單執行緒",
+        "download.combined_workers": "同時處理作品數",
         "download.author_order": "依作者順序下載",
         "download.force_full_rescan": "強制完整重掃",
     }
@@ -417,7 +424,7 @@ class RunController(_CookieValidationMixin):
             path,
             self._attach_aliases(valid_cookies, auth),
             MetadataDB(path).closed_artwork_set(),
-            bool(perf.get("single_thread_mode", False)),
+            _single_thread_from_workers(dl),
             stats_collector=self._stats_collector,
             event_log=self._event_log,
             author_order=bool(dl.get("author_order", False)),
@@ -510,7 +517,7 @@ class RunController(_CookieValidationMixin):
             r18_like_num=int(dl.get("r18_like_num", 0)),
             no_to_check=[],
             base_path=path,
-            single_thread_mode=bool(perf.get("single_thread_mode", False)),
+            single_thread_mode=_single_thread_from_workers(dl),
             pid_wait_nocookie_min=int(perf.get("pid_wait_nocookie_min", 1)),
             pid_wait_nocookie_max=int(perf.get("pid_wait_nocookie_max", 6)),
             special_like_rules=[],
@@ -541,7 +548,7 @@ class RunController(_CookieValidationMixin):
             must_tag=list(dl.get("must_tag", [])),
             like_num=int(dl.get("like_num", 0)),
             r18_like_num=int(dl.get("r18_like_num", 0)), no_to_check=[], base_path=path,
-            single_thread_mode=bool(perf.get("single_thread_mode", False)),
+            single_thread_mode=_single_thread_from_workers(dl),
             download_path=dl_path,
             download_time=self._parse_download_time(dl.get("download_time")),
             nogif=bool(flt.get("nogif", False)), notag=bool(flt.get("notag", False)),
@@ -607,7 +614,7 @@ class RunController(_CookieValidationMixin):
             download_time=dt,
             no_R18G_dir=bool(directory.get("no_R18G_dir", False)),
             no_R18_dir=bool(directory.get("no_R18_dir", False)),
-            single_thread_mode=bool(perf.get("single_thread_mode", False)),
+            single_thread_mode=_single_thread_from_workers(dl),
             intra_pid_wait_min=int(perf.get("intra_pid_wait_min", 5)),
             intra_pid_wait_max=int(perf.get("intra_pid_wait_max", 15)),
             jxl_enable=bool(jxl.get("enable", False)),

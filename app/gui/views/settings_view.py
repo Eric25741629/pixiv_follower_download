@@ -263,7 +263,6 @@ class SettingsView(_SettingsHandlersMixin):
             size=11,
             color=self._cooldown_hint_color(cooldown_avg),
         )
-        self._sw_single_thread = c.switch(theme, label=i18n.t("settings.adv.single_thread"), value=bool(perf.get("single_thread_mode", False)))
 
         # Proxy controls
         proxy_pool = auth.get("proxy_pool") or []
@@ -506,7 +505,6 @@ class SettingsView(_SettingsHandlersMixin):
             },
             "performance": {
                 **store.get_section("performance"),
-                "single_thread_mode": self._sw_single_thread.value,
                 "pid_cooldown_avg": self._safe_int_cooldown(),
                 "pid_wait_nocookie_min": self._clamp_wait(self._tf_nocookie_min, 3, lo=1),
                 "pid_wait_nocookie_max": self._clamp_wait_max(self._tf_nocookie_min, self._tf_nocookie_max, 3, 8),
@@ -680,7 +678,6 @@ class SettingsView(_SettingsHandlersMixin):
                          self._tf_nocookie_min, ft.Text("~", color=theme.text_secondary), self._tf_nocookie_max],
                         spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
-                    self._sw_single_thread,
                     c.subhead(theme, i18n.t("settings.sub.schedule")),
                     self._sw_schedule_enabled,
                     self._dd_schedule_mode,
