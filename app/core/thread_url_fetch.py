@@ -2,7 +2,6 @@ import contextlib
 import os
 import datetime
 import random as pyrandom
-import requests
 from queue import Queue
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
@@ -19,6 +18,7 @@ from app.core.pixiv_thread_utils import (
     to_int_lenient,
 )
 from app.core.pixiv_thread_base import (
+    _NETWORK_RETRY_EXCEPTIONS,
     PauseableThread,
     _normalize_special_like_rules,
 )
@@ -818,9 +818,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             if pid_cookie:
                 return Pixiv_info(url, Agent=Agent, cookie=pid_cookie, session=session)
             return Pixiv_info(url, Agent=Agent, session=session)
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
+        except _NETWORK_RETRY_EXCEPTIONS:
             raise
         except Exception as e:
             self._step3_safe_emit(
@@ -860,9 +858,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             info = self._step3_fetch_artwork_info(url, Agent, pid_key, pid_cookie, session)
             if self._stats_collector is not None:
                 self._stats_collector.report_request(label)
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
+        except _NETWORK_RETRY_EXCEPTIONS:
             raise
         except Exception:
             return None

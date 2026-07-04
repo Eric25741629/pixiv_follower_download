@@ -27,6 +27,7 @@ from PIL import Image
 from app.core.image_integrity import validate_image_file
 
 from app.core.pixiv_thread_base import (
+    _NETWORK_RETRY_EXCEPTIONS,
     DOWNLOAD_CONNECT_TIMEOUT,
     DOWNLOAD_READ_TIMEOUT,
     DownloadDeadlineExceeded,
@@ -166,9 +167,7 @@ class _Step4MediaMixin:
                 url, headers=headers, stream=True,
                 timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
             )
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
+        except _NETWORK_RETRY_EXCEPTIONS:
             raise
         except Exception:
             return None
@@ -327,9 +326,7 @@ class _Step4MediaMixin:
                 self._stats_collector.report_file(True)
             self._enqueue_jxl(saved_gif_path)
             return 0
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
+        except _NETWORK_RETRY_EXCEPTIONS:
             # Network/proxy failures must propagate so the scheduler-aware caller
             # can disable the cookie/proxy for this run.
             raise
@@ -585,9 +582,7 @@ class _Step4MediaMixin:
         for i in range(0, 5):  # 最多重試 5 次，失敗就回傳錯誤
             try:
                 return self._jpg_attempt(url, session, timetag, meta_cache)
-            except (requests.exceptions.ProxyError,
-                    requests.exceptions.ConnectTimeout,
-                    requests.exceptions.ConnectionError):
+            except _NETWORK_RETRY_EXCEPTIONS:
                 # Bypass the retry loop entirely — the proxy is dead, retrying
                 # against the same proxy will not help. Let the scheduler disable
                 # this cookie via release(ok=False).
