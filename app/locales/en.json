@@ -132,6 +132,7 @@
 
   "settings.save": "Save settings",
   "settings.saved": "Settings saved",
+  "settings.unsaved": "You have unsaved settings",
   "settings.cooldown_warn.title": "Cooldown is short",
   "settings.cooldown_warn.body": "Average cooldown {avg}s is below the recommended 30s,\nwhich may increase the risk of Pixiv rate-limit detection. Apply anyway?",
   "settings.cooldown_warn.confirm": "Apply anyway",

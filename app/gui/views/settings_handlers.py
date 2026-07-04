@@ -124,6 +124,7 @@ class _SettingsHandlersMixin:
             self._label_cooldown_hint.update()
         except Exception:
             pass
+        self._mark_dirty()
 
     def _on_cooldown_tf_change(self, e: ft.ControlEvent) -> None:
         try:
@@ -140,6 +141,7 @@ class _SettingsHandlersMixin:
             self._label_cooldown_hint.update()
         except Exception:
             pass
+        self._mark_dirty()
 
     def _safe_int_cooldown(self) -> int:
         try:

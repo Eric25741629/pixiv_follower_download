@@ -22,7 +22,10 @@ class _FakePage:
         self.services = _FakeServices()
 
 
-def _tile_titles(column):
+def _tile_titles(root):
+    # build() returns ft.Stack([Column, unsaved_bar]); the scrollable Column of
+    # sections is controls[0]. Unwrap it before reading the section titles.
+    column = getattr(root, "controls", [root])[0]
     titles = []
     for control in getattr(column, "controls", []):
         # Liquid-glass migration: each ExpansionTile is wrapped in a glass

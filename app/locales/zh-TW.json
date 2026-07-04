@@ -132,6 +132,7 @@
 
   "settings.save": "儲存設定",
   "settings.saved": "設定已儲存",
+  "settings.unsaved": "有設定尚未儲存",
   "settings.cooldown_warn.title": "冷卻時間偏短",
   "settings.cooldown_warn.body": "平均冷卻 {avg} 秒低於建議值 30 秒，\n可能被 Pixiv 風控偵測。確定要套用？",
   "settings.cooldown_warn.confirm": "確定套用",
