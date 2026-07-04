@@ -309,16 +309,8 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         jxl = s.get("jxl", {}) or {}
 
         # filters (tighten-only for Step 4: the queue is already built)
-        try:
-            like = int(dl.get("like_num", 0) or 0)
-        except (TypeError, ValueError):
-            like = 0
-        self.like_num = like if like > 0 else 0
-        self.ban_tag = list(dl.get("ban_tag", []) or [])
-        self.must_tag = list(dl.get("must_tag", []) or [])
+        self._apply_live_filter_fields(dl)
         self.special_like_rules = list(dl.get("special_like_rules", []) or [])
-        self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
-        self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
         self.nogif = bool(flt.get("nogif", False))
         self.notag = bool(flt.get("notag", False))
         self.notime = bool(flt.get("notime", False))
