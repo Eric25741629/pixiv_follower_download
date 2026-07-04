@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 
+from app.core.metadata_db_schema import ARTWORK_UPSERT_SET_CLAUSE
+
 
 class _MigrationMixin:
     """Bulk JSON-import / export methods, mixed into ``MetadataDB``."""
@@ -46,17 +48,7 @@ class _MigrationMixin:
             "upload_date, create_date, user_id, user_name) "
             "VALUES (?, COALESCE(?, datetime('now')), ?, ?, ?, ?, ?, "
             "COALESCE(?, datetime('now')), ?, ?, ?, ?) "
-            "ON CONFLICT(pid) DO UPDATE SET "
-            "page_count       = COALESCE(excluded.page_count, artworks.page_count), "
-            "like_count       = COALESCE(excluded.like_count, artworks.like_count), "
-            "tags             = COALESCE(excluded.tags, artworks.tags), "
-            "img_url_template = COALESCE(excluded.img_url_template, artworks.img_url_template), "
-            "requires_cookie  = COALESCE(excluded.requires_cookie, artworks.requires_cookie), "
-            "meta_updated_at  = COALESCE(excluded.meta_updated_at, artworks.meta_updated_at), "
-            "upload_date      = COALESCE(excluded.upload_date, artworks.upload_date), "
-            "create_date      = COALESCE(excluded.create_date, artworks.create_date), "
-            "user_id          = COALESCE(excluded.user_id, artworks.user_id), "
-            "user_name        = COALESCE(excluded.user_name, artworks.user_name)",
+            + ARTWORK_UPSERT_SET_CLAUSE,
             artworks_rows,
         )
         return len(artworks_rows)
