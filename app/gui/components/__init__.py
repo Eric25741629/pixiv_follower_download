@@ -16,7 +16,7 @@ from app.gui.components.inputs import (
     number_field, text_field, multiline_field, dropdown, switch, slider,
 )
 from app.gui.components.layout import (
-    page_title, subhead, note, status_note, inline_label, section,
+    page_title, subhead, note, status_note, inline_label, section, unsaved_bar,
 )
 from app.gui.components.buttons import (
     primary_button, secondary_button, icon_action,
@@ -25,7 +25,7 @@ from app.gui.components.dialogs import confirm_dialog
 
 __all__ = [
     "number_field", "text_field", "multiline_field", "dropdown", "switch", "slider",
-    "page_title", "subhead", "note", "status_note", "inline_label", "section",
+    "page_title", "subhead", "note", "status_note", "inline_label", "section", "unsaved_bar",
     "primary_button", "secondary_button", "icon_action",
     "confirm_dialog",
 ]

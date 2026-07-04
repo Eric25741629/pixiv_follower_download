@@ -34,6 +34,15 @@ def _safe_int(value, default: int) -> int:
         return default
 
 
+def _normalize_path_input(raw) -> str:
+    """Trim whitespace and surrounding quotes from a hand-typed/pasted path.
+
+    Explorer's "Copy as path" wraps the string in double quotes; no existence
+    check (downstream thread_download does os.makedirs(exist_ok=True)).
+    """
+    return str(raw or "").strip().strip('"').strip("'")
+
+
 class SettingsView(_SettingsHandlersMixin):
     """Settings page grouped into ExpansionTile sections."""
 
@@ -75,23 +84,24 @@ class SettingsView(_SettingsHandlersMixin):
             on_select=self._on_language_select,
         )
 
-        self._tf_account = c.text_field(theme, label=i18n.t("settings.account.account"), value=auth.get("account", ""), width=300)
-        self._tf_password = c.text_field(theme, label=i18n.t("settings.account.password"), value=auth.get("password", ""), width=300, password=True)
-        self._tf_userid = c.text_field(theme, label=i18n.t("settings.account.userid"), value=str(auth.get("userid", "")), width=200)
-        self._tf_path = c.text_field(theme, label=i18n.t("settings.download.path"), value=dl.get("path", ""), expand=True, read_only=True)
+        self._tf_account = c.text_field(theme, label=i18n.t("settings.account.account"), value=auth.get("account", ""), width=300, on_change=self._mark_dirty)
+        self._tf_password = c.text_field(theme, label=i18n.t("settings.account.password"), value=auth.get("password", ""), width=300, password=True, on_change=self._mark_dirty)
+        self._tf_userid = c.text_field(theme, label=i18n.t("settings.account.userid"), value=str(auth.get("userid", "")), width=200, on_change=self._mark_dirty)
+        self._tf_path = c.text_field(theme, label=i18n.t("settings.download.path"), value=dl.get("path", ""), expand=True, on_change=self._mark_dirty)
 
         self._sw_hidefollow = c.switch(theme, label=i18n.t("settings.filter.hidefollow"), value=bool(flt.get("hidefollow", False)))
         self._sw_nogif = c.switch(theme, label=i18n.t("settings.filter.nogif"), value=bool(flt.get("nogif", False)))
         self._sw_notag = c.switch(theme, label=i18n.t("settings.tags.notag"), value=bool(flt.get("notag", False)))
         self._sw_notime = c.switch(theme, label=i18n.t("settings.tags.notime"), value=bool(flt.get("notime", False)))
-        self._tf_like_num = c.number_field(theme, label=i18n.t("settings.filter.like_num"), value=dl.get("like_num", 0), width=150)
-        self._tf_r18_like_num = c.number_field(theme, label=i18n.t("settings.filter.r18_like_num"), value=dl.get("r18_like_num", 0), width=150)
+        self._tf_like_num = c.number_field(theme, label=i18n.t("settings.filter.like_num"), value=dl.get("like_num", 0), width=150, on_change=self._mark_dirty)
+        self._tf_r18_like_num = c.number_field(theme, label=i18n.t("settings.filter.r18_like_num"), value=dl.get("r18_like_num", 0), width=150, on_change=self._mark_dirty)
         self._tf_rescrape_within_days = c.number_field(
             theme,
             label=i18n.t("settings.filter.rescrape_days"),
             value=dl.get("rescrape_within_days", 365),
             width=200,
             tooltip=i18n.t("settings.filter.rescrape_days_tooltip"),
+            on_change=self._mark_dirty,
         )
         self._tf_filename_template = c.text_field(
             theme,
@@ -99,6 +109,7 @@ class SettingsView(_SettingsHandlersMixin):
             value=str(dl.get("filename_template", "") or ""),
             hint_text=i18n.t("settings.filename.template_hint"),
             expand=True,
+            on_change=self._mark_dirty,
         )
         self._tf_download_time = c.text_field(
             theme,
@@ -107,6 +118,7 @@ class SettingsView(_SettingsHandlersMixin):
             hint_text=i18n.t("settings.filename.download_time_hint"),
             width=320,
             tooltip=i18n.t("settings.filename.download_time_tooltip"),
+            on_change=self._mark_dirty,
         )
         self._sw_set_file_mtime = c.switch(
             theme,
@@ -144,6 +156,7 @@ class SettingsView(_SettingsHandlersMixin):
             value=int(dl.get("combined_workers", 1)),
             width=200,
             tooltip=i18n.t("settings.source.workers_tooltip"),
+            on_change=self._mark_dirty,
         )
         self._sw_force_rescan = c.switch(
             theme,
@@ -160,6 +173,7 @@ class SettingsView(_SettingsHandlersMixin):
                 ("bookmarks", i18n.t("settings.source.mode.bookmarks")),
             ],
             width=220,
+            on_select=self._mark_dirty,
         )
         self._dd_following_scope = c.dropdown(
             theme,
@@ -171,6 +185,7 @@ class SettingsView(_SettingsHandlersMixin):
                 ("all", i18n.t("settings.source.following.all")),
             ],
             width=220,
+            on_select=self._mark_dirty,
         )
         self._dd_bookmark_scope = c.dropdown(
             theme,
@@ -182,6 +197,7 @@ class SettingsView(_SettingsHandlersMixin):
                 ("all", i18n.t("settings.source.bookmark.all")),
             ],
             width=220,
+            on_select=self._mark_dirty,
         )
 
         sch = store.get_section("schedule")
@@ -197,12 +213,15 @@ class SettingsView(_SettingsHandlersMixin):
             options=[("daily", i18n.t("settings.adv.schedule.daily")),
                      ("interval", i18n.t("settings.adv.schedule.interval"))],
             width=200,
+            on_select=self._mark_dirty,
         )
         self._tf_schedule_time = c.text_field(
             theme, label=i18n.t("settings.adv.schedule_time"), value=str(sch.get("time", "03:00")), width=160,
+            on_change=self._mark_dirty,
         )
         self._tf_schedule_interval = c.text_field(
             theme, label=i18n.t("settings.adv.schedule_interval"), value=str(sch.get("interval_hours", 6)), width=160,
+            on_change=self._mark_dirty,
         )
 
         self._ban_tags: list[str] = list(dl.get("ban_tag", []))
@@ -237,11 +256,11 @@ class SettingsView(_SettingsHandlersMixin):
         )
 
         self._sw_jxl = c.switch(theme, label=i18n.t("settings.adv.jxl_enable"), value=bool(jxl.get("enable", False)))
-        self._tf_jxl_path = c.text_field(theme, label=i18n.t("settings.adv.jxl_path"), value=jxl.get("cjxl_path", ""), expand=True, read_only=True)
+        self._tf_jxl_path = c.text_field(theme, label=i18n.t("settings.adv.jxl_path"), value=jxl.get("cjxl_path", ""), expand=True, on_change=self._mark_dirty)
         self._sw_jxl_delete = c.switch(theme, label=i18n.t("settings.adv.jxl_delete"), value=bool(jxl.get("delete_original", False)))
         self._sw_jxl_skip_gif = c.switch(theme, label=i18n.t("settings.adv.jxl_skip_gif"), value=bool(jxl.get("skip_gif", True)))
         effort_val = max(1, min(9, int(jxl.get("effort", 7))))
-        self._sl_jxl_effort = c.slider(theme, min=1, max=9, divisions=8, value=effort_val, label="{value}", width=200)
+        self._sl_jxl_effort = c.slider(theme, min=1, max=9, divisions=8, value=effort_val, label="{value}", width=200, on_change=self._mark_dirty)
 
         # Cooldown controls — replace old pid_wait_min / pid_wait_max text fields
         cooldown_avg = int(perf.get("pid_cooldown_avg", 35))
@@ -274,17 +293,19 @@ class SettingsView(_SettingsHandlersMixin):
             min_lines=4,
             max_lines=15,
         )
+        # multiline_field has no on_change param; set it directly.
+        self._tf_proxy_pool.on_change = self._mark_dirty
         self._proxy_test_results = ft.Column([], spacing=4)
 
         # Wait time controls
         intra_min = int(perf.get("intra_pid_wait_min", 5))
         intra_max = int(perf.get("intra_pid_wait_max", 15))
-        self._tf_intra_min = c.number_field(theme, label=None, value=intra_min, width=80)
-        self._tf_intra_max = c.number_field(theme, label=None, value=intra_max, width=80)
+        self._tf_intra_min = c.number_field(theme, label=None, value=intra_min, width=80, on_change=self._mark_dirty)
+        self._tf_intra_max = c.number_field(theme, label=None, value=intra_max, width=80, on_change=self._mark_dirty)
         nocookie_min = int(perf.get("pid_wait_nocookie_min", 3))
         nocookie_max = int(perf.get("pid_wait_nocookie_max", 8))
-        self._tf_nocookie_min = c.number_field(theme, label=None, value=nocookie_min, width=80)
-        self._tf_nocookie_max = c.number_field(theme, label=None, value=nocookie_max, width=80)
+        self._tf_nocookie_min = c.number_field(theme, label=None, value=nocookie_min, width=80, on_change=self._mark_dirty)
+        self._tf_nocookie_max = c.number_field(theme, label=None, value=nocookie_max, width=80, on_change=self._mark_dirty)
 
         # User-Agent controls
         self._tf_agent = c.text_field(
@@ -293,6 +314,7 @@ class SettingsView(_SettingsHandlersMixin):
             value=auth.get("agent", ""),
             hint_text=i18n.t("settings.ua.hint"),
             expand=True,
+            on_change=self._mark_dirty,
         )
         self._btn_detect_ua = c.secondary_button(
             i18n.t("settings.ua.detect_btn"), on_click=self._on_detect_chrome,
@@ -304,10 +326,40 @@ class SettingsView(_SettingsHandlersMixin):
         # Text fields / sliders still rely on the explicit save button.
         self._wire_switch_autosave()
 
+        # Floating unsaved-changes bar. Switches + language dropdown autosave,
+        # so they never mark dirty; every explicit-save control (text/number/
+        # multiline fields, dropdowns, sliders, tag edits, path pickers) does.
+        self._dirty = False
+        self._unsaved_bar = c.unsaved_bar(
+            theme,
+            text=i18n.t("settings.unsaved"),
+            save_button=c.primary_button(
+                i18n.t("settings.save"), icon=ft.Icons.SAVE, on_click=self._save_and_notify,
+            ),
+        )
+
     # _cooldown_hint_color / the per-switch autosave wiring
     # (_switch_autosave_map / _wire_switch_autosave / _make_autosave_handler)
     # moved to settings_handlers._SettingsHandlersMixin (file-size refactor);
     # inherited.
+
+    # ------------------------------------------------------------------
+    # Unsaved-changes tracking
+    # ------------------------------------------------------------------
+
+    def _mark_dirty(self, e=None) -> None:
+        if self._dirty:
+            return
+        self._dirty = True
+        self._unsaved_bar.visible = True
+        with contextlib.suppress(Exception):
+            self._unsaved_bar.update()
+
+    def _clear_dirty(self) -> None:
+        self._dirty = False
+        self._unsaved_bar.visible = False
+        with contextlib.suppress(Exception):
+            self._unsaved_bar.update()
 
     # ------------------------------------------------------------------
     # File picker handlers
@@ -318,12 +370,14 @@ class SettingsView(_SettingsHandlersMixin):
         if path:
             self._tf_path.value = path + "/"
             self._tf_path.update()
+            self._mark_dirty()
 
     async def _pick_jxl_exe(self, e: ft.ControlEvent) -> None:
         files = await self._jxl_picker.pick_files(allowed_extensions=["exe"])
         if files:
             self._tf_jxl_path.value = files[0].path
             self._tf_jxl_path.update()
+            self._mark_dirty()
 
     # ------------------------------------------------------------------
     # Tag handlers
@@ -335,6 +389,7 @@ class SettingsView(_SettingsHandlersMixin):
             self._ban_tags.append(tag)
             self._tf_ban_input.value = ""
             self._refresh_tag_rows()
+            self._mark_dirty()
             self._page.update()
 
     def _add_must_tag(self, e: ft.ControlEvent) -> None:
@@ -343,6 +398,7 @@ class SettingsView(_SettingsHandlersMixin):
             self._must_tags.append(tag)
             self._tf_must_input.value = ""
             self._refresh_tag_rows()
+            self._mark_dirty()
             self._page.update()
 
     def _refresh_tag_rows(self) -> None:
@@ -356,14 +412,18 @@ class SettingsView(_SettingsHandlersMixin):
         ]
 
     def _remove_ban_tag(self, tag: str) -> None:
-        self._ban_tags = [t for t in self._ban_tags if t != tag]
-        self._refresh_tag_rows()
-        self._page.update()
+        if tag in self._ban_tags:
+            self._ban_tags = [t for t in self._ban_tags if t != tag]
+            self._refresh_tag_rows()
+            self._mark_dirty()
+            self._page.update()
 
     def _remove_must_tag(self, tag: str) -> None:
-        self._must_tags = [t for t in self._must_tags if t != tag]
-        self._refresh_tag_rows()
-        self._page.update()
+        if tag in self._must_tags:
+            self._must_tags = [t for t in self._must_tags if t != tag]
+            self._refresh_tag_rows()
+            self._mark_dirty()
+            self._page.update()
 
     # Cooldown helpers (_cooldown_hint / reload_cookie_count /
     # _on_cooldown_slider_change / _on_cooldown_tf_change / _safe_int_cooldown)
@@ -423,6 +483,7 @@ class SettingsView(_SettingsHandlersMixin):
             version = ua.split("Chrome/")[1].split(" ")[0] if "Chrome/" in ua else ua
             self._label_ua_status.value = i18n.t("settings.ua.detected", version=version)
             self._label_ua_status.color = theme.success
+            self._mark_dirty()
         else:
             self._label_ua_status.value = i18n.t("settings.ua.not_found")
             self._label_ua_status.color = theme.error
@@ -462,7 +523,7 @@ class SettingsView(_SettingsHandlersMixin):
         })
         store.update_section("download", {
             **store.get_section("download"),
-            "path": self._tf_path.value,
+            "path": _normalize_path_input(self._tf_path.value),
             "like_num": _safe_int(self._tf_like_num.value, 0),
             "r18_like_num": _safe_int(self._tf_r18_like_num.value, 0),
             "rescrape_within_days": _safe_int(self._tf_rescrape_within_days.value, 365),
@@ -513,12 +574,13 @@ class SettingsView(_SettingsHandlersMixin):
             },
             "jxl": {
                 "enable": self._sw_jxl.value,
-                "cjxl_path": self._tf_jxl_path.value,
+                "cjxl_path": _normalize_path_input(self._tf_jxl_path.value),
                 "delete_original": self._sw_jxl_delete.value,
                 "effort": int(self._sl_jxl_effort.value),
                 "skip_gif": self._sw_jxl_skip_gif.value,
             },
         })
+        self._clear_dirty()
         if self._on_saved is not None:
             with contextlib.suppress(Exception):
                 self._on_saved()
@@ -567,10 +629,8 @@ class SettingsView(_SettingsHandlersMixin):
     # Layout
     # ------------------------------------------------------------------
 
-    def build(self) -> ft.Column:
+    def build(self) -> ft.Stack:
         theme = current_theme(self._page)
-
-        save_btn = c.primary_button(i18n.t("settings.save"), icon=ft.Icons.SAVE, on_click=self._save_and_notify)
 
         def _sec(key: str, controls: list) -> ft.Control:
             # Every content section leads with a one-line purpose note (spec §B
@@ -578,7 +638,7 @@ class SettingsView(_SettingsHandlersMixin):
             return c.section(theme, i18n.t(f"settings.section.{key}"),
                              [c.note(theme, i18n.t(f"settings.note.{key}")), *controls])
 
-        return ft.Column(
+        column = ft.Column(
             controls=[
                 c.page_title(theme, i18n.t("settings.title")),
                 c.section(theme, i18n.t("settings.section.interface"), [
@@ -684,9 +744,9 @@ class SettingsView(_SettingsHandlersMixin):
                     self._tf_schedule_time,
                     self._tf_schedule_interval,
                 ]),
-                ft.Container(content=save_btn, padding=ft.Padding.only(top=8)),
             ],
             scroll=ft.ScrollMode.AUTO,
             spacing=theme.gap,
             expand=True,
         )
+        return ft.Stack([column, self._unsaved_bar], expand=True, fit=ft.StackFit.EXPAND)

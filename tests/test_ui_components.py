@@ -94,6 +94,22 @@ def test_section_returns_control_wrapping_expansion_tile():
     assert isinstance(sec, ft.Control)
 
 
+def test_unsaved_bar_hidden_by_default_with_button_and_bottom_position():
+    btn = c.primary_button("儲存設定", icon=ft.Icons.SAVE)
+    bar = c.unsaved_bar(T, text="有設定尚未儲存", save_button=btn)
+    assert isinstance(bar, ft.Container)
+    # Starts hidden; the owning view flips .visible when dirty.
+    assert bar.visible is False
+    # Stack-positioned along the bottom edge, full width.
+    assert bar.bottom == 16 and bar.left == 0 and bar.right == 0
+    # Message (left) + the passed save button (right) inside the glass panel Row.
+    row = bar.content.content
+    assert isinstance(row, ft.Row)
+    assert row.alignment == ft.MainAxisAlignment.SPACE_BETWEEN
+    assert btn in row.controls
+    assert any(isinstance(x, ft.Text) and x.value == "有設定尚未儲存" for x in row.controls)
+
+
 # ── buttons / dialogs ───────────────────────────────────────────────────────
 def test_buttons():
     assert isinstance(c.primary_button("存", icon=ft.Icons.SAVE), ft.FilledButton)

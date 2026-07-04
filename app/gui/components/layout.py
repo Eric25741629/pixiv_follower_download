@@ -38,6 +38,27 @@ def inline_label(theme: GlassTheme, text: str, size: int = 13) -> ft.Text:
     return ft.Text(text, size=size, color=theme.text_primary)
 
 
+def unsaved_bar(theme: GlassTheme, *, text: str, save_button: ft.Control) -> ft.Container:
+    """Floating unsaved-changes banner (message left, save button right).
+
+    Returned hidden (``visible=False``) and Stack-positioned along the bottom
+    edge; the owning view flips ``.visible`` when settings go dirty/clean.
+    Horizontal padding keeps the glass panel off the window edges.
+    """
+    row = ft.Row(
+        [ft.Text(text, color=theme.text_primary), save_button],
+        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+    )
+    return ft.Container(
+        content=glass_panel(row, theme),
+        visible=False,
+        bottom=16,
+        left=0,
+        right=0,
+        padding=ft.Padding.symmetric(horizontal=24),
+    )
+
+
 def section(theme: GlassTheme, title: str, controls: list) -> ft.Control:
     """Collapsible glass section card — the unified ``_tile``."""
     tile = ft.ExpansionTile(
