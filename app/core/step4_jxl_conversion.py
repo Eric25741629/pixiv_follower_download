@@ -1,12 +1,15 @@
 """Background JPEG-XL conversion for ``download_thread`` (file-size refactor).
 
-A self-contained subsystem: a single worker thread drains a FIFO queue so
-``cjxl.exe`` runs never block downloads. Mixed into ``download_thread`` via
-``_JXLMixin``; every method uses only JXL-owned instance state
-(``self.jxl_*`` / ``self._jxl_*`` set by ``_init_jxl_config``) plus the shared
-event queue (``self._q``), stop event (``self._stop_event``), optional
-``self._stats_collector`` and ``self._format_size_human`` provided by the
-concrete class. Absence of ``cjxl.exe`` must never break downloads.
+A self-contained subsystem: a pool of worker threads drains one shared FIFO
+queue so ``cjxl.exe`` runs never block downloads and multiple conversions run
+in parallel. Mixed into ``download_thread`` via ``_JXLMixin``; every method
+uses only JXL-owned instance state (``self.jxl_*`` / ``self._jxl_*`` set by
+``_init_jxl_config``) plus the shared event queue (``self._q``), stop event
+(``self._stop_event``), optional ``self._stats_collector`` and
+``self._format_size_human`` provided by the concrete class. Because several
+workers now mutate the shared JXL counters concurrently, those increments are
+guarded by ``self._jxl_stats_lock``. Absence of ``cjxl.exe`` must never break
+downloads.
 """
 from __future__ import annotations
 
@@ -49,12 +52,16 @@ class _JXLMixin:
         self._jxl_fail_count = 0
         self._jxl_src_total_bytes = 0
         self._jxl_dst_total_bytes = 0
-        # Background JXL conversion: a single worker thread drains a FIFO
-        # queue so cjxl runs do not block downloads.  All counter mutations
-        # stay on this single worker (no lock needed); the main thread only
-        # reads them after _drain_jxl_queue() in finalize.
+        # Background JXL conversion: a pool of worker threads drains one shared
+        # FIFO queue so cjxl runs do not block downloads and several files
+        # convert in parallel.  Because multiple workers mutate the shared
+        # counters concurrently, all counter increments go through
+        # _jxl_stats_lock; the main thread reads them after _drain_jxl_queue()
+        # in finalize.  Pool size is half the CPU count, clamped to [2, 4].
         self._jxl_queue: Queue = Queue()
-        self._jxl_worker_thread: threading.Thread | None = None
+        self._jxl_workers = min(4, max(2, (os.cpu_count() or 4) // 2))
+        self._jxl_worker_threads: list[threading.Thread] = []
+        self._jxl_stats_lock = threading.Lock()
 
     def _resolve_cjxl_path(self, preferred_path):
         preferred = str(preferred_path or "").strip()
@@ -150,10 +157,16 @@ class _JXLMixin:
                 f"<p><font color='gray'>{i18n.t('log.jxl.skip_gif')}</font></p>"
             ))
 
+    def _jxl_stats_guard(self):
+        """Return the stats lock, tolerating old test stubs that never set it."""
+        lock = getattr(self, "_jxl_stats_lock", None)
+        return lock if lock is not None else contextlib.nullcontext()
+
     def _handle_existing_jxl_destination(self, src_path):
         """Bump ok counter and optionally delete the original when .jxl already exists."""
         try:
-            self._jxl_ok_count += 1
+            with self._jxl_stats_guard():
+                self._jxl_ok_count += 1
             if self.jxl_delete_original and os.path.isfile(src_path):
                 os.remove(src_path)
         except Exception:
@@ -223,8 +236,9 @@ class _JXLMixin:
         if src_size < 0 or dst_size < 0:
             return None, None, None
         try:
-            self._jxl_src_total_bytes += src_size
-            self._jxl_dst_total_bytes += dst_size
+            with self._jxl_stats_guard():
+                self._jxl_src_total_bytes += src_size
+                self._jxl_dst_total_bytes += dst_size
         except Exception:
             pass
         try:
@@ -257,7 +271,8 @@ class _JXLMixin:
 
     def _jxl_emit_failure_log(self, src_path, reason):
         """Print the per-file failure log line; trims very long reasons."""
-        self._jxl_fail_count += 1
+        with self._jxl_stats_guard():
+            self._jxl_fail_count += 1
         msg = reason if len(reason) <= 120 else reason[:117] + "..."
         if not msg:
             msg = "cjxl conversion failed"
@@ -270,7 +285,8 @@ class _JXLMixin:
     def _jxl_record_outcome(self, src_path, dst_path, ok, reason):
         """Update counters, emit log lines and optionally delete the source."""
         if ok and os.path.isfile(dst_path):
-            self._jxl_ok_count += 1
+            with self._jxl_stats_guard():
+                self._jxl_ok_count += 1
             src_size, dst_size, saved = self._jxl_tally_sizes(src_path, dst_path)
             self._jxl_emit_compare_log(src_path, src_size, dst_size, saved)
             self._jxl_delete_source_if_configured(src_path)
@@ -286,18 +302,26 @@ class _JXLMixin:
         self._jxl_record_outcome(src_path, dst_path, ok, reason)
 
     def _start_jxl_worker_if_needed(self):
-        """Lazily spawn the background cjxl worker on first enqueue."""
-        if self._jxl_worker_thread is not None and self._jxl_worker_thread.is_alive():
+        """Lazily spawn the background cjxl worker pool on first enqueue.
+
+        Spawns ``self._jxl_workers`` daemon threads at once; a no-op when any
+        worker from a previous spawn is still alive."""
+        if any(t.is_alive() for t in self._jxl_worker_threads):
             return
-        t = threading.Thread(target=self._jxl_worker_loop, daemon=True, name="jxl-worker")
-        t.start()
-        self._jxl_worker_thread = t
+        self._jxl_worker_threads = []
+        for i in range(self._jxl_workers):
+            t = threading.Thread(
+                target=self._jxl_worker_loop, daemon=True, name=f"jxl-worker-{i}"
+            )
+            t.start()
+            self._jxl_worker_threads.append(t)
 
     def _jxl_worker_loop(self):
-        """Process queued source paths one at a time.  Exits cleanly on the
-        ``None`` sentinel pushed by ``_drain_jxl_queue``.  Uses a 1-second
-        polling timeout so the thread can exit if the main thread crashes
-        before pushing the sentinel."""
+        """Process queued source paths.  One shared queue feeds every worker,
+        so each pops the next available file.  Exits cleanly when it pops a
+        ``None`` sentinel pushed by ``_drain_jxl_queue`` (one sentinel per
+        worker).  Uses a 1-second polling timeout so the thread can exit if
+        the main thread crashes before pushing the sentinel."""
         import queue as _queue_mod
         while not self._stop_event.is_set():
             try:
@@ -337,19 +361,23 @@ class _JXLMixin:
                 self._jxl_queue.task_done()
 
     def _drain_jxl_queue(self):
-        """Wait for queued conversions to finish, then shut the worker down.
+        """Wait for queued conversions to finish, then shut the worker pool down.
 
         On normal completion, blocks until every enqueued file has been
         processed so the JXL summary is accurate.  On a user-initiated stop,
-        discards pending items first (keeps in-flight conversion only) so
-        the user is not left waiting minutes for a long backlog."""
-        worker = self._jxl_worker_thread
-        if worker is None or not worker.is_alive():
+        discards pending items first (keeps in-flight conversions only) so
+        the user is not left waiting minutes for a long backlog.  Pushes one
+        ``None`` sentinel per live worker and joins each."""
+        workers = [t for t in self._jxl_worker_threads if t.is_alive()]
+        if not workers:
             return
         if self._stop_event.is_set():
             self._discard_pending_jxl_items()
         with contextlib.suppress(Exception):
             self._jxl_queue.join()
         with contextlib.suppress(Exception):
-            self._jxl_queue.put(None)
-            worker.join(timeout=5.0)
+            for _ in workers:
+                self._jxl_queue.put(None)
+        for worker in workers:
+            with contextlib.suppress(Exception):
+                worker.join(timeout=5.0)
