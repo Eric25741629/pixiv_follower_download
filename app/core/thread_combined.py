@@ -411,12 +411,11 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             # the cookie with a success (ok=True would refresh its trust window for
             # work the user aborted) nor disable it. Off those paths, a
             # network-exhausted account (account_ok False) still disables as before.
-            # work_units = 1 query (when needed) + N page downloads, so cooldown
-            # scales with the PID's real request cost and balances per-cookie
-            # request counts across the pool.
+            # Cooldown = one full avg for the pickup + a flat 5 s per page
+            # downloaded (PAGE_COOLDOWN_SEC), so a multi-page PID rests a bit
+            # longer without sidelining the cookie for pages × avg.
             self._release_account_after_work(
-                acc, ok=ok and account_ok, neutral=neutral,
-                work_units=(1 if needs_query else 0) + page_count,
+                acc, ok=ok and account_ok, neutral=neutral, pages=page_count,
             )
             with contextlib.suppress(Exception):
                 sess.close()

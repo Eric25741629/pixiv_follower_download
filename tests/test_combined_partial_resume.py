@@ -56,7 +56,7 @@ def test_stop_mid_pid_persists_completed_pages():
     urls = _urls("77701", 3)
     t.fetcher.url_meta = {"77701": {"pagecount": 3, "like": 100, "tag": []}}
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True, work_units=1: None
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: None
     t._run_with_network_retry = _retry_router((True, urls, None))
 
     def fake_download(pid, dl_urls):
@@ -83,7 +83,7 @@ def test_partial_failure_persists_completed_pages():
     urls = _urls("77702", 3)
     t.fetcher.url_meta = {"77702": {"pagecount": 3, "like": 100, "tag": []}}
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True, work_units=1: None
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: None
     t._run_with_network_retry = _retry_router((True, urls, None))
 
     def fake_download(pid, dl_urls):
@@ -114,7 +114,7 @@ def test_requery_skips_already_downloaded_pages():
 
     t.fetcher.url_meta = {"77703": {"pagecount": 3, "like": 100, "tag": []}}
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True, work_units=1: None
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: None
     t._run_with_network_retry = _retry_router((True, urls, None))
 
     seen = {"urls": None}
@@ -148,7 +148,7 @@ def test_requery_all_pages_already_downloaded_closes_pid_without_download():
 
     t.fetcher.url_meta = {"77704": {"pagecount": 2, "like": 100, "tag": []}}
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True, work_units=1: None
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: None
     t._run_with_network_retry = _retry_router((True, urls, None))
 
     called = {"download": False}

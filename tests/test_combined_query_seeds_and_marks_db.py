@@ -60,7 +60,7 @@ def test_clean_query_seeds_pending_then_marks_downloaded_and_closes_pid():
     t.fetcher.url_meta = {"55501": {"pagecount": 2, "like": 100, "tag": []}}
 
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True, work_units=1: None
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: None
     t._run_with_network_retry = _retry_router((True, urls, None))
 
     seen_pending = {"counts": None}
@@ -98,7 +98,7 @@ def test_failed_query_does_not_retire_pid_and_marks_not_ok():
 
     t._acquire_account = lambda: _Acc()
     released = {"ok": None}
-    t._release_account = lambda acc, ok=True, work_units=1: released.__setitem__("ok", ok)
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: released.__setitem__("ok", ok)
     t._run_with_network_retry = _retry_router((False, None, None))
 
     downloaded = {"called": False}
@@ -123,7 +123,7 @@ def test_partial_download_failure_keeps_pid_pending():
 
     t._acquire_account = lambda: _Acc()
     released = {"ok": None}
-    t._release_account = lambda acc, ok=True, work_units=1: released.__setitem__("ok", ok)
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: released.__setitem__("ok", ok)
     t._run_with_network_retry = _retry_router((True, urls, None))
 
     # _download_pid_group returns a non-empty failed list -> partial failure.

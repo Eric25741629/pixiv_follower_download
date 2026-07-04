@@ -24,6 +24,10 @@ class AccountState:
 
 
 _THROUGHPUT_JITTER = 0.10  # ±10% on inter-request gap (anti-detection)
+# Flat per-page cooldown surcharge (seconds): each page download inside a
+# pickup adds this, NOT a full pid_cooldown_avg — image GETs are much cheaper
+# than ajax queries. ponytail: constant, not a setting; promote if it needs a dial.
+PAGE_COOLDOWN_SEC = 5.0
 
 
 class AccountScheduler:
@@ -239,7 +243,7 @@ class AccountScheduler:
         return self._on_disable
 
     def _mark_success_locked(
-        self, account: AccountState, work_units: int = 1
+        self, account: AccountState, work_units: int = 1, pages: int = 0
     ) -> Callable[[AccountState], None] | None:
         """Schedule per-account cooldown; caller must hold ``self._lock``.
         Returns the on_success callback (fired on EVERY successful release) so
@@ -247,15 +251,18 @@ class AccountScheduler:
         view 「檢查：」 time then advances live during a run instead of freezing
         at first use.
 
-        ``work_units`` is the number of HTTP requests the account actually
-        served this pickup (a PID = 1 query + N page downloads). Cooldown scales
-        linearly with it: a 10-page PID rests 10× a 1-page PID. This both raises
-        a heavy PID's cooldown (the anti-detection ask) and equalises the total
-        request count across accounts — a heavy account stays ready less often,
-        so idle-weighted selection hands the next PIDs to lighter accounts.
-        ponytail: linear, uncapped; add a cap here if one mega-PID sidelines an
-        account for too long."""
-        per_account = max(1.0, self._get_cooldown_avg()) * max(1, int(work_units))
+        Cooldown = ``avg × work_units + PAGE_COOLDOWN_SEC × pages``.
+        ``work_units`` is the number of full-cost requests this pickup (the
+        PID query; default 1 = one request, the Step-2/3 case, byte-identical
+        to before). ``pages`` is the number of page downloads served — each
+        adds only the flat PAGE_COOLDOWN_SEC surcharge, so a multi-page PID
+        rests a bit longer than a 1-page one without sidelining the account
+        for pages × avg (image GETs are far cheaper, detection-wise, than
+        ajax queries)."""
+        per_account = (
+            max(1.0, self._get_cooldown_avg()) * max(1, int(work_units))
+            + PAGE_COOLDOWN_SEC * max(0, int(pages))
+        )
         account.cooldown_until = time.monotonic() + per_account
         return self._on_success
 
@@ -268,20 +275,23 @@ class AccountScheduler:
         except Exception:
             pass
 
-    def release(self, account: AccountState, ok: bool = True, work_units: int = 1) -> None:
+    def release(self, account: AccountState, ok: bool = True, work_units: int = 1,
+                pages: int = 0) -> None:
         """Record outcome after a unit of work completes.
 
         ok=True  -> schedule per-account cooldown to ``pid_cooldown_avg ×
-                    work_units`` seconds (``work_units`` = requests served this
-                    pickup: 1 query + N pages; default 1 = one request, the
-                    Step-2/3 case, byte-identical to before). No jitter on
-                    per-account; randomness is applied at the throughput gate in
-                    acquire() so inter-request gap stays bounded.
+                    work_units + PAGE_COOLDOWN_SEC × pages`` seconds
+                    (``work_units`` = full-cost requests, default 1 = the
+                    Step-2/3 case, byte-identical to before; ``pages`` = page
+                    downloads this pickup, each a flat 5 s surcharge). No
+                    jitter on per-account; randomness is applied at the
+                    throughput gate in acquire() so inter-request gap stays
+                    bounded.
         ok=False -> disable account (proxy unreachable).
         """
         with self._lock:
             account.held = False
-            cb = self._mark_failure_locked(account) if not ok else self._mark_success_locked(account, work_units)
+            cb = self._mark_failure_locked(account) if not ok else self._mark_success_locked(account, work_units, pages)
         # Callback runs outside the lock — it does file I/O and we don't
         # want to block other acquire/release threads.
         self._safe_call(cb, account)

@@ -50,6 +50,18 @@ def test_release_cooldown_is_deterministic():
     assert before + expected - 0.05 <= acc.cooldown_until <= before + expected + 0.05
 
 
+def test_release_pages_add_flat_surcharge_not_full_avg():
+    # Cooldown = avg × work_units + PAGE_COOLDOWN_SEC × pages: a 4-page PID
+    # rests avg + 4×5s, NOT avg×5 (pages are cheap; only the query is full-cost).
+    from app.core.account_scheduler import PAGE_COOLDOWN_SEC
+    acc = AccountState(cookie="c1", alias="A1")
+    before = time.monotonic()
+    sched, _, _ = _make_scheduler([acc], avg=45.0)
+    sched.release(acc, ok=True, pages=4)
+    expected = 45.0 + 4 * PAGE_COOLDOWN_SEC
+    assert before + expected - 0.05 <= acc.cooldown_until <= before + expected + 0.05
+
+
 def test_release_ok_false_disables_account():
     acc = AccountState(cookie="c1", alias="A1")
     sched, _, _ = _make_scheduler([acc])

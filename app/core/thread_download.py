@@ -1121,10 +1121,10 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             if neutral and self._scheduler is not None:
                 self._scheduler.release_neutral(acc)
             else:
-                # One PID = len(urls) page requests: cooldown scales with pages
-                # so a multi-page PID rests proportionally longer and the
-                # request count balances across accounts.
-                self._release_account(acc, ok=ok, work_units=len(urls))
+                # One full avg for the PID pickup + a flat 5 s per page
+                # (PAGE_COOLDOWN_SEC): a multi-page PID rests a bit longer
+                # without sidelining the cookie for pages × avg.
+                self._release_account(acc, ok=ok, pages=len(urls))
 
     def _execute_downloads_single(self, pid_order, pid_groups):
         """Single-thread per-PID-group download loop with optional scheduler."""

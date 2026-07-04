@@ -113,7 +113,7 @@ def test_release_account_delegates_to_scheduler():
     class FakeScheduler:
         def __init__(self):
             self.release_args = None
-        def release(self, account, ok=True, work_units=1):
+        def release(self, account, ok=True, work_units=1, pages=0):
             self.release_args = (account, ok)
 
     sched = FakeScheduler()
@@ -130,7 +130,7 @@ def test_release_account_skips_when_account_is_none():
     class FakeScheduler:
         def __init__(self):
             self.release_called = False
-        def release(self, account, ok=True, work_units=1):
+        def release(self, account, ok=True, work_units=1, pages=0):
             self.release_called = True
 
     sched = FakeScheduler()

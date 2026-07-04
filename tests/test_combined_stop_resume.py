@@ -58,7 +58,7 @@ def test_stop_mid_pid_keeps_pid_pending_for_resume():
     urls = [f"https://i.pximg.net/img/55501_p{i}.jpg" for i in range(8)]
 
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True, work_units=1: None
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: None
     t._seed_pending_urls = lambda pid, u: None
     t._persist_pid_meta = lambda pid: None
 
@@ -90,7 +90,7 @@ def test_clean_full_download_still_marks_done():
     urls = [f"https://i.pximg.net/img/777_p{i}.jpg" for i in range(3)]
 
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True, work_units=1: None
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: None
     t._seed_pending_urls = lambda pid, u: None
     t._persist_pid_meta = lambda pid: None
 

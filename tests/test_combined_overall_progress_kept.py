@@ -80,7 +80,7 @@ def test_query_does_not_emit_overall_progress(monkeypatch):
 
     t.fetcher.get_download_url = fake_get_download_url
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True, work_units=1: None
+    t._release_account = lambda acc, ok=True, work_units=1, pages=0: None
     # Router that actually runs both legs so the queue swap is exercised.
     t._run_with_network_retry = lambda label, fn: (True, fn(), None)
     t.downloader._download_pid_group = lambda pid, urls: []
