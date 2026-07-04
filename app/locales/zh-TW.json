@@ -188,6 +188,7 @@
   "main.lane.downloading_started": "PID {pid} 下載中",
   "main.lane.querying": "查詢 PID {pid}",
   "main.lane.waiting": "等待 cookie 就緒…",
+  "main.lane.waiting_countdown": "等待 cookie 就緒…倒數 {r} 秒",
   "main.eta.done": "預計剩餘：完成",
   "main.eta.hms": "預計剩餘：{h}:{m:02d}:{s:02d}",
   "main.eta.ms": "預計剩餘：{m:02d}:{s:02d}",

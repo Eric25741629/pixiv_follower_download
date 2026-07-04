@@ -267,7 +267,11 @@ class _MainProgressMixin:
             lane["status"].value = i18n.t("main.lane.querying", pid=pid)
         else:  # 等待 / cooldown between PIDs
             lane["bar"].value = 0
-            lane["status"].value = i18n.t("main.lane.waiting")
+            r = int(getattr(self, "_lane_countdown", 0) or 0)
+            lane["status"].value = (
+                i18n.t("main.lane.waiting_countdown", r=r) if r > 0
+                else i18n.t("main.lane.waiting")
+            )
         # Reveal on first real data — the load-bearing reflow toggle.
         lane["row"].visible = True
         self._safe_update(lane["row"])
@@ -307,3 +311,10 @@ class _MainProgressMixin:
         self._countdown_text.value = i18n.t("main.countdown", r=r) if r > 0 else ""
         # Update the meta Row, not just the Text, so it reflows reliably.
         self._safe_update(self._meta_row)
+        # Mirror the countdown onto lanes sitting in 等待 (the acquire wait IS
+        # this countdown). Only lanes already in 等待 re-render — never a
+        # fresh (state="") lane, whose reveal must wait for first real data.
+        self._lane_countdown = r
+        for lane in (getattr(self, "_lane_rows", None) or {}).values():
+            if lane["state"].get("state") == "等待":
+                self._render_lane(lane)
