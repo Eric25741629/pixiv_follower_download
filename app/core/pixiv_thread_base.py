@@ -174,6 +174,13 @@ class PauseableThread(threading.Thread):
         self._scheduler = scheduler  # AccountScheduler | None
         self._cookie_usage_lock = threading.Lock()
 
+    def _close_metadata_db_quietly(self, owner=None):
+        """Best-effort close of ``owner._metadata_db`` (default: self) for shutdown paths."""
+        db = getattr(owner or self, "_metadata_db", None)
+        if db is not None:
+            with contextlib.suppress(Exception):
+                db.close()
+
     def pause(self):
         self._pause_event.clear()
         self._q.put(WorkerEvent("output", f"<p><font color='red'>{i18n.t('log.paused')}</font></p>"))

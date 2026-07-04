@@ -96,12 +96,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread, _Step2BookmarkMixin,
             self._flush_step2_incremental(reason="shutdown")
         except Exception:
             pass
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
+        self._close_metadata_db_quietly()
 
     # 增量儲存：每 N 個作者完成後寫一次，保證崩潰時最多只丟 < 1 分鐘工作。
     # 沒有 in-progress 收集（_collected_pids 還沒初始化）就直接 no-op。

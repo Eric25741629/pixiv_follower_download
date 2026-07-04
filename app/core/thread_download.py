@@ -1539,10 +1539,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         """
         with contextlib.suppress(Exception):
             self._persist_url_meta()
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            with contextlib.suppress(Exception):
-                db.close()
+        self._close_metadata_db_quietly()
 
     def stop(self):
         if self.single_mode_flag:

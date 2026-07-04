@@ -265,12 +265,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             self._flush_url_meta_snapshot(full=True)
         except Exception:
             pass
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
+        self._close_metadata_db_quietly()
 
     # pictures_id loading + skip-file prefilter (_check_exist_candidate_paths,
     # _load_check_exist_block_set, _load_step2_skip_set, _scan_pictures_id_lines,
