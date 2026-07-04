@@ -132,7 +132,7 @@ class _ImmediateScheduler:
         except queue.Empty:
             return None
 
-    def release(self, account, ok=True):
+    def release(self, account, ok=True, work_units=1):
         self.released.append((account.cookie, ok))
 
 

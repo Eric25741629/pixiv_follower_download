@@ -35,7 +35,7 @@ def test_one_acquire_release_per_pid_covers_query_and_download():
         calls["acquire"] += 1
         return _Acc()
 
-    def fake_release(acc, ok=True):
+    def fake_release(acc, ok=True, work_units=1):
         calls["release"] += 1
 
     def fake_retry(label, fn):

@@ -238,13 +238,24 @@ class AccountScheduler:
         )
         return self._on_disable
 
-    def _mark_success_locked(self, account: AccountState) -> Callable[[AccountState], None] | None:
+    def _mark_success_locked(
+        self, account: AccountState, work_units: int = 1
+    ) -> Callable[[AccountState], None] | None:
         """Schedule per-account cooldown; caller must hold ``self._lock``.
         Returns the on_success callback (fired on EVERY successful release) so
         the caller refreshes the cookie's last_tested_at each time — the cookies
         view 「檢查：」 time then advances live during a run instead of freezing
-        at first use."""
-        per_account = max(1.0, self._get_cooldown_avg())
+        at first use.
+
+        ``work_units`` is the number of HTTP requests the account actually
+        served this pickup (a PID = 1 query + N page downloads). Cooldown scales
+        linearly with it: a 10-page PID rests 10× a 1-page PID. This both raises
+        a heavy PID's cooldown (the anti-detection ask) and equalises the total
+        request count across accounts — a heavy account stays ready less often,
+        so idle-weighted selection hands the next PIDs to lighter accounts.
+        ponytail: linear, uncapped; add a cap here if one mega-PID sidelines an
+        account for too long."""
+        per_account = max(1.0, self._get_cooldown_avg()) * max(1, int(work_units))
         account.cooldown_until = time.monotonic() + per_account
         return self._on_success
 
@@ -257,18 +268,20 @@ class AccountScheduler:
         except Exception:
             pass
 
-    def release(self, account: AccountState, ok: bool = True) -> None:
+    def release(self, account: AccountState, ok: bool = True, work_units: int = 1) -> None:
         """Record outcome after a unit of work completes.
 
-        ok=True  -> schedule per-account cooldown to exactly the setting
-                    value (``pid_cooldown_avg`` seconds; no jitter on
-                    per-account; randomness is applied at the throughput
-                    gate in acquire() so inter-request gap stays bounded).
+        ok=True  -> schedule per-account cooldown to ``pid_cooldown_avg ×
+                    work_units`` seconds (``work_units`` = requests served this
+                    pickup: 1 query + N pages; default 1 = one request, the
+                    Step-2/3 case, byte-identical to before). No jitter on
+                    per-account; randomness is applied at the throughput gate in
+                    acquire() so inter-request gap stays bounded.
         ok=False -> disable account (proxy unreachable).
         """
         with self._lock:
             account.held = False
-            cb = self._mark_failure_locked(account) if not ok else self._mark_success_locked(account)
+            cb = self._mark_failure_locked(account) if not ok else self._mark_success_locked(account, work_units)
         # Callback runs outside the lock — it does file I/O and we don't
         # want to block other acquire/release threads.
         self._safe_call(cb, account)

@@ -274,6 +274,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         account_ok = True
         download_ok = True
         neutral = False
+        page_count = 0  # pages actually downloaded this pickup (for cooldown scaling)
         try:
             if needs_query:
                 # The fetcher's get_download_url emits one ("progress",(1,
@@ -320,6 +321,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                     self.downloader._maybe_flush_exist_pid(pid)
                     self._persist_pid_meta(pid)
                 urls = kept
+            page_count = len(urls)
             if urls:
                 # Seed the pending pages before download so a partial failure /
                 # crash leaves a recoverable pending trail in the DB.
@@ -409,7 +411,13 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             # the cookie with a success (ok=True would refresh its trust window for
             # work the user aborted) nor disable it. Off those paths, a
             # network-exhausted account (account_ok False) still disables as before.
-            self._release_account_after_work(acc, ok=ok and account_ok, neutral=neutral)
+            # work_units = 1 query (when needed) + N page downloads, so cooldown
+            # scales with the PID's real request cost and balances per-cookie
+            # request counts across the pool.
+            self._release_account_after_work(
+                acc, ok=ok and account_ok, neutral=neutral,
+                work_units=(1 if needs_query else 0) + page_count,
+            )
             with contextlib.suppress(Exception):
                 sess.close()
         # "Genuine success": query succeeded (or not needed) AND downloads

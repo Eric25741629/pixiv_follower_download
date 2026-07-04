@@ -35,7 +35,7 @@ def test_download_only_pid_does_not_query():
         cookie = "c1"; proxy_url = None
 
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True: None
+    t._release_account = lambda acc, ok=True, work_units=1: None
 
     def fake_retry(label, fn):
         # Only the network query path increments queried; the download path

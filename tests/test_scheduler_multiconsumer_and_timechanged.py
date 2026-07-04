@@ -132,7 +132,7 @@ class _RecordingScheduler:
     def acquire(self):
         return self._account
 
-    def release(self, account, ok=True):
+    def release(self, account, ok=True, work_units=1):
         self.calls.append(("release", ok))
 
     def release_neutral(self, account):

@@ -1121,7 +1121,10 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             if neutral and self._scheduler is not None:
                 self._scheduler.release_neutral(acc)
             else:
-                self._release_account(acc, ok=ok)
+                # One PID = len(urls) page requests: cooldown scales with pages
+                # so a multi-page PID rests proportionally longer and the
+                # request count balances across accounts.
+                self._release_account(acc, ok=ok, work_units=len(urls))
 
     def _execute_downloads_single(self, pid_order, pid_groups):
         """Single-thread per-PID-group download loop with optional scheduler."""

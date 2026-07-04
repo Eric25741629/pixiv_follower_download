@@ -58,7 +58,7 @@ def test_process_one_pid_emits_page_progress_without_zero_total_progress():
     ]
 
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True: None
+    t._release_account = lambda acc, ok=True, work_units=1: None
 
     state = {"calls": 0}
 
@@ -93,7 +93,7 @@ def test_run_keeps_pid_progress_separate_from_page_progress():
 
     t._build_work_lists = lambda: (pids, [])
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True: None
+    t._release_account = lambda acc, ok=True, work_units=1: None
     t.fetcher._mark_pid_processed = lambda pid: None
     t.downloader._dispatch_download = lambda *args, **kwargs: -1
 
@@ -127,7 +127,7 @@ def test_run_clears_page_progress_when_pid_has_no_download_urls():
 
     t._build_work_lists = lambda: (pids, [])
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True: None
+    t._release_account = lambda acc, ok=True, work_units=1: None
     t.fetcher._mark_pid_processed = lambda pid: None
     t.downloader._dispatch_download = lambda *args, **kwargs: -1
 

@@ -33,7 +33,7 @@ def test_combined_process_one_pid_refreshes_fetcher_and_downloader_before_work()
     t.downloader = _Engine("downloader")
     t._last_pid_ok = False
     t._acquire_account = lambda: _Acc()
-    t._release_account = lambda acc, ok=True: None
+    t._release_account = lambda acc, ok=True, work_units=1: None
     t._run_with_network_retry = lambda label, fn: (True, fn(), None)
     t._download_only_urls = lambda pid: []
 

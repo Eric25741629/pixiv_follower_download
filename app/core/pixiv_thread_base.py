@@ -340,14 +340,18 @@ class PauseableThread(threading.Thread):
             return None
         return self._scheduler.acquire()
 
-    def _release_account(self, account, ok: bool = True) -> None:
-        """Release account back to scheduler. Safe no-op if scheduler/account is None."""
+    def _release_account(self, account, ok: bool = True, work_units: int = 1) -> None:
+        """Release account back to scheduler. Safe no-op if scheduler/account is None.
+
+        ``work_units`` = HTTP requests served this pickup (1 query + N pages);
+        the scheduler scales the per-account cooldown by it (default 1 =
+        Step-2/3 single-request, unchanged)."""
         if self._scheduler is None or account is None:
             return
-        self._scheduler.release(account, ok=ok)
+        self._scheduler.release(account, ok=ok, work_units=work_units)
 
     def _release_account_after_work(
-        self, account, ok: bool = True, neutral: bool = False
+        self, account, ok: bool = True, neutral: bool = False, work_units: int = 1
     ) -> None:
         """Release an account per the work-unit contract (the proven Step-4
         pattern, factored out so Steps 2/3/combined cannot drift from it).
@@ -367,7 +371,7 @@ class PauseableThread(threading.Thread):
         else:
             # Defer to _release_account (which guards a None scheduler itself);
             # this keeps the single release seam that Steps 2/3/4 stub in tests.
-            self._release_account(account, ok=ok)
+            self._release_account(account, ok=ok, work_units=work_units)
 
     def _r18_aware_like_base(self, artwork_tags):
         """Effective minimum-like base: raised to r18_like_num for R-18 works
