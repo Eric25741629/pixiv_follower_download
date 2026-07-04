@@ -189,6 +189,8 @@
   "main.lane.querying": "Querying PID {pid}",
   "main.lane.waiting": "Waiting for cookie…",
   "main.lane.waiting_countdown": "Waiting for cookie… {r}s",
+  "main.lane.waiting_pid": "PID {pid} waiting for cookie…",
+  "main.lane.waiting_pid_countdown": "PID {pid} waiting for cookie… {r}s",
   "main.eta.done": "ETA: done",
   "main.eta.hms": "ETA: {h}:{m:02d}:{s:02d}",
   "main.eta.ms": "ETA: {m:02d}:{s:02d}",

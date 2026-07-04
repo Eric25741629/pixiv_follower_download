@@ -1,6 +1,7 @@
 import concurrent.futures
 import contextlib
 import os
+import random
 import threading
 import time
 from collections import deque
@@ -23,6 +24,10 @@ import pixiv_api
 # Hard ceiling on 邊查邊下 concurrency regardless of cookie count, so a huge
 # pool can't spawn an unbounded thread fleet.
 COMBINED_WORKERS_CAP = 16
+
+# 查詢→下載緩衝：同一帳號在查完 meta 後歇這麼久（隨機取值）才開始抓圖，
+# 避免 meta 請求與第一張圖片下載零間隔背靠背連發。
+QUERY_TO_DOWNLOAD_PAUSE_RANGE = (1.0, 3.0)
 
 
 def resolve_worker_count(setting, active_accounts, pending_count, cap=COMBINED_WORKERS_CAP):
@@ -213,6 +218,23 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("lane", data))
 
+    def _make_lane_wait_callback(self, slot):
+        """Per-worker acquire-wait observer (parallel mode only; None when
+        ``slot`` is None). Streams THIS worker's own remaining cooldown seconds
+        into its own lane row — each lane counts down independently instead of
+        mirroring one shared global countdown. Deduped on the integer value so
+        the ≤2/s acquire poll doesn't emit identical lane events."""
+        if slot is None:
+            return None
+        last = [None]
+
+        def _on_wait(remaining):
+            r = int(remaining)
+            if r != last[0]:
+                last[0] = r
+                self._emit_lane(slot, state="等待", wait=r)
+        return _on_wait
+
     def _lane_download(self, pid, urls):
         """Download one PID's pages, resetting this thread's lane page counter at
         the START of each attempt. _run_with_network_retry re-invokes this on a
@@ -253,12 +275,16 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         diag_log.log(diag_log.WORKER, f"PID {pid} 開始 (needs_query={needs_query})")
         # Lane shows "等待 cookie" during the acquire wait — that wait IS the
         # per-account cooldown, so the user sees each lane pause between PIDs.
-        self._emit_lane(slot, pid=str(pid), alias="", state="等待", page=0, total=0)
+        # wait=0 clears any stale countdown left by the previous PID's wait.
+        self._emit_lane(slot, pid=str(pid), alias="", state="等待", page=0,
+                        total=0, wait=0)
         # The acquire span's elapsed time IS the visible cooldown wait. When it
         # logs ~0.00s the account was ready immediately (cooldown absorbed by the
         # previous PID's download) — that is exactly why no 倒數 shows.
+        on_wait = self._make_lane_wait_callback(slot)
         with diag_log.span(diag_log.WORKER, f"PID {pid} acquire(cooldown)"):
-            acc = self._acquire_account()
+            acc = (self._acquire_account(on_wait=on_wait) if on_wait is not None
+                   else self._acquire_account())
         if acc is None:
             diag_log.log(diag_log.WORKER, f"PID {pid} acquire -> None (stop/all-disabled)")
             return None, False  # stop / all disabled -> caller breaks
@@ -323,6 +349,12 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 urls = kept
             page_count = len(urls)
             if urls:
+                if needs_query:
+                    # 查詢→下載緩衝：同一帳號查完 meta 後先歇 1-3 秒再開始抓圖
+                    # （stop 可中斷；stop 後下載迴圈本身也會立即退出並走
+                    # download_ok=False 的既有停止路徑）。
+                    self._wait_interruptible(
+                        random.uniform(*QUERY_TO_DOWNLOAD_PAUSE_RANGE))
                 # Seed the pending pages before download so a partial failure /
                 # crash leaves a recoverable pending trail in the DB.
                 self._seed_pending_urls(pid, urls)
@@ -397,7 +429,8 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 # A PID that resolved to zero usable urls (revoked / filtered /
                 # query exhausted) must not leave its lane stuck on 查詢/下載.
                 if slot is not None:
-                    self._emit_lane(slot, pid="", alias="", state="等待", page=0, total=0)
+                    self._emit_lane(slot, pid="", alias="", state="等待",
+                                    page=0, total=0, wait=0)
         except Exception:
             neutral = True  # non-network failure: not the cookie's fault
             raise

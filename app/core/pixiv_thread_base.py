@@ -334,11 +334,17 @@ class PauseableThread(threading.Thread):
         except Exception:
             pass
 
-    def _acquire_account(self):
-        """Acquire next available account from scheduler, or None if no scheduler."""
+    def _acquire_account(self, on_wait=None):
+        """Acquire next available account from scheduler, or None if no scheduler.
+
+        ``on_wait`` (optional) is forwarded to ``AccountScheduler.acquire`` as
+        the per-caller wait observer; omitted entirely when None so stub
+        schedulers with a zero-arg acquire() keep working."""
         if self._scheduler is None:
             return None
-        return self._scheduler.acquire()
+        if on_wait is None:
+            return self._scheduler.acquire()
+        return self._scheduler.acquire(on_wait=on_wait)
 
     def _release_account(self, account, ok: bool = True, work_units: int = 1,
                          pages: int = 0) -> None:

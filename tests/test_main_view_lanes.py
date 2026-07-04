@@ -61,16 +61,40 @@ def test_update_lane_waiting_state_shows_cooldown_hint(view):
     assert "等待" in lane["status"].value
 
 
-def test_countdown_appends_seconds_to_waiting_lanes(view):
-    view.init_lanes(2)
-    view.update_lane(0, pid="1", state="等待", page=0, total=0)
-    view.update_lane(1, alias="B", pid="2", state="下載", page=1, total=3)
-    view.update_countdown(23)
-    assert "23" in view._lane_rows[0]["status"].value      # waiting lane shows secs
-    assert "23" not in view._lane_rows[1]["status"].value  # busy lane untouched
-    view.update_countdown(0)  # pickup fired -> suffix clears
+def test_lane_countdown_is_per_lane_not_shared(view):
+    """Each waiting lane counts down its OWN worker's wait (the per-slot
+    ``wait`` field); a global countdown tick never syncs across lanes."""
+    view.init_lanes(3)
+    view.update_lane(0, pid="1", state="等待", page=0, total=0, wait=23)
+    view.update_lane(1, pid="2", state="等待", page=0, total=0, wait=7)
+    view.update_lane(2, alias="B", pid="3", state="下載", page=1, total=3)
+    assert "23" in view._lane_rows[0]["status"].value
+    assert "7" in view._lane_rows[1]["status"].value
+    assert "23" not in view._lane_rows[1]["status"].value  # not mirrored
+    assert "23" not in view._lane_rows[2]["status"].value  # busy lane untouched
+    view.update_lane(0, wait=0)  # this worker's pickup fired -> suffix clears
     assert "23" not in view._lane_rows[0]["status"].value
     assert "等待" in view._lane_rows[0]["status"].value
+    assert "7" in view._lane_rows[1]["status"].value       # other lane unaffected
+
+
+def test_waiting_lane_shows_its_assigned_pid(view):
+    """A waiting lane displays WHICH PID this slot is about to process."""
+    view.init_lanes(2)
+    view.update_lane(0, pid="125400331", state="等待", page=0, total=0, wait=5)
+    view.update_lane(1, pid="", state="等待", page=0, total=0, wait=0)
+    assert "125400331" in view._lane_rows[0]["status"].value
+    assert "5" in view._lane_rows[0]["status"].value
+    assert "PID" not in view._lane_rows[1]["status"].value  # idle slot: plain text
+
+
+def test_global_countdown_does_not_touch_lanes(view):
+    view.init_lanes(1)
+    view.update_lane(0, pid="1", state="等待", page=0, total=0, wait=0)
+    before = view._lane_rows[0]["status"].value
+    view.update_countdown(42)
+    assert view._lane_rows[0]["status"].value == before
+    assert "42" not in view._lane_rows[0]["status"].value
 
 
 def test_countdown_never_reveals_fresh_lane(view):

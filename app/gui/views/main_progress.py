@@ -211,7 +211,8 @@ class _MainProgressMixin:
             visible=False,
         )
         return {"bar": bar, "alias": alias, "status": status, "row": row,
-                "state": {"alias": "", "pid": "", "state": "", "page": 0, "total": 0}}
+                "state": {"alias": "", "pid": "", "state": "", "page": 0,
+                          "total": 0, "wait": 0}}
 
     def init_lanes(self, count) -> None:
         try:
@@ -240,7 +241,7 @@ class _MainProgressMixin:
         if lane is None:
             return
         st = lane["state"]
-        for k in ("alias", "pid", "state", "page", "total"):
+        for k in ("alias", "pid", "state", "page", "total", "wait"):
             if k in fields and fields[k] is not None:
                 st[k] = fields[k]
         self._render_lane(lane)
@@ -267,11 +268,22 @@ class _MainProgressMixin:
             lane["status"].value = i18n.t("main.lane.querying", pid=pid)
         else:  # 等待 / cooldown between PIDs
             lane["bar"].value = 0
-            r = int(getattr(self, "_lane_countdown", 0) or 0)
-            lane["status"].value = (
-                i18n.t("main.lane.waiting_countdown", r=r) if r > 0
-                else i18n.t("main.lane.waiting")
-            )
+            # Per-lane countdown: each worker streams its OWN remaining wait
+            # (st["wait"]) — lanes never share/mirror one global countdown.
+            try:
+                r = int(st.get("wait") or 0)
+            except (TypeError, ValueError):
+                r = 0
+            if pid:
+                lane["status"].value = (
+                    i18n.t("main.lane.waiting_pid_countdown", pid=pid, r=r) if r > 0
+                    else i18n.t("main.lane.waiting_pid", pid=pid)
+                )
+            else:
+                lane["status"].value = (
+                    i18n.t("main.lane.waiting_countdown", r=r) if r > 0
+                    else i18n.t("main.lane.waiting")
+                )
         # Reveal on first real data — the load-bearing reflow toggle.
         lane["row"].visible = True
         self._safe_update(lane["row"])
@@ -311,10 +323,5 @@ class _MainProgressMixin:
         self._countdown_text.value = i18n.t("main.countdown", r=r) if r > 0 else ""
         # Update the meta Row, not just the Text, so it reflows reliably.
         self._safe_update(self._meta_row)
-        # Mirror the countdown onto lanes sitting in 等待 (the acquire wait IS
-        # this countdown). Only lanes already in 等待 re-render — never a
-        # fresh (state="") lane, whose reveal must wait for first real data.
-        self._lane_countdown = r
-        for lane in (getattr(self, "_lane_rows", None) or {}).values():
-            if lane["state"].get("state") == "等待":
-                self._render_lane(lane)
+        # NOTE: deliberately NOT mirrored onto lanes — each lane's countdown is
+        # its own worker's wait, streamed per-slot via the "lane" event (wait=N).

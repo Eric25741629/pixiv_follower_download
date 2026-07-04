@@ -1,4 +1,5 @@
 from __future__ import annotations
+import contextlib
 import random
 import threading
 import time
@@ -178,32 +179,47 @@ class AccountScheduler:
         gate_wait = max(0.0, self._next_emit_at - now)
         return max(acc_wait, gate_wait)
 
-    def acquire(self) -> AccountState | None:
+    def acquire(self, on_wait=None) -> AccountState | None:
         """Block until an account is ready and the throughput gate has
-        elapsed. Returns None when stop fires or all accounts are disabled."""
+        elapsed. Returns None when stop fires or all accounts are disabled.
+
+        ``on_wait(remaining_seconds)`` is an optional per-CALLER wait observer
+        (e.g. a per-worker UI lane). Unlike the shared ``countdown`` event
+        (globally throttled to 1/s across all workers), it fires on every poll
+        of THIS caller only, and is always called with 0 on exit/pickup."""
+        def _notify(remaining: int) -> None:
+            if on_wait is not None:
+                with contextlib.suppress(Exception):
+                    on_wait(remaining)
+
         while not self._stop_event.is_set():
             if not self._wait_for_resume():
                 self._emit_countdown(0)
+                _notify(0)
                 return None
 
             with self._lock:
                 active = [a for a in self._accounts if a.disabled_reason is None]
                 if not active:
                     self._empty_active_pool_response()
+                    _notify(0)
                     return None
                 now = time.monotonic()
                 wait = self._compute_wait(active, now)
                 if wait <= 0:
                     picked = self._try_pickup_ready_account(active, now)
                     if picked is not None:
+                        _notify(0)
                         return picked
 
             # Emit countdown tick for UI display
             self._emit_countdown(int(wait) + 1 if wait > 0 else 0)
+            _notify(int(wait) + 1 if wait > 0 else 0)
             # Poll at most 0.5 s so stop/pause can interrupt
             time.sleep(max(0.001, min(0.5, wait)))
 
         self._emit_countdown(0)
+        _notify(0)
         return None
 
     def _throughput_seconds(self, active: list[AccountState]) -> float:
