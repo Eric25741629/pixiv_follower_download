@@ -344,21 +344,27 @@ Review:
 全部低風險機械抽取,建議排進 A6/A7 批次順手做。逐項驗證結果:
 
 ### 復用（真重複,抽一份共用）
-- [ ] R1 `_refresh_cookie_requirement` 25 行整段重複 — `step3_cookie_labels.py:87` ≡ `step4_filters.py:129`(已確認兩處同名方法)。留 step3 一份,step4 mixin 改繼承/委派同一實作。
-- [ ] R2 `_apply_live_settings_if_changed` 的 signature 比對 + like/ban/must/special_like_rules 解析 ~30 行 — `thread_download.py:273` ≡ `thread_url_fetch.py:148`(已確認)。抽 `pixiv_thread_base._parse_live_filter_fields(live)`,兩邊只留各自欄位差異。
-- [ ] R3 網路三例 re-raise 樣板 7 處 — `pixiv_api.py:466`、`step4_media.py:169/330/588`、`thread_url_fetch.py:821/863`、`thread_pid_scan.py:559`。**注意:`pixiv_thread_base._NETWORK_RETRY_EXCEPTIONS` tuple 已存在(:28)**,最懶修法是 7 處 `except (...三行...)` 直接改 `except _NETWORK_RETRY_EXCEPTIONS:`,不必新造 contextmanager。
-- [ ] R4 `flush_for_shutdown` 的「flush + 靜默關 DB」尾段 — 4 處都有此方法(`thread_pid_scan.py:85`、`thread_url_fetch.py:262`、`thread_download.py:1535`、`thread_combined.py:713`)。抽 `PauseableThread._close_metadata_db_quietly()`,各自保留前段 flush 差異。
-- [ ] R5 artworks 的 `ON CONFLICT(pid) DO UPDATE ... COALESCE` upsert SQL — `metadata_db_artwork.py:68` 與 `metadata_db_migration.py:47` 近乎相同(migration 版**少 revoked_at 一欄**,合併時要保留此差異或補欄位後確認行為等價)。抽成 `metadata_db_schema.py` 模組常數。
-- [ ] R6 pictures_id 候選路徑組裝(path + APPDATA fallback)— `step3_check_exist.py:25` ≡ `step3_persistence.py:223`(已確認)。留一個 `_pictures_id_candidates(path)`。
-- [ ] R7 `_safe_meta_count` 兩份 — `step3_init_state.py:20` ≡ `thread_download.py:54`(已確認,僅 2 份非 3 份)。收進 `pixiv_thread_utils.py` 純函式 Move+re-export。
+- [x] R1 `_refresh_cookie_requirement` 25 行整段重複 — `step3_cookie_labels.py:87` ≡ `step4_filters.py:129`(已確認兩處同名方法)。留 step3 一份,step4 mixin 改繼承/委派同一實作。
+- [x] R2 `_apply_live_settings_if_changed` 的 signature 比對 + like/ban/must/special_like_rules 解析 ~30 行 — `thread_download.py:273` ≡ `thread_url_fetch.py:148`(已確認)。抽 `pixiv_thread_base._parse_live_filter_fields(live)`,兩邊只留各自欄位差異。
+- [x] R3 網路三例 re-raise 樣板 7 處 — `pixiv_api.py:466`、`step4_media.py:169/330/588`、`thread_url_fetch.py:821/863`、`thread_pid_scan.py:559`。**注意:`pixiv_thread_base._NETWORK_RETRY_EXCEPTIONS` tuple 已存在(:28)**,最懶修法是 7 處 `except (...三行...)` 直接改 `except _NETWORK_RETRY_EXCEPTIONS:`,不必新造 contextmanager。
+- [x] R4 `flush_for_shutdown` 的「flush + 靜默關 DB」尾段 — 4 處都有此方法(`thread_pid_scan.py:85`、`thread_url_fetch.py:262`、`thread_download.py:1535`、`thread_combined.py:713`)。抽 `PauseableThread._close_metadata_db_quietly()`,各自保留前段 flush 差異。
+- [x] R5 artworks 的 `ON CONFLICT(pid) DO UPDATE ... COALESCE` upsert SQL — `metadata_db_artwork.py:68` 與 `metadata_db_migration.py:47` 近乎相同(migration 版**少 revoked_at 一欄**,合併時要保留此差異或補欄位後確認行為等價)。抽成 `metadata_db_schema.py` 模組常數。
+- [x] R6 pictures_id 候選路徑組裝(path + APPDATA fallback)— `step3_check_exist.py:25` ≡ `step3_persistence.py:223`(已確認)。留一個 `_pictures_id_candidates(path)`。
+- [x] R7 `_safe_meta_count` 兩份 — `step3_init_state.py:20` ≡ `thread_download.py:54`(已確認,僅 2 份非 3 份)。收進 `pixiv_thread_utils.py` 純函式 Move+re-export。
 
 ### 刪除（死碼/已規劃）
-- [ ] D1 `cookie_speed_divisor` + `apply_cookie_pool_speedup` — CLAUDE.md 標 deprecated;**已實測 app/ 與 tests/ 零呼叫者**(findings.md 的呼叫點是舊碼殘影),只剩 `cookie_utils.py:176/188` 定義 + `pixiv_thread_utils.py:439` re-export。連 re-export 一起刪,同步刪 CLAUDE.md deprecated 句。
+- [x] D1 `cookie_speed_divisor` + `apply_cookie_pool_speedup` — CLAUDE.md 標 deprecated;**已實測 app/ 與 tests/ 零呼叫者**(findings.md 的呼叫點是舊碼殘影),只剩 `cookie_utils.py:176/188` 定義 + `pixiv_thread_utils.py:439` re-export。連 re-export 一起刪,同步刪 CLAUDE.md deprecated 句。
 - [ ] D2 PHASE-B JSON exist_pid 分支(`load_exist_pid_set` + `_read_exist_pid_json`/`_read_legacy_exist_pid_set`/`_trash_legacy_exist_pid_files`/`_augment_exist_pid_from_db` + exist.json/existPID.txt fallback)— 最大一筆(估 -150~250 行)但**前置是完成 Phase B 切換**(`_build_step2/3` 改 `closed_artwork_set()`),屬既有計畫,不與本輪機械抽取混做。
 
 ### 重構（複雜度,非重複;做完上面再說）
 - [ ] C1 `flet_app.main`(CC=32)— 閉包受限,CLAUDE.md 已明訂不搬,僅能繼續抽無狀態 helper;低優先。
 - [ ] C2 `combined_thread._process_one_pid_core`(CC=29)— query/seed/download 三段可抽 `_step_*` helper;**combined 剛做完 lane/parallel 且有未 commit 改動,等實機驗證穩定後再動**。
+
+### 執行結果(2026-07-05,branch worktree-refactor-reuse-dedupe)
+R1-R7+D1 全部完成,8 個 commit、一次一個 transformation、每步全測 1100 綠 + ruff 零新增(R4 還少 2 個既有 SIM105)。
+細節:R3 的 pixiv_api.py:466 保留(pixiv_thread_base 反向 star-import 會循環);R5 的 upsert_artwork
+revoked_at 移到 SET 清單尾端(SQL 語意等價);R2 抽 like/ban/must 共通塊,special_like_rules 兩邊差異保留。
+D2(PHASE-B 前置)、C1/C2(複雜度)未動,照原計畫等前置條件。
 
 ### 執行鐵則
 沿用拆分計畫:一次一個 transformation、全測綠才續、ruff 零新增;R1-R7+D1 皆純機械可先做,D2/C2 有前置條件。

@@ -2,7 +2,6 @@ import contextlib
 import os
 import datetime
 import random as pyrandom
-import requests
 from queue import Queue
 from pixiv_api import *
 from app.core.worker_event import WorkerEvent
@@ -19,6 +18,7 @@ from app.core.pixiv_thread_utils import (
     to_int_lenient,
 )
 from app.core.pixiv_thread_base import (
+    _NETWORK_RETRY_EXCEPTIONS,
     PauseableThread,
     _normalize_special_like_rules,
 )
@@ -163,18 +163,10 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         self._live_sig = sig
         dl = s.get("download", {}) or {}
         perf = s.get("performance", {}) or {}
-        try:
-            like = int(dl.get("like_num", 0) or 0)
-        except (TypeError, ValueError):
-            like = 0
-        self.like_num = like if like > 0 else 0
-        self.ban_tag = list(dl.get("ban_tag", []) or [])
-        self.must_tag = list(dl.get("must_tag", []) or [])
+        self._apply_live_filter_fields(dl)
         self.special_like_rules = _normalize_special_like_rules(
             dl.get("special_like_rules", []) or []
         )
-        self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
-        self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
         self.pid_wait_nocookie_min, self.pid_wait_nocookie_max = (
             self._resolve_nocookie_wait_range(
                 perf.get("pid_wait_nocookie_min", 1), perf.get("pid_wait_nocookie_max", 6)
@@ -265,12 +257,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             self._flush_url_meta_snapshot(full=True)
         except Exception:
             pass
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
+        self._close_metadata_db_quietly()
 
     # pictures_id loading + skip-file prefilter (_check_exist_candidate_paths,
     # _load_check_exist_block_set, _load_step2_skip_set, _scan_pictures_id_lines,
@@ -818,9 +805,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             if pid_cookie:
                 return Pixiv_info(url, Agent=Agent, cookie=pid_cookie, session=session)
             return Pixiv_info(url, Agent=Agent, session=session)
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
+        except _NETWORK_RETRY_EXCEPTIONS:
             raise
         except Exception as e:
             self._step3_safe_emit(
@@ -860,9 +845,7 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             info = self._step3_fetch_artwork_info(url, Agent, pid_key, pid_cookie, session)
             if self._stats_collector is not None:
                 self._stats_collector.report_request(label)
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
+        except _NETWORK_RETRY_EXCEPTIONS:
             raise
         except Exception:
             return None

@@ -3,8 +3,7 @@
 Extracted verbatim from ``pixiv_thread_utils`` (file-size refactor). These are
 pure, stdlib-only helpers with zero coupling to the rest of the module, used by
 the worker threads' __init__, the GUI cookie-persistence layer, and the cookies
-view. ``cookie_speed_divisor`` / ``apply_cookie_pool_speedup`` are deprecated
-(superseded by AccountScheduler) and kept only for import compatibility.
+view.
 
 ``pixiv_thread_utils`` re-exports every name here so existing
 ``from app.core.pixiv_thread_utils import normalize_cookie_entries`` callers keep
@@ -170,33 +169,6 @@ def format_cookie_usage_summary(cookie_usage_counts, cookie_pool=None, alias_map
         return "總計 {} 次；{}".format(total, "，".join(parts))
     except Exception:
         return "未使用 Cookie"
-
-
-# Deprecated: superseded by AccountScheduler per-account cooldown. Kept for import compat.
-def cookie_speed_divisor(cookie_pool):
-    """Speed multiplier for multi-cookie pool: n=1→1.0x, n=2→1.6x … max 4.0x."""
-    try:
-        n = len(cookie_pool or [])
-    except Exception:
-        n = 0
-    if n <= 1:
-        return 1.0
-    return min(4.0, 1.0 + 0.6 * float(n - 1))
-
-
-# Deprecated: superseded by AccountScheduler per-account cooldown. Kept for import compat.
-def apply_cookie_pool_speedup(delay, cookie_pool):
-    """Reduce delay proportionally to cookie pool size."""
-    try:
-        d = int(delay)
-    except Exception:
-        return delay
-    if d <= 0:
-        return 0
-    div = cookie_speed_divisor(cookie_pool)
-    if div <= 1.0:
-        return d
-    return max(1, int(round(float(d) / div)))
 
 
 def init_cookie_fields(raw_cookies):

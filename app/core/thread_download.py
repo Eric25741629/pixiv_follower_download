@@ -12,6 +12,7 @@ from app.core.worker_event import WorkerEvent
 from app import i18n
 import pixiv_api
 from app.core.pixiv_thread_utils import (
+    safe_meta_count as _safe_meta_count,
     append_diagnostic_event,
     atomic_write_text,
     count_text_lines,
@@ -49,13 +50,6 @@ from app.core import diag_log
 # stops instead of grinding out 0-byte / failed writes (2026-07-04 incident:
 # F: hit 0 bytes free and a 4-day combined run mass-failed 35k pages).
 LOW_DISK_MIN_FREE_BYTES = 100 * 1024 * 1024
-
-
-def _safe_meta_count(db) -> int:
-    try:
-        return int(db.meta_count())
-    except Exception:
-        return 0
 
 
 # Tag-cleanup regexes (_ZERO_WIDTH_RE / _BRACKET_CONTENT_RE /
@@ -315,16 +309,8 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         jxl = s.get("jxl", {}) or {}
 
         # filters (tighten-only for Step 4: the queue is already built)
-        try:
-            like = int(dl.get("like_num", 0) or 0)
-        except (TypeError, ValueError):
-            like = 0
-        self.like_num = like if like > 0 else 0
-        self.ban_tag = list(dl.get("ban_tag", []) or [])
-        self.must_tag = list(dl.get("must_tag", []) or [])
+        self._apply_live_filter_fields(dl)
         self.special_like_rules = list(dl.get("special_like_rules", []) or [])
-        self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
-        self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
         self.nogif = bool(flt.get("nogif", False))
         self.notag = bool(flt.get("notag", False))
         self.notime = bool(flt.get("notime", False))
@@ -1545,10 +1531,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         """
         with contextlib.suppress(Exception):
             self._persist_url_meta()
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            with contextlib.suppress(Exception):
-                db.close()
+        self._close_metadata_db_quietly()
 
     def stop(self):
         if self.single_mode_flag:

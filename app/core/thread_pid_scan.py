@@ -16,6 +16,7 @@ from app.core.pixiv_thread_utils import (
     safe_read_json,
 )
 from app.core.pixiv_thread_base import (
+    _NETWORK_RETRY_EXCEPTIONS,
     PauseableThread,
     _cookie_usage_label,
     _format_cookie_usage_summary,
@@ -95,12 +96,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread, _Step2BookmarkMixin,
             self._flush_step2_incremental(reason="shutdown")
         except Exception:
             pass
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
+        self._close_metadata_db_quietly()
 
     # 增量儲存：每 N 個作者完成後寫一次，保證崩潰時最多只丟 < 1 分鐘工作。
     # 沒有 in-progress 收集（_collected_pids 還沒初始化）就直接 no-op。
@@ -556,9 +552,7 @@ class get_pixiv_author_imgID_Thread(PauseableThread, _Step2BookmarkMixin,
             self._step2_append_new_pids(pid, author_id=author_pids)
             self._step2_record_author_progress(author_pids)
             return pid
-        except (requests.exceptions.ProxyError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ConnectionError):
+        except _NETWORK_RETRY_EXCEPTIONS:
             # Network/proxy failures must propagate so the scheduler-aware
             # caller (_run_step2_with_acquired_cookie) can disable the cookie
             # for this run. Without this re-raise the broad Exception handler
