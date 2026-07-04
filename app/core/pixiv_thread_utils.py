@@ -404,6 +404,14 @@ def read_pid_lines(file_path):
         return []
 
 
+def safe_meta_count(db) -> int:
+    """`db.meta_count()` with a 0 fallback (db may be None or broken)."""
+    try:
+        return int(db.meta_count())
+    except Exception:
+        return 0
+
+
 # JSON read + history-backup recovery helpers moved to json_recovery.py
 # (file-size refactor). Re-exported so existing
 # ``from app.core.pixiv_thread_utils import safe_read_json`` /

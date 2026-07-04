@@ -15,13 +15,7 @@ import threading
 from queue import Queue
 
 from app.core.pixiv_thread_utils import safe_read_json
-
-
-def _safe_meta_count(db) -> int:
-    try:
-        return int(db.meta_count())
-    except Exception:
-        return 0
+from app.core.pixiv_thread_utils import safe_meta_count as _safe_meta_count  # noqa: F401  (re-export)
 
 
 class _Step3InitStateMixin:

@@ -12,6 +12,7 @@ from app.core.worker_event import WorkerEvent
 from app import i18n
 import pixiv_api
 from app.core.pixiv_thread_utils import (
+    safe_meta_count as _safe_meta_count,
     append_diagnostic_event,
     atomic_write_text,
     count_text_lines,
@@ -49,13 +50,6 @@ from app.core import diag_log
 # stops instead of grinding out 0-byte / failed writes (2026-07-04 incident:
 # F: hit 0 bytes free and a 4-day combined run mass-failed 35k pages).
 LOW_DISK_MIN_FREE_BYTES = 100 * 1024 * 1024
-
-
-def _safe_meta_count(db) -> int:
-    try:
-        return int(db.meta_count())
-    except Exception:
-        return 0
 
 
 # Tag-cleanup regexes (_ZERO_WIDTH_RE / _BRACKET_CONTENT_RE /
