@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="750" viewBox="0 0 1100 750"
+     font-family="'Microsoft JhengHei','PingFang TC','Noto Sans TC','Segoe UI',sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f6f9ff"/><stop offset="0.5" stop-color="#ffffff"/><stop offset="1" stop-color="#f3f6fc"/>
+    </linearGradient>
+    <style>
+      .ttl{font-size:18px;font-weight:700;fill:#0f172a}
+      .hd{font-size:14px;font-weight:700;fill:#111827}
+      .t{font-size:13px;fill:#374151}
+      .sec{font-size:11px;fill:#6b7280}
+      .mono{font-family:Consolas,monospace;font-size:11px;fill:#9aa6b6}
+      .c{text-anchor:middle}
+      .panel{fill:#ffffff;fill-opacity:0.72;stroke:#cdd6e3;stroke-width:1.2}
+      .pill{fill:#eef2f7;stroke:#9aa5b1}
+      .pri{fill:#dbe8fd;stroke:#3b82f6;stroke-width:1.3}
+      .card{fill:#f3f5f9;stroke:#c5cfdd}
+      .bar{fill:#eef2f7;stroke:#c5cfdd}
+      .fill{fill:#93c5fd}
+      .ico{fill:none;stroke:#475569;stroke-width:1.6}
+      .icoon{fill:none;stroke:#2563eb;stroke-width:1.9}
+    </style>
+  </defs>
+  <rect width="1100" height="750" fill="url(#bg)"/>
+  <circle cx="1010" cy="70" r="180" fill="#dbe7ff" opacity="0.25"/>
+  <circle cx="110" cy="710" r="150" fill="#e7dbff" opacity="0.18"/>
+
+  <!-- ===== AppBar ===== -->
+  <text x="24" y="33" class="ttl">Pixiv 下載器</text>
+  <line x1="0" y1="50" x2="1100" y2="50" stroke="#dce3ee"/>
+  <circle cx="1066" cy="25" r="8" class="ico"/>
+  <g stroke="#475569" stroke-width="1.4">
+    <line x1="1066" y1="12" x2="1066" y2="16"/><line x1="1066" y1="34" x2="1066" y2="38"/>
+    <line x1="1053" y1="25" x2="1057" y2="25"/><line x1="1075" y1="25" x2="1079" y2="25"/>
+  </g>
+  <text x="1048" y="44" class="sec" text-anchor="end">切換深淺色</text>
+
+  <!-- ===== Floating glass nav (left) ===== -->
+  <rect x="16" y="70" width="88" height="372" rx="18" class="panel"/>
+  <!-- item 1 active: 主頁 -->
+  <rect x="26" y="80" width="68" height="84" rx="12" class="navon"/>
+  <path d="M48 116 L60 104 L72 116 M51 113 V126 H69 V113" class="icoon" fill="none"/>
+  <text x="60" y="150" class="c" font-size="12" font-weight="700" fill="#2563eb">主頁</text>
+  <!-- item 2: 設定 -->
+  <circle cx="60" cy="198" r="11" class="ico"/><circle cx="60" cy="198" r="3.5" class="ico"/>
+  <text x="60" y="234" class="c" font-size="12" fill="#475569">設定</text>
+  <!-- item 3: Cookie -->
+  <circle cx="60" cy="282" r="11" class="ico"/>
+  <circle cx="56" cy="279" r="1.6" fill="#475569"/><circle cx="64" cy="278" r="1.6" fill="#475569"/><circle cx="61" cy="286" r="1.6" fill="#475569"/>
+  <text x="60" y="318" class="c" font-size="12" fill="#475569">Cookie</text>
+  <!-- item 4: 統計 -->
+  <g class="ico"><line x1="52" y1="372" x2="52" y2="360"/><line x1="60" y1="372" x2="60" y2="352"/><line x1="68" y1="372" x2="68" y2="366"/></g>
+  <text x="60" y="396" class="c" font-size="12" fill="#475569">統計</text>
+
+  <!-- ===== Content: control panel ===== -->
+  <rect x="120" y="70" width="964" height="208" rx="14" class="panel"/>
+
+  <!-- mode row -->
+  <text x="140" y="100" class="t">來源</text>
+  <rect x="178" y="86" width="74" height="26" rx="13" class="pri"/><text x="215" y="103" class="c t">抓追隨</text>
+  <rect x="258" y="86" width="74" height="26" rx="13" class="pill"/><text x="295" y="103" class="c t">抓收藏</text>
+  <text x="392" y="100" class="t">追隨範圍</text>
+  <rect x="452" y="86" width="60" height="26" rx="13" class="pill"/><text x="482" y="103" class="c t">公開</text>
+  <rect x="518" y="86" width="72" height="26" rx="13" class="pill"/><text x="554" y="103" class="c t">非公開</text>
+  <rect x="596" y="86" width="60" height="26" rx="13" class="pri"/><text x="626" y="103" class="c t">全部</text>
+
+  <!-- action row -->
+  <rect x="140" y="124" width="92" height="40" rx="20" class="pri"/><text x="186" y="149" class="c hd" fill="#1d4ed8">一鍵執行</text>
+  <rect x="244" y="124" width="96" height="40" rx="10" class="card"/><text x="292" y="141" class="c sec">步驟 1</text><text x="292" y="156" class="c t">抓追蹤</text>
+  <rect x="348" y="124" width="96" height="40" rx="10" class="card"/><text x="396" y="141" class="c sec">步驟 2</text><text x="396" y="156" class="c t">抓 PID</text>
+  <rect x="452" y="124" width="96" height="40" rx="10" class="card"/><text x="500" y="141" class="c sec">步驟 3</text><text x="500" y="156" class="c t">抓 URL</text>
+  <rect x="556" y="124" width="96" height="40" rx="10" class="card"/><text x="604" y="141" class="c sec">步驟 4</text><text x="604" y="156" class="c t">下載</text>
+  <rect x="700" y="124" width="86" height="40" rx="20" class="pill"/><text x="743" y="149" class="c t">暫停</text>
+  <rect x="794" y="124" width="86" height="40" rx="20" class="pill"/><text x="837" y="149" class="c t">停止</text>
+  <text x="980" y="135" class="sec" text-anchor="end">步驟 3 在「邊查邊下」時</text>
+  <text x="980" y="150" class="sec" text-anchor="end">變「步驟 3+4」、步驟 4 隱藏</text>
+
+  <!-- overall progress -->
+  <text x="140" y="194" class="sec">整體進度</text>
+  <rect x="210" y="184" width="690" height="12" rx="6" class="bar"/><rect x="210" y="184" width="300" height="12" rx="6" class="fill"/>
+  <text x="918" y="194" class="t" font-weight="700">128 / 540</text>
+
+  <!-- page progress -->
+  <text x="140" y="218" class="sec">本作分頁</text>
+  <rect x="210" y="208" width="690" height="12" rx="6" class="bar"/><rect x="210" y="208" width="180" height="12" rx="6" fill="#7dd3fc"/>
+  <text x="918" y="218" class="t" font-weight="700">PID 12345 分頁 2/5</text>
+
+  <!-- meta row -->
+  <text x="210" y="242" class="t" fill="#0ea5e9" font-weight="700">正在下載：PID 12345</text>
+  <text x="470" y="242" class="sec">預計剩餘：07:42</text>
+  <text x="660" y="242" class="t" fill="#d97706" font-weight="700">倒數：18 秒</text>
+
+  <!-- phase row -->
+  <circle cx="146" cy="262" r="6" class="ico"/>
+  <text x="160" y="266" class="sec" fill="#0ea5e9">邊查邊下階段開始 / 正在下載：PID 12345</text>
+
+  <!-- ===== Content: log panel ===== -->
+  <rect x="120" y="290" width="964" height="436" rx="14" class="panel"/>
+  <text x="140" y="318" class="hd">即時 Log</text>
+  <line x1="140" y1="328" x2="1064" y2="328" stroke="#e3e9f2"/>
+  <g class="mono" fill="#9aa6b6">
+    <text x="140" y="352" class="mono">[03:14:05] 邊查邊下階段開始</text>
+    <text x="140" y="374" class="mono">[03:14:06] 待處理：查詢+下載 540 筆、純下載 12 筆</text>
+    <text x="140" y="396" class="mono">[03:14:09] PID 12345 取得帳號 alias=minato</text>
+    <text x="140" y="418" class="mono">[03:14:12] PID 12345 p0 完成</text>
+    <text x="140" y="440" class="mono">[03:14:13] PID 12345 p1 完成 ...</text>
+    <text x="140" y="462" class="mono" fill="#c0c8d4">（可框選複製、滾到底自動跟隨，上滑出現「跳到最新」膠囊）</text>
+  </g>
+
+  <!-- footnote -->
+  <text x="120" y="744" class="sec">主頁 / Home — 控制面板（來源切換・步驟按鈕・暫停停止・雙進度條・倒數/ETA）＋ 即時 Log　|　視窗 1100×750・玻璃擬態・極光漸層背景</text>
+</svg>

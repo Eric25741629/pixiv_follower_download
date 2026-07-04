@@ -123,6 +123,31 @@ def test_run_concurrent_download_only_pid_not_marked(monkeypatch):
     assert sorted(marked) == ["1", "3"]
 
 
+def test_send_rate_uses_recent_one_second_window(monkeypatch):
+    t = _thread(workers=2)
+    now = {"v": 100.0}
+    monkeypatch.setattr("app.core.thread_combined.time.monotonic", lambda: now["v"])
+
+    t._record_pid_send()
+    now["v"] = 100.4
+    t._record_pid_send()
+    now["v"] = 101.2
+
+    assert t._current_send_rate_per_sec() == 1.0
+
+
+def test_aggregate_phase_includes_current_send_rate(monkeypatch):
+    t = _thread(workers=2)
+    monkeypatch.setattr(t, "_current_send_rate_per_sec", lambda: 1.5)
+    with t._active_lock:
+        t._active_pids = {"122873228": "下載"}
+
+    t._emit_aggregate_phase(done=16, total=43445, workers=2)
+
+    phase = [e.data for e in _drain(t._q) if e.type == "phase"][-1]
+    assert "發送 1.5/s" in phase
+
+
 # ── distinct accounts held simultaneously (held flag) ──────────────────────
 def test_concurrent_workers_get_distinct_accounts():
     t = _thread(workers=2)

@@ -1,0 +1,367 @@
+"""Phase 1 紅燈測試：combined-mode 併發化 + ordinal×STRIDE timetag。
+
+對應 spec/plan：docs/superpowers/specs|plans/2026-06-15-combined-mode-concurrency*。
+全部 app.core 符號採「test 內延遲 import」，讓尚未實作的 Task 只讓該 test 紅、
+不影響整檔 collection —— OpenCode 可逐 Task 轉綠。
+"""
+import os, sys, tempfile, datetime, threading, time
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import pytest
+from queue import Queue
+
+
+@pytest.fixture(autouse=True)
+def _isolate_appdata(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+
+# ── shared builders (lazy app imports) ──────────────────────────────────────
+def _combined(ncookies=1, single=True):
+    from app.core.thread_combined import combined_thread
+    path = tempfile.mkdtemp()
+    cookies = [{"cookie": f"c{i}", "alias": f"A{i}"} for i in range(ncookies)]
+    return combined_thread(
+        q=Queue(), Author_list=[], Agent="UA", cookies=cookies, exist_pid=set(),
+        ban_tag=[], must_tag=[], like_num=0, no_to_check=[], base_path=path,
+        single_thread_mode=single, download_path=path,
+        download_time=datetime.datetime(1970, 1, 1),
+    )
+
+
+def _downloader():
+    from app.core.thread_download import download_thread
+    path = tempfile.mkdtemp()
+    return download_thread(
+        q=Queue(), nogif=False, notag=False, notime=False, create_dir=False,
+        download_path=path, cookies=[{"cookie": "c1", "alias": "A"}], agent="UA",
+        download_time=datetime.datetime(1970, 1, 1),
+        no_R18G_dir=False, no_R18_dir=False, single_thread_mode=True,
+        defer_step4_scan=True, db_base_path=path,
+    )
+
+
+class _Acc:
+    cookie = "c1"
+    proxy_url = None
+
+
+class _Sched:
+    def __init__(self, n):
+        self._n = n
+
+    def active_account_count(self):
+        return self._n
+
+
+# ── Task 1: _combined_worker_count ──────────────────────────────────────────
+class TestWorkerCount:
+    def test_cap_is_32(self):
+        from app.core.thread_combined import COMBINED_MAX_WORKERS
+        assert COMBINED_MAX_WORKERS == 32
+
+    def test_takes_min_of_cookies_pids_cap(self):
+        from app.core.thread_combined import _combined_worker_count
+        assert _combined_worker_count(active_cookie_count=100, pending_pid_count=100) == 32
+        assert _combined_worker_count(active_cookie_count=10, pending_pid_count=3) == 3
+        assert _combined_worker_count(active_cookie_count=4, pending_pid_count=50) == 4
+
+    def test_never_below_one(self):
+        from app.core.thread_combined import _combined_worker_count
+        assert _combined_worker_count(active_cookie_count=0, pending_pid_count=0) == 1
+        assert _combined_worker_count(active_cookie_count=1, pending_pid_count=5) == 1
+
+    def test_custom_cap(self):
+        from app.core.thread_combined import _combined_worker_count
+        assert _combined_worker_count(8, 50, cap=6) == 6
+
+
+# ── Task 2: AccountScheduler.active_account_count ────────────────────────────
+class TestActiveAccountCount:
+    def _sched(self, states):
+        from app.core.account_scheduler import AccountScheduler
+        return AccountScheduler(
+            accounts=states, get_cooldown_avg=lambda: 0.0,
+            pause_event=threading.Event(), stop_event=threading.Event(),
+        )
+
+    def test_counts_only_non_disabled(self):
+        from app.core.account_scheduler import AccountState
+        a = AccountState(cookie="c1", alias="A")
+        b = AccountState(cookie="c2", alias="B")
+        c = AccountState(cookie="c3", alias="C", disabled_reason="proxy_dead")
+        assert self._sched([a, b, c]).active_account_count() == 2
+
+    def test_zero_when_all_disabled(self):
+        from app.core.account_scheduler import AccountState
+        a = AccountState(cookie="c1", alias="A", disabled_reason="proxy_dead")
+        assert self._sched([a]).active_account_count() == 0
+
+
+# ── Task 3: _ConcurrentEventForwarder ───────────────────────────────────────
+class TestEventForwarder:
+    @staticmethod
+    def _drain(q):
+        out = []
+        while not q.empty():
+            out.append(q.get())
+        return out
+
+    def test_forwards_output_and_finished(self):
+        from app.core.combined_progress_queues import _ConcurrentEventForwarder
+        from app.core.worker_event import WorkerEvent
+        real = Queue()
+        f = _ConcurrentEventForwarder(real)
+        f.put(WorkerEvent("output", "<p>hi</p>"))
+        f.put(WorkerEvent("finished", "done"))
+        assert [e.type for e in self._drain(real)] == ["output", "finished"]
+
+    def test_drops_page_progress_and_engine_progress_and_phase(self):
+        from app.core.combined_progress_queues import _ConcurrentEventForwarder
+        from app.core.worker_event import WorkerEvent
+        real = Queue()
+        f = _ConcurrentEventForwarder(real)
+        f.put(WorkerEvent("page_progress", (1, 5)))
+        f.put(WorkerEvent("progress", (1, 0)))
+        f.put(WorkerEvent("phase", "正在查詢：PID 1"))
+        assert self._drain(real) == []
+
+    def test_put_never_raises_on_bad_event(self):
+        from app.core.combined_progress_queues import _ConcurrentEventForwarder
+        f = _ConcurrentEventForwarder(Queue())
+        f.put(object())  # must not raise
+
+
+# ── Task 4: ordinal×STRIDE timetag ──────────────────────────────────────────
+class TestOrdinalTimetag:
+    def test_stride_constant_exceeds_pixiv_max_pages(self):
+        from app.core.thread_download import TIMETAG_PID_STRIDE_SEC
+        assert TIMETAG_PID_STRIDE_SEC >= 256
+
+    def test_base_is_start_plus_ordinal_times_stride(self):
+        from app.core.thread_download import TIMETAG_PID_STRIDE_SEC
+        d = _downloader()
+        start = datetime.datetime(1970, 1, 1)
+        d._set_pid_time_base("100", start, ordinal=0)
+        d._set_pid_time_base("200", start, ordinal=1)
+        d._set_pid_time_base("300", start, ordinal=5)
+        assert d._page_timetag("100", 0) == start.strftime('%Y%m%d_%H%M%S')
+        assert d._page_timetag("100", 2) == (start + datetime.timedelta(seconds=2)).strftime('%Y%m%d_%H%M%S')
+        b1 = start + datetime.timedelta(seconds=TIMETAG_PID_STRIDE_SEC)
+        assert d._page_timetag("200", 0) == b1.strftime('%Y%m%d_%H%M%S')
+        b5 = start + datetime.timedelta(seconds=5 * TIMETAG_PID_STRIDE_SEC)
+        assert d._page_timetag("300", 3) == (b5 + datetime.timedelta(seconds=3)).strftime('%Y%m%d_%H%M%S')
+
+    def test_blocks_never_overlap_across_pids(self):
+        from app.core.thread_download import TIMETAG_PID_STRIDE_SEC
+        d = _downloader()
+        start = datetime.datetime(1970, 1, 1)
+        d._set_pid_time_base("a", start, 0)
+        d._set_pid_time_base("b", start, 1)
+        assert d._page_timetag("a", TIMETAG_PID_STRIDE_SEC - 1) < d._page_timetag("b", 0)
+
+    def test_concurrent_assignment_unique_and_ordered(self):
+        d = _downloader()
+        start = datetime.datetime(1970, 1, 1)
+        stamps = {}
+
+        def work(o):
+            pid = f"p{o}"
+            d._set_pid_time_base(pid, start, o)
+            stamps[o] = d._page_timetag(pid, 0)
+
+        threads = [threading.Thread(target=work, args=(o,)) for o in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        vals = [stamps[o] for o in range(50)]
+        assert len(set(vals)) == 50
+        assert vals == sorted(vals)
+
+    def test_persist_time_highwater_is_monotonic(self):
+        d = _downloader()
+        start = datetime.datetime(1970, 1, 1)
+        d._persist_time_highwater(start, ordinal=2)
+        after2 = d.download_time
+        d._persist_time_highwater(start, ordinal=0)  # lower ordinal must NOT rewind
+        assert d.download_time == after2
+        d._persist_time_highwater(start, ordinal=5)
+        assert d.download_time > after2
+
+
+# ── Task 5: _process_one_pid 回傳值 ─────────────────────────────────────────
+def _wire(t, *, query_urls, download_failed):
+    t._acquire_account = lambda: _Acc()
+    t._release_account = lambda acc, ok=True: None
+    t._release_account_after_work = lambda acc, ok=True, neutral=False: None
+
+    def fake_retry(label, fn):
+        if "下載" in label:
+            return True, fn(), None
+        return True, query_urls, None
+
+    t._run_with_network_retry = fake_retry
+    t.downloader._download_pid_group = lambda pid, urls: list(download_failed)
+    t.downloader._maybe_flush_exist_pid = lambda pid: None
+    t._seed_pending_urls = lambda pid, urls: None
+    t._mark_urls_done = lambda urls: None
+    t._persist_pid_meta = lambda pid: None
+    t.downloader._set_pid_time_base = lambda *a, **k: None
+    t._timetag_start = datetime.datetime(1970, 1, 1)
+
+
+class TestProcessOnePid:
+    def test_returns_failed_and_ok_tuple_clean(self):
+        t = _combined()
+        _wire(t, query_urls=["https://x/123_p0.jpg"], download_failed=[])
+        failed, ok = t._process_one_pid("123", needs_query=True, ordinal=0)
+        assert failed == []
+        assert ok is True
+
+    def test_returns_not_ok_on_partial_download_failure(self):
+        t = _combined()
+        _wire(t, query_urls=["https://x/9_p0.jpg"], download_failed=[["https://x/9_p0.jpg", "9"]])
+        failed, ok = t._process_one_pid("9", needs_query=True, ordinal=3)
+        assert ok is False
+        assert failed
+
+    def test_stop_sentinel_when_acquire_returns_none(self):
+        from app.core.thread_combined import _STOP_SENTINEL
+        t = _combined()
+        t._acquire_account = lambda: None
+        assert t._process_one_pid("1", needs_query=True, ordinal=0) is _STOP_SENTINEL
+
+    def test_two_pids_do_not_clobber_each_others_status(self):
+        t = _combined()
+        _wire(t, query_urls=["https://x/1_p0.jpg"], download_failed=[])
+        _, ok_clean = t._process_one_pid("1", needs_query=True, ordinal=0)
+        t.downloader._download_pid_group = lambda pid, urls: [["u", "2"]]
+        _, ok_fail = t._process_one_pid("2", needs_query=True, ordinal=1)
+        assert ok_clean is True and ok_fail is False
+
+
+# ── Task 6: run() 併發 pool + coordinator ───────────────────────────────────
+class TestConcurrentRun:
+    def _prep(self, t, order, active):
+        t._build_work_lists = lambda: ([p for p, _ in order], [])
+        t._resolve_combined_order = lambda q, d: order
+        t._share_scheduler = lambda: None
+        t._scheduler = _Sched(active)
+        t._finalize = lambda fn: None
+
+    def test_every_pid_processed_once_concurrently(self):
+        t = _combined(ncookies=4, single=False)
+        order = [(str(p), True) for p in range(10)]
+        self._prep(t, order, active=4)
+        seen = []
+        lock = threading.Lock()
+
+        def fake_process(pid, needs, ordinal):
+            with lock:
+                seen.append(pid)
+            return [], True
+
+        t._process_one_pid = fake_process
+        marked = []
+        t.fetcher._mark_pid_processed = lambda pid: marked.append(pid)
+        t.run()
+        assert sorted(seen) == sorted(p for p, _ in order)
+        assert sorted(marked) == sorted(p for p, _ in order)
+
+    def test_stop_sentinel_prevents_mark_processed(self):
+        from app.core.thread_combined import _STOP_SENTINEL
+        t = _combined(ncookies=4, single=False)
+        order = [(str(p), True) for p in range(6)]
+        self._prep(t, order, active=4)
+        marked = []
+        t.fetcher._mark_pid_processed = lambda pid: marked.append(pid)
+        t._process_one_pid = lambda pid, needs, ordinal: _STOP_SENTINEL
+        t.run()
+        assert marked == []
+
+    def test_k1_runs_sequentially_in_order(self):
+        t = _combined(ncookies=1, single=True)
+        order = [(str(p), True) for p in range(5)]
+        self._prep(t, order, active=1)
+        t.fetcher._mark_pid_processed = lambda pid: None
+        seen = []
+        t._process_one_pid = lambda pid, needs, ordinal: (seen.append((pid, ordinal)) or ([], True))
+        t.run()
+        assert seen == [(str(p), p) for p in range(5)]
+
+    def test_no_two_workers_hold_same_account(self):
+        t = _combined(ncookies=3, single=False)
+        order = [(str(p), True) for p in range(12)]
+        self._prep(t, order, active=3)
+        t.fetcher._mark_pid_processed = lambda pid: None
+        held = set()
+        maxhold = [0]
+        processed = []
+        lock = threading.Lock()
+        avail = ["c0", "c1", "c2"]
+
+        def process(pid, needs, ordinal):
+            while True:
+                with lock:
+                    if avail:
+                        c = avail.pop()
+                        held.add(c)
+                        maxhold[0] = max(maxhold[0], len(held))
+                        break
+                time.sleep(0.001)
+            time.sleep(0.005)
+            with lock:
+                held.discard(c)
+                avail.append(c)
+                processed.append(pid)
+            return [], True
+
+        t._process_one_pid = process
+        t.run()
+        # work must actually have run (guards against run() swallowing a TypeError
+        # and the invariant passing trivially with maxhold==0), and it must be
+        # genuinely concurrent (>=2 simultaneous holders) yet never exceed the pool.
+        assert len(processed) == 12
+        assert 2 <= maxhold[0] <= 3
+
+
+# ── Task 7: Step 4 串 ordinal timetag ───────────────────────────────────────
+class TestStep4Wiring:
+    def test_single_mode_sets_ordinal_base_per_pid(self):
+        from app.core.thread_download import TIMETAG_PID_STRIDE_SEC
+        d = _downloader()
+        d._scheduler = None
+        captured = {}
+
+        def fake_group(pid, urls):
+            captured[pid] = d._page_timetag(pid, 0)
+            return []
+
+        d._download_pid_group = fake_group
+        pid_order = ["a", "b", "c"]
+        pid_groups = {"a": ["ua"], "b": ["ub"], "c": ["uc"]}
+        d._execute_downloads_single(pid_order, pid_groups)
+        start = datetime.datetime(1970, 1, 1)
+        assert captured["a"] == start.strftime('%Y%m%d_%H%M%S')
+        assert captured["b"] == (start + datetime.timedelta(seconds=TIMETAG_PID_STRIDE_SEC)).strftime('%Y%m%d_%H%M%S')
+        assert captured["c"] == (start + datetime.timedelta(seconds=2 * TIMETAG_PID_STRIDE_SEC)).strftime('%Y%m%d_%H%M%S')
+
+
+# ── Regression: jpg_download must feed _page_timetag the REAL page index ─────
+# (pximg page token is "p0"/"p1"; a bare int("p0") would pin every page to 0 →
+# identical timetag per PID, breaking per-page +1s.)
+class TestJpgPageTimetag:
+    def test_jpg_download_uses_real_page_index_per_page(self):
+        d = _downloader()
+        start = datetime.datetime(1970, 1, 1)
+        d._set_pid_time_base("12345678", start, ordinal=0)
+        seen = []
+        d._jpg_attempt = lambda url, session, timetag: seen.append(timetag) or 0
+        tmpl = "https://i.pximg.net/img-original/img/2020/01/01/00/00/00/12345678_p{}.jpg"
+        for p in (0, 1, 2):
+            d.jpg_download(tmpl.format(p))
+        assert seen == [
+            start.strftime('%Y%m%d_%H%M%S'),
+            (start + datetime.timedelta(seconds=1)).strftime('%Y%m%d_%H%M%S'),
+            (start + datetime.timedelta(seconds=2)).strftime('%Y%m%d_%H%M%S'),
+        ]

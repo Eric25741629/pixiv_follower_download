@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="750" viewBox="0 0 1100 750"
+     font-family="'Microsoft JhengHei','PingFang TC','Noto Sans TC','Segoe UI',sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f6f9ff"/><stop offset="0.5" stop-color="#ffffff"/><stop offset="1" stop-color="#f3f6fc"/>
+    </linearGradient>
+    <style>
+      .ttl{font-size:18px;font-weight:700;fill:#0f172a}
+      .ph{font-size:18px;font-weight:700;fill:#0f172a}
+      .t{font-size:13px;fill:#374151}
+      .sec{font-size:11px;fill:#6b7280}
+      .mono{font-family:Consolas,monospace;font-size:10px;fill:#9aa6b6}
+      .c{text-anchor:middle}
+      .panel{fill:#ffffff;fill-opacity:0.72;stroke:#cdd6e3;stroke-width:1.2}
+      .row{fill:#ffffff;fill-opacity:0.6;stroke:#d7deea}
+      .pill{fill:#eef2f7;stroke:#9aa5b1}
+      .pri{fill:#dbe8fd;stroke:#3b82f6;stroke-width:1.3}
+      .field{fill:#ffffff;stroke:#c5cfdd}
+      .swon{fill:#93c5fd}.swt{fill:#cbd5e1}
+      .knob{fill:#ffffff;stroke:#94a3b8}
+      .ico{fill:none;stroke:#475569;stroke-width:1.6}
+      .ok{fill:#dcfce7;stroke:#22c55e}.bad{fill:#fee2e2;stroke:#ef4444}.test{fill:#fef9c3;stroke:#eab308}
+    </style>
+  </defs>
+  <rect width="1100" height="750" fill="url(#bg)"/>
+  <circle cx="1010" cy="70" r="180" fill="#dbe7ff" opacity="0.22"/>
+
+  <!-- AppBar -->
+  <text x="24" y="33" class="ttl">Pixiv 下載器</text>
+  <line x1="0" y1="50" x2="1100" y2="50" stroke="#dce3ee"/>
+  <circle cx="1066" cy="25" r="8" class="ico"/>
+
+  <!-- Nav (item 3 Cookie active) -->
+  <rect x="16" y="70" width="88" height="372" rx="18" class="panel"/>
+  <path d="M48 116 L60 104 L72 116 M51 113 V126 H69 V113" class="ico"/><text x="60" y="150" class="c" font-size="12" fill="#475569">主頁</text>
+  <circle cx="60" cy="198" r="11" class="ico"/><circle cx="60" cy="198" r="3.5" class="ico"/><text x="60" y="234" class="c" font-size="12" fill="#475569">設定</text>
+  <rect x="26" y="250" width="68" height="84" rx="12" fill="#e2edff" stroke="#3b82f6" stroke-width="1.5"/>
+  <circle cx="60" cy="282" r="11" fill="none" stroke="#2563eb" stroke-width="1.9"/><circle cx="56" cy="279" r="1.8" fill="#2563eb"/><circle cx="64" cy="278" r="1.8" fill="#2563eb"/><circle cx="61" cy="286" r="1.8" fill="#2563eb"/>
+  <text x="60" y="318" class="c" font-size="12" font-weight="700" fill="#2563eb">Cookie</text>
+  <g class="ico"><line x1="52" y1="372" x2="52" y2="360"/><line x1="60" y1="372" x2="60" y2="352"/><line x1="68" y1="372" x2="68" y2="366"/></g><text x="60" y="396" class="c" font-size="12" fill="#475569">統計</text>
+
+  <!-- Header toolbar -->
+  <text x="120" y="86" class="ph">Cookies</text>
+  <text x="208" y="86" class="sec">（共 10 筆，已選 3）</text>
+  <rect x="332" y="70" width="88" height="28" rx="14" class="pri"/><text x="376" y="89" class="c t" fill="#1d4ed8">＋ 新增</text>
+  <rect x="430" y="76" width="16" height="16" rx="3" class="field"/><path d="M433 84 l3 3 5 -6" stroke="#2563eb" stroke-width="1.6" fill="none"/><text x="452" y="89" class="t">全選</text>
+  <rect x="500" y="70" width="92" height="28" rx="14" class="pill"/><text x="546" y="89" class="c t">測試選取</text>
+  <rect x="600" y="70" width="92" height="28" rx="14" class="pill"/><text x="646" y="89" class="c t">測試全部</text>
+  <rect x="700" y="70" width="92" height="28" rx="14" class="pill"/><text x="746" y="89" class="c t">啟用選取</text>
+  <rect x="800" y="70" width="92" height="28" rx="14" class="pill"/><text x="846" y="89" class="c t">禁用選取</text>
+  <rect x="900" y="70" width="92" height="28" rx="14" class="pill"/><text x="946" y="89" class="c t">自動配對</text>
+  <line x1="120" y1="110" x2="1084" y2="110" stroke="#e3e9f2"/>
+
+  <!-- Cookie rows (scrollable list) -->
+  <!-- row template: y0 -->
+  <!-- ROW 1 (valid) -->
+  <g>
+    <rect x="120" y="120" width="964" height="60" rx="10" class="row"/>
+    <rect x="134" y="143" width="15" height="15" rx="3" class="field"/><path d="M137 151 l3 3 5 -6" stroke="#2563eb" stroke-width="1.5" fill="none"/>
+    <rect x="158" y="142" width="32" height="17" rx="8" class="swon"/><circle cx="182" cy="150" r="6.5" class="knob"/>
+    <text x="208" y="142" class="t" font-weight="700">主帳號</text>
+    <rect x="348" y="131" width="44" height="18" rx="9" class="ok"/><text x="370" y="144" class="c" font-size="10" fill="#15803d">有效</text>
+    <text x="402" y="144" class="sec">檢查：3 分鐘前</text>
+    <text x="208" y="166" class="mono">PHPSESSID=126925462_ZLRD8o5vfaori8znbmMQIkz...</text>
+    <rect x="790" y="135" width="180" height="26" rx="6" class="field"/><text x="800" y="152" class="sec">（本機 IP）</text><path d="M952 145 l6 6 6 -6" class="ico"/>
+    <circle cx="1000" cy="150" r="12" class="ico"/><path d="M996 154 l8 -8 2 2 -8 8 z" class="ico"/>
+    <circle cx="1040" cy="150" r="12" fill="none" stroke="#ef4444" stroke-width="1.6"/><path d="M1035 146 h10 M1037 146 v8 M1043 146 v8" stroke="#ef4444" stroke-width="1.4" fill="none"/>
+  </g>
+  <!-- ROW 2 (invalid) -->
+  <g>
+    <rect x="120" y="188" width="964" height="60" rx="10" class="row"/>
+    <rect x="134" y="211" width="15" height="15" rx="3" class="field"/>
+    <rect x="158" y="210" width="32" height="17" rx="8" class="swt"/><circle cx="166" cy="218" r="6.5" class="knob"/>
+    <text x="208" y="210" class="t" font-weight="700" fill="#94a3b8">infinite2（停用）</text>
+    <rect x="348" y="199" width="44" height="18" rx="9" class="bad"/><text x="370" y="212" class="c" font-size="10" fill="#b91c1c">失效</text>
+    <text x="402" y="212" class="sec">檢查：6月14日 21:32</text>
+    <text x="208" y="234" class="mono">first_visit_datetime_pc=2025-08-27%2003%3A49...</text>
+    <rect x="790" y="203" width="180" height="26" rx="6" class="field"/><text x="800" y="220" class="sec">http://10.0.0.5:1080</text><path d="M952 213 l6 6 6 -6" class="ico"/>
+    <circle cx="1000" cy="218" r="12" class="ico"/><path d="M996 222 l8 -8 2 2 -8 8 z" class="ico"/>
+    <circle cx="1040" cy="218" r="12" fill="none" stroke="#ef4444" stroke-width="1.6"/><path d="M1035 214 h10 M1037 214 v8 M1043 214 v8" stroke="#ef4444" stroke-width="1.4" fill="none"/>
+  </g>
+  <!-- ROW 3 (testing) -->
+  <g>
+    <rect x="120" y="256" width="964" height="60" rx="10" class="row"/>
+    <rect x="134" y="279" width="15" height="15" rx="3" class="field"/><path d="M137 287 l3 3 5 -6" stroke="#2563eb" stroke-width="1.5" fill="none"/>
+    <rect x="158" y="278" width="32" height="17" rx="8" class="swon"/><circle cx="182" cy="286" r="6.5" class="knob"/>
+    <text x="208" y="278" class="t" font-weight="700">f1213f6631yolov8</text>
+    <rect x="348" y="267" width="44" height="18" rx="9" class="test"/><text x="370" y="280" class="c" font-size="10" fill="#a16207">測試中</text>
+    <text x="402" y="280" class="sec">檢查：剛剛</text>
+    <text x="208" y="302" class="mono">first_visit_datetime_pc=2026-04-01%2001%3A14...</text>
+    <rect x="790" y="271" width="180" height="26" rx="6" class="field"/><text x="800" y="288" class="sec">socks5://host:1080</text><path d="M952 281 l6 6 6 -6" class="ico"/>
+    <circle cx="1000" cy="286" r="12" class="ico"/><path d="M996 290 l8 -8 2 2 -8 8 z" class="ico"/>
+    <circle cx="1040" cy="286" r="12" fill="none" stroke="#ef4444" stroke-width="1.6"/><path d="M1035 282 h10 M1037 282 v8 M1043 282 v8" stroke="#ef4444" stroke-width="1.4" fill="none"/>
+  </g>
+  <!-- ROW 4 / 5 (collapsed) -->
+  <rect x="120" y="324" width="964" height="60" rx="10" class="row"/><text x="208" y="358" class="sec">…（更多 cookie 列，可垂直捲動）</text>
+  <rect x="120" y="392" width="964" height="60" rx="10" class="row"/>
+
+  <!-- one-row anatomy callout -->
+  <text x="120" y="486" class="sec" font-weight="700">單列結構（左 → 右）：</text>
+  <text x="120" y="506" class="sec">勾選框 ＋ 啟用開關　|　別名(140) ＋ 狀態徽章(有效/失效/測試中) ＋「檢查：時間」(130)　／　下方：cookie 預覽(等寬字、tooltip 全文)　|　Proxy 綁定下拉(180) ＋ 編輯 ✎ ＋ 刪除 🗑</text>
+
+  <!-- edit dialog mock -->
+  <rect x="640" y="520" width="444" height="200" rx="14" fill="#ffffff" fill-opacity="0.96" stroke="#9aa5b1" stroke-width="1.4" stroke-dasharray="6 4"/>
+  <text x="660" y="548" class="t" font-weight="700">新增 / 編輯 Cookie（對話框）</text>
+  <rect x="660" y="560" width="300" height="28" rx="6" class="field"/><text x="670" y="578" class="sec">別名（例：主帳號）</text>
+  <rect x="660" y="598" width="404" height="70" rx="6" class="field"/><text x="670" y="616" class="sec">Cookie 字串（多行）</text>
+  <rect x="868" y="682" width="80" height="28" rx="14" class="pill"/><text x="908" y="701" class="c t">取消</text>
+  <rect x="958" y="682" width="106" height="28" rx="14" class="pri"/><text x="1011" y="701" class="c t" fill="#1d4ed8">儲存</text>
+
+  <text x="120" y="742" class="sec">Cookie — 工具列（新增・全選・測試/啟用/禁用選取・測試全部・自動配對）＋ 玻璃卡列表（多 cookie 輪替，每帳號綁定 Proxy）</text>
+</svg>

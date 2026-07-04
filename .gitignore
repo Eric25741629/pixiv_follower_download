@@ -90,3 +90,7 @@ docs/superpowers/
 
 # 個人歸檔（舊版 PyQt5 UI、notebooks、archive、driver zip 等）
 other/
+
+# 工具暫存
+.superpowers/
+tmp_review/

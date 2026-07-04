@@ -2,6 +2,8 @@ import concurrent.futures
 import contextlib
 import os
 import threading
+import time
+from collections import deque
 
 from app.core.worker_event import WorkerEvent
 from app import i18n
@@ -116,6 +118,8 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         # Concurrent-mode bookkeeping (only used when combined_workers > 1).
         self._active_lock = threading.Lock()
         self._active_pids = {}
+        self._send_rate_lock = threading.Lock()
+        self._send_timestamps = deque()
         # Per-thread lane context for the parallel per-worker panel. Created here
         # (not just in _run_concurrent) so sequential mode's finally `del
         # self._lane_ctx_local.ctx` finds the attribute and is a clean no-op
@@ -258,6 +262,7 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         if acc is None:
             diag_log.log(diag_log.WORKER, f"PID {pid} acquire -> None (stop/all-disabled)")
             return None, False  # stop / all disabled -> caller breaks
+        self._record_pid_send()
         diag_log.log(diag_log.WORKER, f"PID {pid} 取得帳號 alias={getattr(acc, 'alias', '?')}")
         # Lane now shows which cookie this worker holds + whether it is querying.
         if slot is not None:
@@ -302,6 +307,19 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 urls = self._download_only_urls(pid)
 
             urls = [u for u in urls if isinstance(u, str) and u.startswith("http")]
+            if needs_query and urls:
+                # Resume filter: a previous partial/stopped run persisted its
+                # completed pages per-page (_flush_partial_done); drop them so
+                # the re-queried PID downloads only what is still pending
+                # instead of duplicating those pages under a new timetag.
+                kept = self._drop_already_downloaded(pid, urls)
+                if not kept:
+                    # Every page already on disk from an earlier run: finish
+                    # the bookkeeping a clean download would have done so the
+                    # PID actually closes instead of re-querying forever.
+                    self.downloader._maybe_flush_exist_pid(pid)
+                    self._persist_pid_meta(pid)
+                urls = kept
             if urls:
                 # Seed the pending pages before download so a partial failure /
                 # crash leaves a recoverable pending trail in the DB.
@@ -355,6 +373,14 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                     download_ok = False
                 else:
                     self._mark_urls_done(urls)
+                if not download_ok:
+                    # Partial/stopped: persist the pages that DID land so the
+                    # next run resumes from them. _completed_urls only ever
+                    # holds pages confirmed on disk (ret 0/-1), so this can
+                    # never close an unattempted page — the rest of the PID
+                    # stays pending (stop ≠ success still holds).
+                    self._flush_partial_done(urls)
+                if download_ok:
                     self.downloader._maybe_flush_exist_pid(pid)
                     # A queried PID's meta lives only in the fetcher's
                     # in-memory url_meta until _finalize. Persist it now so
@@ -411,6 +437,43 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             return
         with contextlib.suppress(Exception):
             db.upsert_pending_urls([(u, pid) for u in urls])
+
+    def _flush_partial_done(self, urls):
+        """Persist per-page progress of a partial/stopped PID.
+
+        Marks as downloaded only the pages the downloader confirmed on disk
+        (``_completed_urls``: ret 0 = downloaded, ret -1 = already present).
+        Unattempted / failed / mid-stream-stopped pages are never in that set,
+        so they stay pending and resume next run."""
+        dl = self.downloader
+        try:
+            with dl._completed_urls_lock:
+                done = [u for u in urls if u in dl._completed_urls]
+        except Exception:
+            return
+        if done:
+            self._mark_urls_done(done)
+
+    def _drop_already_downloaded(self, pid, urls):
+        """Resume filter: drop pages whose ``pages`` row is already
+        ``status='downloaded'``. Unparseable urls (e.g. ugoira zips) are kept —
+        safe default (whole-PID behavior unchanged for them)."""
+        db = self.fetcher._metadata_db
+        if db is None or not urls:
+            return urls
+        try:
+            done = db.downloaded_page_indices(pid)
+        except Exception:
+            return urls
+        if not done:
+            return urls
+        from app.core.pid_filesystem import parse_pid_and_page_from_url
+        kept = []
+        for u in urls:
+            _, pidx = parse_pid_and_page_from_url(str(u))
+            if pidx is None or pidx not in done:
+                kept.append(u)
+        return kept
 
     def _mark_urls_done(self, urls):
         db = self.fetcher._metadata_db
@@ -655,11 +718,34 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         with self._active_lock:
             active = list(self._active_pids.keys())
         shown = "、".join(active) if active else "-"
+        send_rate = self._current_send_rate_per_sec()
         with contextlib.suppress(Exception):
             self._q.put(WorkerEvent(
                 "phase",
-                f"邊查邊下中（{len(active)}/{workers} 並發，完成 {done}/{total}）：PID {shown}",
+                f"邊查邊下中（{len(active)}/{workers} 並發，發送 {send_rate:.1f}/s，"
+                f"完成 {done}/{total}）：PID {shown}",
             ))
+
+    def _record_pid_send(self):
+        # Stub-safe: tests build combined_thread via __new__ (no __init__),
+        # so the send-rate state may be absent — the metric is display-only.
+        if getattr(self, "_send_rate_lock", None) is None:
+            return
+        now = time.monotonic()
+        with self._send_rate_lock:
+            self._send_timestamps.append(now)
+            self._trim_send_timestamps_locked(now)
+
+    def _current_send_rate_per_sec(self) -> float:
+        now = time.monotonic()
+        with self._send_rate_lock:
+            self._trim_send_timestamps_locked(now)
+            return float(len(self._send_timestamps))
+
+    def _trim_send_timestamps_locked(self, now: float) -> None:
+        cutoff = now - 1.0
+        while self._send_timestamps and self._send_timestamps[0] <= cutoff:
+            self._send_timestamps.popleft()
 
     def _finalize(self, failed_nested):
         # Fetcher side: persist meta + revoked + pending list.

@@ -141,6 +141,20 @@ class _PagesMixin:
         if rows:
             self.mark_pages_downloaded_bulk(rows)
 
+    def downloaded_page_indices(self, pid) -> set:
+        """Page indices of *pid* already ``status='downloaded'``.
+
+        Resume filter for combined mode: a re-queried PID drops these pages
+        instead of re-downloading (and duplicating under a new timetag)."""
+        pid_key = self._coerce_pid(pid)
+        if not pid_key:
+            return set()
+        cur = self._conn().execute(
+            "SELECT page_index FROM pages WHERE pid=? AND status='downloaded'",
+            (pid_key,),
+        )
+        return {int(r[0]) for r in cur.fetchall()}
+
     def pending_url_count(self) -> int:
         """Number of ``pages`` rows with ``status='pending'``."""
         cur = self._conn().execute(

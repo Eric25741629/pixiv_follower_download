@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="1460" viewBox="0 0 1100 1460"
+     font-family="'Microsoft JhengHei','PingFang TC','Noto Sans TC','Segoe UI',sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f6f9ff"/><stop offset="0.5" stop-color="#ffffff"/><stop offset="1" stop-color="#f3f6fc"/>
+    </linearGradient>
+    <style>
+      .ttl{font-size:18px;font-weight:700;fill:#0f172a}
+      .shd{font-size:15px;font-weight:700;fill:#1d4ed8}
+      .hd{font-size:13px;font-weight:700;fill:#334155}
+      .t{font-size:13px;fill:#374151}
+      .sec{font-size:11px;fill:#6b7280}
+      .ph{font-size:11px;fill:#aab4c2}
+      .c{text-anchor:middle}
+      .panel{fill:#ffffff;fill-opacity:0.72;stroke:#cdd6e3;stroke-width:1.2}
+      .pill{fill:#eef2f7;stroke:#9aa5b1}
+      .pri{fill:#dbe8fd;stroke:#3b82f6;stroke-width:1.3}
+      .field{fill:#ffffff;stroke:#c5cfdd}
+      .swt{fill:#cbd5e1}.swon{fill:#93c5fd}
+      .knob{fill:#ffffff;stroke:#94a3b8}
+      .ico{fill:none;stroke:#475569;stroke-width:1.6}
+    </style>
+  </defs>
+  <rect width="1100" height="1460" fill="url(#bg)"/>
+
+  <!-- AppBar -->
+  <text x="24" y="33" class="ttl">Pixiv 下載器</text>
+  <line x1="0" y1="50" x2="1100" y2="50" stroke="#dce3ee"/>
+  <circle cx="1066" cy="25" r="8" class="ico"/>
+
+  <!-- Nav (item 2 設定 active) -->
+  <rect x="16" y="70" width="88" height="372" rx="18" class="panel"/>
+  <path d="M48 116 L60 104 L72 116 M51 113 V126 H69 V113" class="ico"/>
+  <text x="60" y="150" class="c" font-size="12" fill="#475569">主頁</text>
+  <rect x="26" y="166" width="68" height="84" rx="12" fill="#e2edff" stroke="#3b82f6" stroke-width="1.5"/>
+  <circle cx="60" cy="198" r="11" fill="none" stroke="#2563eb" stroke-width="1.9"/><circle cx="60" cy="198" r="3.5" fill="none" stroke="#2563eb" stroke-width="1.9"/>
+  <text x="60" y="234" class="c" font-size="12" font-weight="700" fill="#2563eb">設定</text>
+  <circle cx="60" cy="282" r="11" class="ico"/><circle cx="56" cy="279" r="1.6" fill="#475569"/><circle cx="64" cy="278" r="1.6" fill="#475569"/><circle cx="61" cy="286" r="1.6" fill="#475569"/>
+  <text x="60" y="318" class="c" font-size="12" fill="#475569">Cookie</text>
+  <g class="ico"><line x1="52" y1="372" x2="52" y2="360"/><line x1="60" y1="372" x2="60" y2="352"/><line x1="68" y1="372" x2="68" y2="366"/></g>
+  <text x="60" y="396" class="c" font-size="12" fill="#475569">統計</text>
+  <text x="60" y="430" class="c" font-size="9" fill="#9aa6b6">(固定)</text>
+
+  <!-- scrollbar hint -->
+  <rect x="1080" y="70" width="6" height="1300" rx="3" fill="#e3e9f2"/>
+  <rect x="1080" y="70" width="6" height="300" rx="3" fill="#bcc7d6"/>
+
+  <!-- ============ Section 1 帳號與連線 ============ -->
+  <rect x="120" y="70" width="952" height="206" rx="14" class="panel"/>
+  <text x="140" y="98" class="shd">帳號與連線</text>
+  <text x="140" y="124" class="hd">Pixiv 帳號</text>
+  <rect x="140" y="132" width="280" height="28" rx="6" class="field"/><text x="150" y="150" class="ph">帳號</text>
+  <rect x="432" y="132" width="280" height="28" rx="6" class="field"/><text x="442" y="150" class="ph">密碼 ●●●●</text>
+  <rect x="724" y="132" width="180" height="28" rx="6" class="field"/><text x="734" y="150" class="ph">User ID</text>
+  <text x="140" y="184" class="hd">User-Agent</text>
+  <rect x="140" y="192" width="600" height="28" rx="6" class="field"/><text x="150" y="210" class="ph">未設定，將使用內建隨機 UA</text>
+  <rect x="752" y="192" width="150" height="28" rx="14" class="pill"/><text x="827" y="210" class="c t">重新偵測 Chrome</text>
+  <text x="140" y="244" class="hd">Proxy</text>
+  <rect x="140" y="250" width="600" height="16" rx="4" class="field"/><text x="150" y="262" class="ph">Proxy 列表（每行一個）http:// socks5://</text>
+  <rect x="752" y="244" width="150" height="24" rx="12" class="pill"/><text x="827" y="260" class="c t">測試全部 Proxy</text>
+
+  <!-- ============ Section 2 下載輸出 ============ -->
+  <rect x="120" y="292" width="952" height="384" rx="14" class="panel"/>
+  <text x="140" y="320" class="shd">下載輸出</text>
+  <text x="140" y="346" class="hd">下載位置</text>
+  <rect x="140" y="354" width="730" height="28" rx="6" class="field"/><text x="150" y="372" class="ph">下載路徑（唯讀）  F:\pixiv_test_2026_05\</text>
+  <rect x="882" y="354" width="34" height="28" rx="6" class="pill"/><text x="899" y="373" class="c t">📁</text>
+  <text x="140" y="406" class="hd">資料夾分類</text>
+  <g><rect x="140" y="414" width="34" height="18" rx="9" class="swon"/><circle cx="165" cy="423" r="7" class="knob"/><text x="182" y="427" class="t">依作者 ID 建立子資料夾</text></g>
+  <g><rect x="370" y="414" width="34" height="18" rx="9" class="swon"/><circle cx="395" cy="423" r="7" class="knob"/><text x="412" y="427" class="t">R-18 作品分類資料夾</text></g>
+  <g><rect x="600" y="414" width="34" height="18" rx="9" class="swt"/><circle cx="609" cy="423" r="7" class="knob"/><text x="642" y="427" class="t">R-18G 作品分類資料夾</text></g>
+  <g><rect x="140" y="442" width="34" height="18" rx="9" class="swon"/><circle cx="165" cy="451" r="7" class="knob"/><text x="182" y="455" class="t">AI 生成作品分類資料夾（關閉後下載到一般路徑）</text></g>
+  <text x="140" y="486" class="hd">檔名範本 / 時間戳</text>
+  <rect x="140" y="494" width="430" height="28" rx="6" class="field"/><text x="150" y="512" class="ph">檔名範本（留空＝使用預設）</text>
+  <rect x="586" y="494" width="318" height="28" rx="6" class="field"/><text x="596" y="512" class="ph">下載時間戳起點 (YYYY-MM-DD HH:MM:SS)</text>
+  <g><rect x="140" y="532" width="34" height="18" rx="9" class="swon"/><circle cx="165" cy="541" r="7" class="knob"/><text x="182" y="545" class="t">下載檔案時間設為時間戳 (mtime)</text></g>
+  <g><rect x="430" y="532" width="34" height="18" rx="9" class="swt"/><circle cx="439" cy="541" r="7" class="knob"/><text x="472" y="545" class="t">無 tag 不下載</text></g>
+  <g><rect x="600" y="532" width="34" height="18" rx="9" class="swt"/><circle cx="609" cy="541" r="7" class="knob"/><text x="642" y="545" class="t">無時間不下載</text></g>
+  <text x="140" y="576" class="hd">Tag 整理（套用於 {hashtag}）</text>
+  <g><rect x="140" y="584" width="34" height="18" rx="9" class="swt"/><circle cx="149" cy="593" r="7" class="knob"/><text x="182" y="597" class="t">Tag 過濾括號內容</text></g>
+  <g><rect x="370" y="584" width="34" height="18" rx="9" class="swt"/><circle cx="379" cy="593" r="7" class="knob"/><text x="412" y="597" class="t">Tag 過濾裝飾符號與 emoji</text></g>
+  <text x="140" y="628" class="hd">JXL 轉檔</text>
+  <g><rect x="140" y="636" width="34" height="18" rx="9" class="swt"/><circle cx="149" cy="645" r="7" class="knob"/><text x="182" y="649" class="t">啟用 JXL 轉檔</text></g>
+  <rect x="320" y="635" width="360" height="22" rx="6" class="field"/><text x="330" y="650" class="ph">cjxl.exe 路徑（唯讀）</text>
+  <rect x="694" y="635" width="22" height="22" rx="6" class="pill"/><text x="705" y="651" class="c sec">…</text>
+  <g><rect x="740" y="636" width="34" height="18" rx="9" class="swt"/><circle cx="749" cy="645" r="7" class="knob"/><text x="782" y="649" class="t">刪除原檔</text></g>
+  <text x="140" y="668" class="t">Effort（1-9）</text>
+  <line x1="240" y1="663" x2="430" y2="663" stroke="#c5cfdd" stroke-width="3" stroke-linecap="round"/><circle cx="380" cy="663" r="7" class="knob"/>
+
+  <!-- ============ Section 3 作品篩選 ============ -->
+  <rect x="120" y="692" width="952" height="200" rx="14" class="panel"/>
+  <text x="140" y="720" class="shd">作品篩選</text>
+  <g><rect x="140" y="734" width="34" height="18" rx="9" class="swt"/><circle cx="149" cy="743" r="7" class="knob"/><text x="182" y="747" class="t">隱藏追蹤</text></g>
+  <g><rect x="300" y="734" width="34" height="18" rx="9" class="swt"/><circle cx="309" cy="743" r="7" class="knob"/><text x="342" y="747" class="t">過濾 GIF</text></g>
+  <rect x="140" y="762" width="150" height="28" rx="6" class="field"/><text x="150" y="780" class="ph">最低讚數（一般）</text>
+  <rect x="306" y="762" width="150" height="28" rx="6" class="field"/><text x="316" y="780" class="ph">最低讚數（R18）</text>
+  <rect x="472" y="762" width="200" height="28" rx="6" class="field"/><text x="482" y="780" class="ph">重抓上限（天數，0=關閉）</text>
+  <text x="140" y="816" class="hd">禁止 tag</text>
+  <rect x="140" y="824" width="70" height="22" rx="11" class="pill"/><text x="175" y="839" class="c sec">tagA ✕</text>
+  <rect x="218" y="824" width="80" height="22" rx="11" class="pill"/><text x="258" y="839" class="c sec">tagB ✕</text>
+  <rect x="500" y="822" width="160" height="26" rx="6" class="field"/><text x="510" y="839" class="ph">新增禁止 tag　＋</text>
+  <text x="140" y="872" class="hd">必須 tag</text>
+  <rect x="500" y="858" width="160" height="26" rx="6" class="field"/><text x="510" y="875" class="ph">新增必須 tag　＋</text>
+
+  <!-- ============ Section 4 執行流程 ============ -->
+  <rect x="120" y="908" width="952" height="206" rx="14" class="panel"/>
+  <text x="140" y="936" class="shd">執行流程</text>
+  <text x="140" y="962" class="hd">作品來源</text>
+  <rect x="140" y="970" width="220" height="28" rx="6" class="field"/><text x="150" y="988" class="ph">作品來源　抓追隨畫師</text><path d="M340 982 l6 6 6 -6" class="ico"/>
+  <rect x="376" y="970" width="220" height="28" rx="6" class="field"/><text x="386" y="988" class="ph">追隨範圍　全部追隨</text><path d="M576 982 l6 6 6 -6" class="ico"/>
+  <rect x="612" y="970" width="220" height="28" rx="6" class="field"/><text x="622" y="988" class="ph">收藏範圍　全部收藏</text><path d="M812 982 l6 6 6 -6" class="ico"/>
+  <g><rect x="140" y="1018" width="34" height="18" rx="9" class="swon"/><circle cx="165" cy="1027" r="7" class="knob"/><text x="182" y="1031" class="t">邊查邊下（查到即下載，合併步驟三、四）</text></g>
+  <rect x="520" y="1014" width="220" height="28" rx="6" class="field"/><text x="530" y="1032" class="ph">邊查邊下並發數（1=循序）</text>
+  <g><rect x="140" y="1052" width="34" height="18" rx="9" class="swon"/><circle cx="165" cy="1061" r="7" class="knob"/><text x="182" y="1065" class="t">依作者順序下載（同作者連續）</text></g>
+  <g><rect x="140" y="1080" width="34" height="18" rx="9" class="swt"/><circle cx="149" cy="1089" r="7" class="knob"/><text x="182" y="1093" class="t">強制重新掃描全部畫家（忽略30天，一次性）</text></g>
+
+  <!-- ============ Section 5 速度與自動化 ============ -->
+  <rect x="120" y="1130" width="952" height="232" rx="14" class="panel"/>
+  <text x="140" y="1158" class="shd">速度與自動化</text>
+  <text x="140" y="1184" class="hd">冷卻與等待</text>
+  <rect x="140" y="1192" width="170" height="28" rx="6" class="field"/><text x="150" y="1210" class="ph">單帳號冷卻秒數  45</text>
+  <line x1="330" y1="1206" x2="560" y2="1206" stroke="#c5cfdd" stroke-width="3" stroke-linecap="round"/><circle cx="430" cy="1206" r="7" class="knob"/>
+  <text x="580" y="1210" class="sec">提示：建議 ≥ 30 秒</text>
+  <text x="140" y="1244" class="t">同 PID 頁間等待（秒）</text>
+  <rect x="300" y="1230" width="64" height="24" rx="6" class="field"/><text x="372" y="1247" class="t">~</text><rect x="384" y="1230" width="64" height="24" rx="6" class="field"/>
+  <text x="500" y="1244" class="t">免 Cookie 請求等待（秒）</text>
+  <rect x="680" y="1230" width="64" height="24" rx="6" class="field"/><text x="752" y="1247" class="t">~</text><rect x="764" y="1230" width="64" height="24" rx="6" class="field"/>
+  <g><rect x="140" y="1268" width="34" height="18" rx="9" class="swt"/><circle cx="149" cy="1277" r="7" class="knob"/><text x="182" y="1281" class="t">單執行緒 PID 模式</text></g>
+  <text x="140" y="1314" class="hd">排程</text>
+  <g><rect x="140" y="1322" width="34" height="18" rx="9" class="swt"/><circle cx="149" cy="1331" r="7" class="knob"/><text x="182" y="1335" class="t">啟用排程（定時自動 Run All）</text></g>
+  <rect x="430" y="1320" width="200" height="24" rx="6" class="field"/><text x="440" y="1336" class="ph">排程方式　每日固定時間</text><path d="M610 1328 l6 6 6 -6" class="ico"/>
+  <rect x="650" y="1320" width="120" height="24" rx="6" class="field"/><text x="660" y="1336" class="ph">每日 03:00</text>
+  <rect x="784" y="1320" width="120" height="24" rx="6" class="field"/><text x="794" y="1336" class="ph">間隔 6 小時</text>
+
+  <!-- Save -->
+  <rect x="120" y="1380" width="150" height="40" rx="20" class="pri"/><text x="195" y="1405" class="c shd" fill="#1d4ed8">💾 儲存設定</text>
+  <text x="290" y="1405" class="sec">（開關即時 autosave；文字/滑桿需按「儲存設定」）</text>
+
+  <text x="120" y="1448" class="sec">設定 / Settings — 可捲動長表單，5 大區：帳號與連線・下載輸出・作品篩選・執行流程・速度與自動化　|　視窗實際可見高約 670px（其餘捲動）</text>
+</svg>

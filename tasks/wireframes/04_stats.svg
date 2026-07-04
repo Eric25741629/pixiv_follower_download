@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="750" viewBox="0 0 1100 750"
+     font-family="'Microsoft JhengHei','PingFang TC','Noto Sans TC','Segoe UI',sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f6f9ff"/><stop offset="0.5" stop-color="#ffffff"/><stop offset="1" stop-color="#f3f6fc"/>
+    </linearGradient>
+    <style>
+      .ttl{font-size:18px;font-weight:700;fill:#0f172a}
+      .ph{font-size:18px;font-weight:700;fill:#0f172a}
+      .t{font-size:13px;fill:#374151}
+      .sec{font-size:12px;fill:#6b7280}
+      .small{font-size:11px;fill:#6b7280}
+      .big{font-size:22px;font-weight:700}
+      .hd{font-size:14px;font-weight:700;fill:#111827}
+      .c{text-anchor:middle}
+      .panel{fill:#ffffff;fill-opacity:0.72;stroke:#cdd6e3;stroke-width:1.2}
+      .pill{fill:#eef2f7;stroke:#9aa5b1}
+      .pri{fill:#dbe8fd;stroke:#3b82f6;stroke-width:1.3}
+      .track{fill:#eef2f7;stroke:#c5cfdd}
+      .ico{fill:none;stroke:#475569;stroke-width:1.6}
+    </style>
+  </defs>
+  <rect width="1100" height="750" fill="url(#bg)"/>
+  <circle cx="1010" cy="70" r="180" fill="#dbe7ff" opacity="0.22"/>
+  <circle cx="120" cy="710" r="150" fill="#e7dbff" opacity="0.16"/>
+
+  <!-- AppBar -->
+  <text x="24" y="33" class="ttl">Pixiv 下載器</text>
+  <line x1="0" y1="50" x2="1100" y2="50" stroke="#dce3ee"/>
+  <circle cx="1066" cy="25" r="8" class="ico"/>
+
+  <!-- Nav (item 4 統計 active) -->
+  <rect x="16" y="70" width="88" height="372" rx="18" class="panel"/>
+  <path d="M48 116 L60 104 L72 116 M51 113 V126 H69 V113" class="ico"/><text x="60" y="150" class="c" font-size="12" fill="#475569">主頁</text>
+  <circle cx="60" cy="198" r="11" class="ico"/><circle cx="60" cy="198" r="3.5" class="ico"/><text x="60" y="234" class="c" font-size="12" fill="#475569">設定</text>
+  <circle cx="60" cy="282" r="11" class="ico"/><circle cx="56" cy="279" r="1.6" fill="#475569"/><circle cx="64" cy="278" r="1.6" fill="#475569"/><circle cx="61" cy="286" r="1.6" fill="#475569"/><text x="60" y="318" class="c" font-size="12" fill="#475569">Cookie</text>
+  <rect x="26" y="334" width="68" height="84" rx="12" fill="#e2edff" stroke="#3b82f6" stroke-width="1.5"/>
+  <g stroke="#2563eb" stroke-width="2"><line x1="52" y1="384" x2="52" y2="372"/><line x1="60" y1="384" x2="60" y2="364"/><line x1="68" y1="384" x2="68" y2="378"/></g>
+  <text x="60" y="408" class="c" font-size="12" font-weight="700" fill="#2563eb">統計</text>
+
+  <!-- Page title -->
+  <text x="120" y="86" class="ph">統計資料</text>
+
+  <!-- mode toggle -->
+  <rect x="120" y="102" width="96" height="30" rx="15" class="pri"/><text x="168" y="122" class="c t" fill="#1d4ed8">本次執行</text>
+  <rect x="224" y="102" width="96" height="30" rx="15" class="pill"/><text x="272" y="122" class="c t">歷史累計</text>
+
+  <!-- 4 stat cards -->
+  <rect x="120" y="148" width="232" height="96" rx="14" class="panel"/>
+  <text x="236" y="182" class="c sec">總下載流量</text><text x="236" y="216" class="c big" fill="#2563eb">12.4 GB</text>
+  <rect x="364" y="148" width="232" height="96" rx="14" class="panel"/>
+  <text x="480" y="182" class="c sec">JXL 節省空間</text><text x="480" y="216" class="c big" fill="#0ea5e9">3.1 GB</text>
+  <rect x="608" y="148" width="232" height="96" rx="14" class="panel"/>
+  <text x="724" y="182" class="c sec">HTTP 請求數</text><text x="724" y="216" class="c big" fill="#16a34a">8,642</text>
+  <rect x="852" y="148" width="232" height="96" rx="14" class="panel"/>
+  <text x="968" y="182" class="c sec">執行時間</text><text x="968" y="216" class="c big" fill="#d97706">01:23:45</text>
+
+  <!-- divider -->
+  <line x1="120" y1="270" x2="1084" y2="270" stroke="#dce3ee"/>
+
+  <!-- cookie request chart -->
+  <text x="120" y="300" class="hd">Cookie 請求次數</text>
+
+  <!-- bars: label(120) + track(max 300) + count -->
+  <g>
+    <text x="120" y="334" class="small">minato</text>
+    <rect x="250" y="323" width="300" height="16" rx="4" class="track"/><rect x="250" y="323" width="300" height="16" rx="4" fill="#3b82f6"/>
+    <text x="562" y="336" class="small">1,204</text>
+  </g>
+  <g>
+    <text x="120" y="362" class="small">infinite5</text>
+    <rect x="250" y="351" width="300" height="16" rx="4" class="track"/><rect x="250" y="351" width="232" height="16" rx="4" fill="#0ea5e9"/>
+    <text x="562" y="364" class="small">  932</text>
+  </g>
+  <g>
+    <text x="120" y="390" class="small">f1213f6631yolov8</text>
+    <rect x="250" y="379" width="300" height="16" rx="4" class="track"/><rect x="250" y="379" width="188" height="16" rx="4" fill="#16a34a"/>
+    <text x="562" y="392" class="small">  751</text>
+  </g>
+  <g>
+    <text x="120" y="418" class="small">pixiv1f1213f6631</text>
+    <rect x="250" y="407" width="300" height="16" rx="4" class="track"/><rect x="250" y="407" width="150" height="16" rx="4" fill="#d97706"/>
+    <text x="562" y="420" class="small">  603</text>
+  </g>
+  <g>
+    <text x="120" y="446" class="small">infinite3@…uk</text>
+    <rect x="250" y="435" width="300" height="16" rx="4" class="track"/><rect x="250" y="435" width="96" height="16" rx="4" fill="#3b82f6"/>
+    <text x="562" y="448" class="small">  388</text>
+  </g>
+  <g>
+    <text x="120" y="474" class="small">本帳</text>
+    <rect x="250" y="463" width="300" height="16" rx="4" class="track"/><rect x="250" y="463" width="58" height="16" rx="4" fill="#0ea5e9"/>
+    <text x="562" y="476" class="small">  233</text>
+  </g>
+
+  <text x="120" y="510" class="sec" fill="#0ea5e9">免 Cookie：1,140 次</text>
+
+  <text x="120" y="742" class="sec">統計 / Statistics — 本次執行 / 歷史累計切換　|　4 張卡：總流量・JXL 節省・HTTP 請求數・執行時間　|　每 cookie 請求次數橫條（降冪、配色輪替）＋ 免 Cookie 次數</text>
+</svg>

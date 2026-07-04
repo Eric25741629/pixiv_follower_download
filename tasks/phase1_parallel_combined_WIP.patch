@@ -1,0 +1,934 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index e415fed..071c0a1 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -202,7 +202,7 @@ Step 4 stamps each file with an advancing per-file timetag (`self.download_time`
+ 
+ ### Per-account cooldown + proxy binding (Steps 2/3/4)
+ 
+-`AccountScheduler` (`app/core/account_scheduler.py`) is a multi-consumer-safe round-robin state machine that gates HTTP work behind a per-account cooldown. `acquire()` marks the returned account `held` so concurrent pool workers can never check out the same account; `release()` / `release_neutral()` clear it. `release_neutral` (no disable, no first-success credit, normal cooldown) is used when the unit of work was aborted by user stop or failed for a non-network reason — only genuine retry exhaustion on the network triple disables a cookie. The 「所有 Cookie 都已禁用」 message is emitted once per run; non-zero countdown ticks are throttled to 1/s across workers. Each `AccountState` holds `(cookie, alias, proxy_url, cooldown_until, disabled_reason, held)`; `proxies` property returns the `requests`-compatible dict via `app/core/proxy_utils.to_requests_proxies`. Workers in Steps 2/3/4 call `_acquire_account()` (blocks until next available) before each work unit and `_release_account(acc, ok=...)` after; `ok=False` (raised by `ProxyError` / `ConnectionError`) marks that cookie disabled for the entire run.
++`AccountScheduler` (`app/core/account_scheduler.py`) is a multi-consumer-safe state machine that gates HTTP work behind a per-account cooldown. Among the accounts that are ready (off cooldown, not held), it picks one by **idle-weighted random selection** (`_pick_weighted_by_idle`: weight = `(now - cooldown_until)` idle seconds + one throughput interval as a base), so load spreads in a balanced spread around the mean and a long-neglected account keeps gaining weight until it wins — no account starves. This replaced the original `available[0]` fixed-list-order pick, which under any demand slack let the front of the pool satisfy every request and left the tail accounts at zero (the cause of the steep 「Cookie 請求次數」 skew + never-selected cookies). `acquire()` marks the returned account `held` so concurrent pool workers can never check out the same account; `release()` / `release_neutral()` clear it. `release_neutral` (no disable, no first-success credit, normal cooldown) is used when the unit of work was aborted by user stop or failed for a non-network reason — only genuine retry exhaustion on the network triple disables a cookie. The 「所有 Cookie 都已禁用」 message is emitted once per run; non-zero countdown ticks are throttled to 1/s across workers. Each `AccountState` holds `(cookie, alias, proxy_url, cooldown_until, disabled_reason, held)`; `proxies` property returns the `requests`-compatible dict via `app/core/proxy_utils.to_requests_proxies`. Workers in Steps 2/3/4 call `_acquire_account()` (blocks until next available) before each work unit and `_release_account(acc, ok=...)` after; `ok=False` (raised by `ProxyError` / `ConnectionError`) marks that cookie disabled for the entire run.
+ 
+ On a `(ProxyError, ConnectTimeout, ConnectionError)` raised inside the four scheduler-aware call sites (Steps 2/3/4), the worker retries on the **same account** up to **5 attempts total** with a fixed **60 s** wait between attempts (constants `NETWORK_RETRY_ATTEMPTS` and `NETWORK_RETRY_WAIT_SEC` in `app/core/pixiv_thread_base.py`). The retry is implemented in `PauseableThread._run_with_network_retry`. Only after all 5 attempts fail does the cookie get disabled via `release(ok=False)`. The 60 s wait is interruptible by `stop_event` and skipped during pause (paused time does not count toward the budget).
+ 
+diff --git a/app/core/account_scheduler.py b/app/core/account_scheduler.py
+index 34b03ad..fde746a 100644
+--- a/app/core/account_scheduler.py
++++ b/app/core/account_scheduler.py
+@@ -27,7 +27,17 @@ _THROUGHPUT_JITTER = 0.10  # ±10% on inter-request gap (anti-detection)
+ 
+ 
+ class AccountScheduler:
+-    """Round-robin per-account cooldown scheduler with a throughput gate.
++    """Idle-weighted per-account cooldown scheduler with a throughput gate.
++
++    Selection among the currently-ready accounts is a *weighted random*
++    pick favouring the account that has been idle longest (see
++    ``_pick_weighted_by_idle``). This spreads load across the whole pool —
++    request counts land in a balanced spread around the mean instead of a
++    steep front-of-list skew — while guaranteeing no account starves: an
++    account that keeps getting skipped accumulates idle time, so its pick
++    weight keeps rising until it wins. (The earlier implementation picked
++    ``available[0]`` in fixed list order, which under any demand slack let
++    the front of the list satisfy every request and left the tail at zero.)
+ 
+     Per-account cooldown is the deterministic setting value itself
+     (``pid_cooldown_avg`` seconds, fixed regardless of account count —
+@@ -128,11 +138,30 @@ class AccountScheduler:
+         throughput = self._throughput_seconds(active)
+         jitter = 1.0 + random.uniform(-_THROUGHPUT_JITTER, _THROUGHPUT_JITTER)
+         self._next_emit_at = now + max(0.5, throughput * jitter)
+-        picked = available[0]
++        picked = self._pick_weighted_by_idle(available, now, throughput)
+         picked.held = True
+         self._emit_countdown(0)
+         return picked
+ 
++    def _pick_weighted_by_idle(self, available, now, throughput):
++        """Weighted-random choice among ready accounts, favouring the one
++        idle longest.
++
++        Weight = ``(now - cooldown_until) + base`` where ``base`` is one
++        throughput interval (floored at 0.5 s). ``now - cooldown_until`` is
++        the time the account has sat ready (``>= 0``; the caller already
++        filtered to ``cooldown_until <= now``), so a long-neglected account
++        gets a proportionally larger share and can never be starved, while
++        the base keeps a just-ready account pickable and guarantees the
++        total weight is positive. Counts therefore form a balanced spread
++        around the mean rather than the old fixed-list-order skew.
++        """
++        if len(available) == 1:
++            return available[0]
++        base = max(0.5, throughput)
++        weights = [(now - a.cooldown_until) + base for a in available]
++        return random.choices(available, weights=weights, k=1)[0]
++
+     def _compute_wait(self, active, now) -> float:
+         """How long to sleep before the next acquire attempt; 0 means ready now."""
+         free = [a for a in active if not a.held]
+@@ -272,6 +301,11 @@ class AccountScheduler:
+         with self._lock:
+             return self._all_disabled()
+ 
++    def active_account_count(self) -> int:
++        """Number of accounts not disabled (used to size the combined worker pool)."""
++        with self._lock:
++            return sum(1 for a in self._accounts if a.disabled_reason is None)
++
+     def average_cooldown(self) -> float:
+         """Average inter-request throughput in seconds — i.e., the
+         expected gap until the next request fires across all accounts.
+diff --git a/app/core/combined_progress_queues.py b/app/core/combined_progress_queues.py
+index 5c4aea6..f38e017 100644
+--- a/app/core/combined_progress_queues.py
++++ b/app/core/combined_progress_queues.py
+@@ -78,3 +78,29 @@ class _DropOverallProgressQueue:
+         if isinstance(event, WorkerEvent) and getattr(event, "type", None) == "progress":
+             return
+         self._target_q.put(event, *args, **kwargs)
++
++
++_FORWARDER_DROP_TYPES = frozenset({"page_progress", "progress", "phase"})
++
++
++class _ConcurrentEventForwarder:
++    """Installed once as fetcher._q and downloader._q during concurrent combined
++    mode. Drops engine events that are meaningless or fight the UI under K-way
++    concurrency (per-page progress, the fetcher's bogus overall progress, and
++    per-PID phase labels); forwards everything else to the real queue. The
++    coordinator emits overall progress / aggregate phase straight to the real
++    queue. Stateless and lock-free — filtering is identical for every thread."""
++
++    def __init__(self, real_q):
++        self._real_q = real_q
++
++    def put(self, ev, *args, **kwargs):
++        try:
++            if getattr(ev, "type", None) in _FORWARDER_DROP_TYPES:
++                return
++        except Exception:
++            pass
++        try:
++            self._real_q.put(ev)
++        except Exception:
++            pass
+diff --git a/app/core/step4_media.py b/app/core/step4_media.py
+index 976c4d8..8a11760 100644
+--- a/app/core/step4_media.py
++++ b/app/core/step4_media.py
+@@ -292,9 +292,8 @@ class _Step4MediaMixin:
+             url = download_url
+             http = session if session is not None else requests
+             headers = self._build_artwork_headers(pid, pid_cookie, need_cookie, honour_pid_used=True)
+-            with self.timelock:
+-                my_time = self.download_time
+-                self.download_time = self.download_time + datetime.timedelta(seconds=1)
++            timetag = self._page_timetag(pid or "", 0)
++            my_time = datetime.datetime.strptime(timetag, '%Y%m%d_%H%M%S')
+             zip_bytes = self._stream_ugoira_zip_bytes(url, headers, http, pid_cookie)
+             if not zip_bytes:
+                 return [url, my_time.strftime('%Y%m%d_%H%M%S')]
+@@ -426,7 +425,17 @@ class _Step4MediaMixin:
+         return 0
+ 
+     def jpg_download(self, url, session=None):
+-        timetag = self._jpg_advance_timetag()
++        pid = normalize_pid(str(url).rsplit('/', 1)[1].split('_', 1)[0])
++        page_str, _ = self._jpg_extract_page_and_format(url)
++        try:
++            # page_str is the pximg page token like "p0"/"p12" (it doubles as the
++            # filename page-suffix), so strip the leading "p" before int() — a bare
++            # int(page_str) raises and would pin every page of a PID to index 0
++            # (identical timetag, breaking per-page +1s).
++            page_idx = int(str(page_str).lstrip('pP'))
++        except (TypeError, ValueError):
++            page_idx = 0
++        timetag = self._page_timetag(pid or "", page_idx)
+         last_err = None
+         for i in range(0, 5):  # 最多重試 5 次，失敗就回傳錯誤
+             try:
+diff --git a/app/core/thread_combined.py b/app/core/thread_combined.py
+index 00f5ccb..36d5bdf 100644
+--- a/app/core/thread_combined.py
++++ b/app/core/thread_combined.py
+@@ -1,3 +1,4 @@
++import concurrent.futures
+ import contextlib
+ import os
+ 
+@@ -12,6 +13,15 @@ from app.core.combined_progress_queues import (
+ from app.core.combined_work_lists import _CombinedWorkListsMixin
+ import pixiv_api
+ 
++COMBINED_MAX_WORKERS = 32
++_STOP_SENTINEL = object()
++
++
++def _combined_worker_count(active_cookie_count, pending_pid_count, cap=COMBINED_MAX_WORKERS):
++    """Concurrent worker count for combined mode: bounded by active cookies,
++    pending PID count, and the resource cap; never below 1."""
++    return max(1, min(int(active_cookie_count), int(pending_pid_count), int(cap)))
++
+ 
+ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
+     """邊查邊下: per PID, query meta (Step 3) then immediately download
+@@ -125,43 +135,48 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
+         # reads that meta in-memory instead of re-issuing a redundant,
+         # un-cooldowned, un-proxied Pixiv_info network fetch per page.
+         self.downloader.url_meta = self.fetcher.url_meta
++        # Built here but installed only for the concurrent (K>1) run in
++        # _run_pool; the sequential path keeps the engines on the real queue so
++        # single-cookie combined mode emits per-PID phase / page-progress exactly
++        # as before (zero behaviour change for K<=1).
++        from app.core.combined_progress_queues import _ConcurrentEventForwarder
++        self._forwarder = _ConcurrentEventForwarder(self._q)
++        self._concurrent = False
+ 
+     def _share_scheduler(self):
+         """Propagate the scheduler set by run_actions after construction."""
+         self.fetcher._scheduler = self._scheduler
+         self.downloader._scheduler = self._scheduler
+ 
+-    def _process_one_pid(self, pid, needs_query):
++    def _process_one_pid(self, pid, needs_query, ordinal):
+         """Acquire one account; query (if needed) + download this PID's pages;
+-        release. Returns the per-PID failed list (possibly empty).
++        release. Returns (failed_list, ok) or _STOP_SENTINEL.
+ 
+-        Side effect: sets ``self._last_pid_ok`` to whether this PID was
+-        processed cleanly (query ok / not needed, AND every page downloaded).
+-        ``run()`` reads it to gate ``_mark_pid_processed`` so an exhausted
+-        query or a partial-download failure is NOT silently dropped from the
+-        pending list.
++        Sequential (K<=1) keeps the original per-PID UI behaviour — per-PID
++        live-settings, phase labels, the fetcher overall-progress drop during
++        query, and the per-page progress bar — so single-cookie combined mode is
++        byte-for-byte unchanged. The concurrent (K>1) path skips all of that:
++        the per-PID ``_q`` swaps would race across workers, the installed
++        ``_ConcurrentEventForwarder`` drops the engine noise, and the coordinator
++        owns aggregate phase/progress + per-batch live-settings.
+         """
+-        # Pick up any mid-run 「儲存設定」 on both engines before this PID
+-        # (one shared LiveSettings; the signature check makes this near-free).
+-        self.fetcher._apply_live_settings_if_changed()
+-        self.downloader._apply_live_settings_if_changed()
+-        self._last_pid_ok = False
+-        # Phase BEFORE acquire: the cooldown wait happens inside
+-        # _acquire_account, so emitting here lets the UI show
+-        # 「正在查詢：PID x」(or 正在下載) alongside the 倒數 ticks instead of
+-        # leaving the previous PID's label on screen during the wait.
+-        with contextlib.suppress(Exception):
+-            verb = "正在查詢" if needs_query else "正在下載"
+-            self._q.put(WorkerEvent("phase", f"{verb}：PID {pid}"))
++        seq = not getattr(self, "_concurrent", False)
++        if seq:
++            # Pick up any mid-run 「儲存設定」 before this PID (signature check
++            # makes it near-free). The pool path applies this once per batch.
++            self.fetcher._apply_live_settings_if_changed()
++            self.downloader._apply_live_settings_if_changed()
++            # Phase BEFORE acquire so the UI shows 「正在查詢/下載：PID x」 next to
++            # the 倒數 ticks during the cooldown wait instead of the previous label.
++            with contextlib.suppress(Exception):
++                verb = "正在查詢" if needs_query else "正在下載"
++                self._q.put(WorkerEvent("phase", f"{verb}：PID {pid}"))
+         diag_log.log(diag_log.WORKER, f"PID {pid} 開始 (needs_query={needs_query})")
+-        # The acquire span's elapsed time IS the visible cooldown wait. When it
+-        # logs ~0.00s the account was ready immediately (cooldown absorbed by the
+-        # previous PID's download) — that is exactly why no 倒數 shows.
+         with diag_log.span(diag_log.WORKER, f"PID {pid} acquire(cooldown)"):
+             acc = self._acquire_account()
+         if acc is None:
+             diag_log.log(diag_log.WORKER, f"PID {pid} acquire -> None (stop/all-disabled)")
+-            return None  # stop signal / all disabled -> caller breaks
++            return _STOP_SENTINEL
+         diag_log.log(diag_log.WORKER, f"PID {pid} 取得帳號 alias={getattr(acc, 'alias', '?')}")
+         sess = pixiv_api.make_session(acc.proxy_url)
+         failed = []
+@@ -171,17 +186,12 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
+         neutral = False
+         try:
+             if needs_query:
+-                # The fetcher's get_download_url emits one ("progress",(1,
+-                # fetcher.pid_max)) per PID via _step3_advance_progress, and
+-                # fetcher.pid_max is 0 in combined mode (run() never ran). That
+-                # (1, 0) would blank/hide the 整體進度 bar on every query — the
+-                # "bar disappears when the next PID starts" bug. combined owns
+-                # overall progress (one tick per PID in run()), so drop the
+-                # fetcher's progress events for the duration of the query.
+-                # (The 「正在查詢」 phase event was already emitted before
+-                # _acquire_account so the countdown wait shows it.)
++                # Sequential: drop the fetcher's bogus (1, pid_max=0) overall
++                # progress during the query via a temporary _q swap (safe in a
++                # single thread). Concurrent: the forwarder already drops it.
+                 prev_fetcher_q = self.fetcher._q
+-                self.fetcher._q = _DropOverallProgressQueue(prev_fetcher_q)
++                if seq:
++                    self.fetcher._q = _DropOverallProgressQueue(prev_fetcher_q)
+                 try:
+                     with diag_log.span(diag_log.WORKER, f"PID {pid} query"):
+                         ok, one, _ = self._run_with_network_retry(
+@@ -192,7 +202,8 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
+                             ),
+                         )
+                 finally:
+-                    self.fetcher._q = prev_fetcher_q
++                    if seq:
++                        self.fetcher._q = prev_fetcher_q
+                 urls = self.fetcher._normalize_loop_result(one) if ok else []
+             else:
+                 urls = self._download_only_urls(pid)
+@@ -202,20 +213,24 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
+                 # Seed the pending pages before download so a partial failure /
+                 # crash leaves a recoverable pending trail in the DB.
+                 self._seed_pending_urls(pid, urls)
+-                with contextlib.suppress(Exception):
+-                    self._q.put(WorkerEvent("phase", f"正在下載：PID {pid}"))
++                self.downloader._set_pid_time_base(
++                    pid, getattr(self, "_timetag_start", self.downloader.download_time), ordinal)
++                if seq:
++                    with contextlib.suppress(Exception):
++                        self._q.put(WorkerEvent("phase", f"正在下載：PID {pid}"))
+                 self.downloader._set_current_download_account(acc)
+                 # Bind THIS account's cookie to the PID so the download leg sends
+                 # the held account's cookie over the held account's proxy (the
+                 # hard cookie<->IP contract). Without this seed,
+                 # _select_cookie_for_pid would pick a RANDOM pool cookie and send
+-                # it over acc's IP — a mismatch Pixiv anti-fraud flags. Mirrors
+-                # standalone Step 4 (_download_pid_with_scheduler).
++                # it over acc's IP — a mismatch Pixiv anti-fraud flags.
+                 self.downloader._pid_cookie_selection[normalize_pid(pid) or str(pid)] = acc.cookie
++                downloader_call = (self._download_pid_group_with_page_progress
++                                   if seq else self.downloader._download_pid_group)
+                 with diag_log.span(diag_log.WORKER, f"PID {pid} download ({len(urls)} pages)"):
+                     account_ok, failed, _ = self._run_with_network_retry(
+                         f"PID {pid} 下載",
+-                        lambda: self._download_pid_group_with_page_progress(pid, urls),
++                        lambda: downloader_call(pid, urls),
+                     )
+                 if not isinstance(failed, list):
+                     failed = []
+@@ -223,22 +238,17 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
+                 elif failed:
+                     download_ok = False
+                 elif self._stop_event.is_set():
+-                    # Stopped mid-PID. _download_pid_group only reports
+-                    # *attempted* failures, so the pages that were never
+-                    # reached are absent from `failed` (it is []) — which must
+-                    # NOT be read as "all pages done". Mark the PID incomplete
+-                    # so its seeded pending rows + pictures_id.txt entry survive
+-                    # and the next run resumes the remaining pages instead of
+-                    # skipping the whole PID as already downloaded.
++                    # Stopped mid-PID. _download_pid_group only reports *attempted*
++                    # failures, so unreached pages are absent from `failed` (it is
++                    # []) — must NOT be read as "all pages done". Keep the PID
++                    # pending so the next run resumes the remaining pages.
+                     download_ok = False
+                 else:
+                     self._mark_urls_done(urls)
+                     self.downloader._maybe_flush_exist_pid(pid)
+-                    # A queried PID's meta lives only in the fetcher's
+-                    # in-memory url_meta until _finalize. Persist it now so
+-                    # page_count + meta_updated_at land immediately, making
+-                    # v_complete_artworks / v_closed_artworks exact and
+-                    # crash-safe. Download-only PIDs already have DB meta.
++                    # Persist the queried PID's meta now so page_count +
++                    # meta_updated_at land immediately (v_complete/closed exact,
++                    # crash-safe). Download-only PIDs already have DB meta.
+                     if needs_query:
+                         self._persist_pid_meta(pid)
+             else:
+@@ -248,19 +258,13 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
+             raise
+         finally:
+             self.downloader._clear_current_download_account()
+-            # Stop mid-PID or a non-network error releases NEUTRALLY: don't credit
+-            # the cookie with a success (ok=True would refresh its trust window for
+-            # work the user aborted) nor disable it. Off those paths, a
+-            # network-exhausted account (account_ok False) still disables as before.
++            # Stop mid-PID or a non-network error releases NEUTRALLY (neither
++            # credit nor disable the cookie); network-exhausted (account_ok False)
++            # disables as before.
+             self._release_account_after_work(acc, ok=ok and account_ok, neutral=neutral)
+             with contextlib.suppress(Exception):
+                 sess.close()
+-        # "Genuine success": query succeeded (or not needed) AND downloads
+-        # were clean. A query that produced no urls (revoked / filtered out)
+-        # leaves ``download_ok`` True and is correctly settled. Only a failed/
+-        # exhausted query or a partial download keeps the PID pending.
+-        self._last_pid_ok = bool(ok) and download_ok
+-        return failed if isinstance(failed, list) else []
++        return (failed if isinstance(failed, list) else []), (bool(ok) and download_ok)
+ 
+     def _download_pid_group_with_page_progress(self, pid, urls):
+         page_q = _CombinedPageProgressQueue(self._q, pid, len(urls))
+@@ -316,37 +320,22 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
+             self._emit("<p><font color='red'>邊查邊下階段開始</font></p>")
+             self.fetcher._reset_run_counters()
+             query_pids, download_only = self._build_work_lists()
+-            # Resolve the (optionally author-grouped) iteration order once so the
+-            # progress denominator always matches what we actually iterate.
+             order = self._resolve_combined_order(query_pids, download_only)
+             total = len(order)
++            self._timetag_start = self.downloader.download_time
+             self._q.put(WorkerEvent("progress", (0, total)))
+             self._emit(
+                 f"<p><font color='red'>待處理：查詢+下載 {len(query_pids)} 筆、"
+-                f"純下載(吸收上次未完成) {len(download_only)} 筆</font></p>"
+-            )
+-
++                f"純下載(吸收上次未完成) {len(download_only)} 筆</font></p>")
++            active = self._scheduler.active_account_count() if self._scheduler else 1
++            K = _combined_worker_count(active, total)
++            self._concurrent = K > 1
+             failed_nested = []
+-            for pid, needs_query in order:
+-                if self._stop_event.is_set():
+-                    break
+-                failed = self._process_one_pid(pid, needs_query)
+-                if failed is None:  # acquire returned stop / all disabled
+-                    break
+-                failed_nested.append(failed)
+-                # Only retire a queried PID from the pending list when it was
+-                # processed cleanly; exhausted queries / partial downloads stay
+-                # pending so the next run retries them.
+-                if needs_query and self._last_pid_ok:
+-                    self.fetcher._mark_pid_processed(pid)
+-                self._q.put(WorkerEvent("progress", (1, total)))
+-                # Persist the advanced timetag counter after every PID —
+-                # combined never runs Step 4's finalize, so without this the
+-                # next run reuses the same download_time start and stamps
+-                # duplicate filename prefixes.
+-                with contextlib.suppress(Exception):
+-                    self.downloader._emit_timechanged()
+-
++            if K <= 1:
++                self._run_sequential(order, total, failed_nested)
++            else:
++                self._emit(f"<p><font color='gray'>{K} 並發，逐頁進度不顯示</font></p>")
++                self._run_pool(order, total, K, failed_nested)
+             self._finalize(failed_nested)
+         except Exception as e:
+             from app.core.pixiv_thread_utils import output_err
+@@ -354,6 +343,68 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
+             self._emit(output_err(e))
+             self._q.put(WorkerEvent("next", -1))
+ 
++    def _coordinator_settle(self, pid, needs, ordinal, result, total, done, label):
++        if result is _STOP_SENTINEL:
++            return done, True
++        failed, ok = result
++        self._failed_nested.append(failed)
++        if needs and ok:
++            self.fetcher._mark_pid_processed(pid)
++        done += 1
++        self._q.put(WorkerEvent("progress", (1, total)))
++        self._q.put(WorkerEvent("phase", label.format(done=done, total=total)))
++        self.downloader._persist_time_highwater(self._timetag_start, ordinal)
++        return done, False
++
++    def _run_sequential(self, order, total, failed_nested):
++        self._failed_nested = failed_nested
++        # live-settings applied per-PID inside _process_one_pid on the sequential
++        # path (preserves the original K<=1 behaviour) — do not re-apply here.
++        done = 0
++        for ordinal, (pid, needs) in enumerate(order):
++            if self._stop_event.is_set():
++                break
++            result = self._process_one_pid(pid, needs, ordinal)
++            done, stop = self._coordinator_settle(pid, needs, ordinal, result, total, done,
++                                                   "邊查邊下中（{done}/{total}）")
++            if stop:
++                break
++
++    def _run_pool(self, order, total, K, failed_nested):
++        self._failed_nested = failed_nested
++        # Concurrent: live-settings once before the pool (the workers' stripped
++        # _process_one_pid does not re-apply them per PID).
++        self.fetcher._apply_live_settings_if_changed()
++        self.downloader._apply_live_settings_if_changed()
++        done = 0
++        pool_stopped = False
++        # Route engine events through the filtering forwarder for the duration of
++        # the pool so K workers' page/overall-progress + per-PID phase don't race
++        # the real queue; restore afterwards so _finalize emits normally.
++        self.fetcher._q = self._forwarder
++        self.downloader._q = self._forwarder
++        try:
++            with concurrent.futures.ThreadPoolExecutor(max_workers=K) as self.executor:
++                futures = {
++                    self.executor.submit(self._process_one_pid, pid, needs, ordinal): (pid, needs, ordinal)
++                    for ordinal, (pid, needs) in enumerate(order)
++                }
++                for fu in concurrent.futures.as_completed(futures):
++                    pid, needs, ordinal = futures[fu]
++                    try:
++                        result = fu.result()
++                    except Exception:
++                        result = ([], False)
++                    done, stop = self._coordinator_settle(pid, needs, ordinal, result, total, done,
++                                                          "邊查邊下中（{done}/{total}，%d 並發）" % K)
++                    if stop:
++                        pool_stopped = True
++        finally:
++            self.fetcher._q = self._q
++            self.downloader._q = self._q
++        if pool_stopped:
++            self._emit("<p><font color='orange'>下載池已停止：剩餘 PID 保留為未嘗試，下次執行續傳</font></p>")
++
+     def _finalize(self, failed_nested):
+         # Fetcher side: persist meta + revoked + pending list.
+         with contextlib.suppress(Exception):
+diff --git a/app/core/thread_download.py b/app/core/thread_download.py
+index ccf0d75..8022cb1 100644
+--- a/app/core/thread_download.py
++++ b/app/core/thread_download.py
+@@ -41,6 +41,9 @@ from app.core.step4_author_order import (  # noqa: F401  (facade re-export)
+ )
+ from app.core import diag_log
+ 
++TIMETAG_PID_STRIDE_SEC = 256
++
++
+ def _safe_meta_count(db) -> int:
+     try:
+         return int(db.meta_count())
+@@ -182,6 +185,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+         (self.cookie_entries, self.cookie_pool,
+          self._cookie_alias_map, self.cookies) = init_cookie_fields(cookies)
+         self._pid_cookie_selection = {}
++        self._pid_time_base = {}
+         self._current_account_local = threading.local()
+         self.agent = agent
+         self.download_time = (download_time if isinstance(download_time, datetime.datetime)
+@@ -385,6 +389,26 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+         self._cookie_usage_counts = {"step4": {}}
+         self._cookie_usage_seen = {"step4": set()}
+ 
++    def _set_pid_time_base(self, pid, start, ordinal):
++        key = normalize_pid(pid) or str(pid)
++        self._pid_time_base[key] = start + datetime.timedelta(seconds=int(ordinal) * TIMETAG_PID_STRIDE_SEC)
++
++    def _page_timetag(self, pid, page_index):
++        """Filename timetag for one page. ordinal base if set, else legacy +1s."""
++        key = normalize_pid(pid) or str(pid)
++        base = self._pid_time_base.get(key)
++        if base is None:
++            return self._jpg_advance_timetag()   # legacy global +1s fallback
++        off = min(int(page_index), TIMETAG_PID_STRIDE_SEC - 1)
++        return (base + datetime.timedelta(seconds=off)).strftime('%Y%m%d_%H%M%S')
++
++    def _persist_time_highwater(self, start, ordinal):
++        with self.timelock:
++            candidate = start + datetime.timedelta(seconds=(int(ordinal) + 1) * TIMETAG_PID_STRIDE_SEC)
++            if candidate > self.download_time:
++                self.download_time = candidate
++        self._emit_timechanged()
++
+     def _load_initial_exist_pid_set(self):
+         """Compute the 'do not redownload' PID set.
+ 
+@@ -1407,6 +1431,10 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+         """Single-thread per-PID-group download loop with optional scheduler."""
+         self._emit_single_mode_header()
+         failed_nested = []
++        # Capture the timetag start ONCE per run so per-PID ordinal bases stay
++        # stable: _persist_time_highwater advances self.download_time, so reading
++        # it per PID (when _timetag_start is unset) would shift every base.
++        start = getattr(self, "_timetag_start", self.download_time)
+         for idx, pid in enumerate(pid_order, start=1):
+             if self._stop_after_group:
+                 self._emit_output("<p><font color='orange'>收到中止要求：已在上一個 PID 組完成後停止</font></p>")
+@@ -1419,6 +1447,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+                 f"（{len(pid_groups.get(pid, []))} 張）</font></p>"))
+ 
+             urls = pid_groups.get(pid, [])
++            self._set_pid_time_base(pid, start, idx - 1)
+             self._emit_phase(f"正在下載：PID {pid}")
+             if self._scheduler is not None:
+                 result, stop = self._download_pid_with_scheduler(pid, urls)
+@@ -1442,6 +1471,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+             total = getattr(self, "_step4_pid_total", len(pid_order))
+             self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
+             self._maybe_flush_url_meta_periodically(done)
++            self._persist_time_highwater(start, idx - 1)
+             self._emit_timechanged()
+             if self._stop_event.is_set():
+                 break
+@@ -1451,7 +1481,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+                 self._sleep_between_downloads(pid)
+         return failed_nested
+ 
+-    def _execute_downloads_pool(self, author_batches, pid_groups):
++    def _execute_downloads_pool(self, author_batches, pid_groups, ordinal_map=None):
+         """Multi-thread per-PID-group download via ThreadPoolExecutor.
+ 
+         Processes ``author_batches`` one batch (= one author) at a time:
+@@ -1462,6 +1492,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+         self._q.put(WorkerEvent("output",
+             "<p><font color='gray'>下載模式：多執行緒（以 PID 為單位分派；每個 PID 仍共用單一 Session）</font></p>"))
+         failed_nested = []
++        start = getattr(self, "_timetag_start", self.download_time)
+         total = getattr(self, "_step4_pid_total",
+                         sum(len(b) for b in author_batches))
+         done = 0
+@@ -1472,11 +1503,14 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+                     break
+                 use_scheduler = self._scheduler is not None
+                 worker = self._download_pid_with_scheduler if use_scheduler else self._download_pid_group
+-                futures = [
+-                    self.executor.submit(worker, pid, pid_groups.get(pid, []))
++                for pid in batch:
++                    self._set_pid_time_base(pid, start, (ordinal_map or {}).get(pid, 0))
++                futures = {
++                    self.executor.submit(worker, pid, pid_groups.get(pid, [])): pid
+                     for pid in batch
+-                ]
++                }
+                 for fu in concurrent.futures.as_completed(futures):
++                    pid_done = futures[fu]
+                     try:
+                         result = fu.result()
+                         if use_scheduler:
+@@ -1496,6 +1530,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+                     self._step4_pid_done = done
+                     self._emit_phase(f"步驟 4：下載中（{done} / {total} PID 完成）")
+                     self._maybe_flush_url_meta_periodically(done)
++                    self._persist_time_highwater(start, (ordinal_map or {}).get(pid_done, 0))
+                     self._emit_timechanged()
+         if pool_stopped:
+             self._emit_output("<p><font color='orange'>下載池已停止：剩餘 PID 保留為未嘗試，下次執行續傳</font></p>")
+@@ -1504,7 +1539,8 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+     def _execute_downloads(self, pid_order, pid_groups, author_batches):
+         if self.single_mode_flag:
+             return self._execute_downloads_single(pid_order, pid_groups)
+-        return self._execute_downloads_pool(author_batches, pid_groups)
++        ordinal_map = {p: i for i, p in enumerate(pid_order)}
++        return self._execute_downloads_pool(author_batches, pid_groups, ordinal_map=ordinal_map)
+ 
+     @staticmethod
+     def _classify_one_fail_item(item):
+@@ -1823,6 +1859,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
+             self._emit_phase(f"步驟 4：下載中（0 / {len(pid_order)} PID 完成）")
+             self._step4_pid_total = len(pid_order)
+             self._step4_pid_done = 0
++            self._timetag_start = self.download_time
+             failed_nested = self._execute_downloads(pid_order, pid_groups, author_batches)
+             self._emit_phase("步驟 4：整理失敗項目...")
+             self._q.put(WorkerEvent("output",
+diff --git a/app/gui/log_format.py b/app/gui/log_format.py
+index 00a7498..c49341a 100644
+--- a/app/gui/log_format.py
++++ b/app/gui/log_format.py
+@@ -13,7 +13,7 @@ COLOR_MAP: dict[str, str] = {
+ }
+ 
+ _FONT_RE = re.compile(
+-    r"<font\s+color=['\"](\w+)['\"]>(.*?)</font>",
++    r"<font\s+color=['\"](#?\w+)['\"]>(.*?)</font>",
+     re.IGNORECASE | re.DOTALL,
+ )
+ 
+@@ -35,7 +35,7 @@ def html_to_spans(html: str) -> list[ft.TextSpan]:
+ 
+         color_name = m.group(1).lower()
+         content = m.group(2)
+-        flet_color = COLOR_MAP.get(color_name)
++        flet_color = COLOR_MAP.get(color_name) or (color_name if color_name.startswith("#") else None)
+         style = ft.TextStyle(color=flet_color) if flet_color else None
+         spans.append(ft.TextSpan(text=content, style=style))
+         last_end = m.end()
+diff --git a/tests/test_account_scheduler.py b/tests/test_account_scheduler.py
+index af6972b..9889eb3 100644
+--- a/tests/test_account_scheduler.py
++++ b/tests/test_account_scheduler.py
+@@ -224,3 +224,43 @@ def test_throughput_gate_bounds_inter_request_gap(monkeypatch):
+     # And in steady state ≥ 0.9 × throughput so the gate is enforced.
+     steady = gaps[7:]
+     assert min(steady) >= throughput * 0.9 - 0.5
++
++
++def test_no_account_starves_under_demand_slack(monkeypatch):
++    """Regression for the steep request-count skew / never-selected tail.
++
++    Under demand slack (a unit of work takes longer than one throughput
++    interval, the normal case for slow downloads) several accounts are
++    ready at once. The old `available[0]` pick always took the lowest list
++    index, so the front of the pool satisfied every request and the tail
++    accounts were never selected. Idle-weighted selection must use the
++    whole pool: every account picked at least once and the spread bounded.
++    """
++    import random as _r
++
++    _r.seed(2024)
++    clock = [100.0]
++
++    def fake_sleep(d):
++        clock[0] += max(0.0, float(d))
++
++    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
++    monkeypatch.setattr(time, "sleep", fake_sleep)
++
++    accs = [AccountState(cookie=f"c{i}", alias=f"A{i}") for i in range(8)]
++    sched, _, _ = _make_scheduler(accs, avg=30.0)  # throughput 30/8 = 3.75s
++
++    counts = {a.cookie: 0 for a in accs}
++    WORK = 10.0  # each unit of work > throughput -> several accounts pile up ready
++    for _ in range(240):
++        acc = sched.acquire()
++        assert acc is not None
++        counts[acc.cookie] += 1
++        clock[0] += WORK            # simulate a slow download/query
++        sched.release(acc, ok=True)
++
++    # No account starves (the old code left tail accounts at 0).
++    assert min(counts.values()) > 0
++    # Busiest is not wildly more than quietest — a balanced spread, not a
++    # 598-vs-0 cliff.
++    assert max(counts.values()) <= 3 * min(counts.values())
+diff --git a/tests/test_account_scheduler_helpers.py b/tests/test_account_scheduler_helpers.py
+index 8e6fe80..dd951f2 100644
+--- a/tests/test_account_scheduler_helpers.py
++++ b/tests/test_account_scheduler_helpers.py
+@@ -72,13 +72,42 @@ def test_compute_wait_takes_max_of_two():
+ 
+ # ── _try_pickup_ready_account ───────────────────────────────────────────────
+ 
+-def test_pickup_returns_first_ready_account():
++def test_pickup_returns_a_ready_account_and_marks_held():
+     sched = _make_scheduler([])
+     sched._next_emit_at = 0.0
+     now = 100.0
+     a, b = _make_account_at("c1", 100.0), _make_account_at("c2", 100.0)
+     picked = sched._try_pickup_ready_account([a, b], now)
+-    assert picked is a
++    # Selection among equally-idle ready accounts is weighted-random, so the
++    # contract is "returns one of the ready accounts and marks it held" —
++    # not the old fixed list-order `available[0]`.
++    assert picked in (a, b)
++    assert picked.held is True
++
++
++def test_pick_weighted_favors_longer_idle_but_never_starves():
++    """Among ready accounts the longer-idle one wins more often, yet the
++    just-ready one still gets a turn (no starvation)."""
++    import random as _r
++
++    _r.seed(12345)
++    sched = _make_scheduler([])
++    now = 1000.0
++    long_idle = _make_account_at("c1", 970.0)   # ready 30s ago
++    just_ready = _make_account_at("c2", 1000.0)  # ready right now
++    counts = {"c1": 0, "c2": 0}
++    for _ in range(600):
++        picked = sched._pick_weighted_by_idle([long_idle, just_ready], now, throughput=15.0)
++        counts[picked.cookie] += 1
++    assert counts["c1"] > counts["c2"]   # longer-idle favored
++    assert counts["c2"] > 0              # but never starved
++
++
++def test_pick_weighted_single_available_is_deterministic():
++    sched = _make_scheduler([])
++    now = 100.0
++    only = _make_account_at("c1", 100.0)
++    assert sched._pick_weighted_by_idle([only], now, throughput=15.0) is only
+ 
+ 
+ def test_pickup_returns_none_when_no_account_ready():
+diff --git a/tests/test_combined_cache_hit_no_network.py b/tests/test_combined_cache_hit_no_network.py
+index fb9e7c0..f0564e6 100644
+--- a/tests/test_combined_cache_hit_no_network.py
++++ b/tests/test_combined_cache_hit_no_network.py
+@@ -50,7 +50,7 @@ def test_download_only_pid_does_not_query():
+     t.downloader._download_pid_group = lambda pid, urls: got.__setitem__("urls", urls) or []
+     t.downloader._maybe_flush_exist_pid = lambda pid: None
+ 
+-    t._process_one_pid("777", needs_query=False)
++    t._process_one_pid("777", needs_query=False, ordinal=0)
+ 
+     assert queried["n"] == 0  # no network query for download-only PID
+     assert got["urls"] == ["https://x/777_p0.jpg"]
+diff --git a/tests/test_combined_live_apply.py b/tests/test_combined_live_apply.py
+index bbd7291..fe94644 100644
+--- a/tests/test_combined_live_apply.py
++++ b/tests/test_combined_live_apply.py
+@@ -37,7 +37,8 @@ def test_combined_process_one_pid_refreshes_fetcher_and_downloader_before_work()
+     t._run_with_network_retry = lambda label, fn: (True, fn(), None)
+     t._download_only_urls = lambda pid: []
+ 
+-    result = t._process_one_pid("123", needs_query=False)
++    result, ok = t._process_one_pid("123", needs_query=False, ordinal=0)
+ 
+     assert calls == ["fetcher", "downloader"]
+     assert result == []
++    assert ok is True
+diff --git a/tests/test_combined_one_cooldown_per_pid.py b/tests/test_combined_one_cooldown_per_pid.py
+index 3056ff1..3cfbb47 100644
+--- a/tests/test_combined_one_cooldown_per_pid.py
++++ b/tests/test_combined_one_cooldown_per_pid.py
+@@ -35,7 +35,7 @@ def test_one_acquire_release_per_pid_covers_query_and_download():
+         calls["acquire"] += 1
+         return _Acc()
+ 
+-    def fake_release(acc, ok=True):
++    def fake_release(acc, ok=True, neutral=False):
+         calls["release"] += 1
+ 
+     def fake_retry(label, fn):
+@@ -52,18 +52,21 @@ def test_one_acquire_release_per_pid_covers_query_and_download():
+         return []  # no failures
+ 
+     t._acquire_account = fake_acquire
+-    t._release_account = fake_release
++    t._release_account_after_work = fake_release
+     t._run_with_network_retry = fake_retry
+     t.downloader._download_pid_group = fake_download
+     t.downloader._maybe_flush_exist_pid = lambda pid: None
++    t.downloader._set_pid_time_base = lambda *a, **k: None
+     t._seed_pending_urls = lambda pid, urls: None
+     t._mark_urls_done = lambda urls: None
++    t._persist_pid_meta = lambda pid: None
++    t._timetag_start = datetime.datetime(1970, 1, 1)
+ 
+-    failed = t._process_one_pid("123", needs_query=True)
++    failed, ok = t._process_one_pid("123", needs_query=True, ordinal=0)
+ 
+     assert calls["acquire"] == 1
+     assert calls["release"] == 1
+     assert calls["query"] == 1
+     assert calls["download"] == [("123", ("https://x/123_p0.jpg",))]
+     assert failed == []
+-    assert t._last_pid_ok is True
++    assert ok is True
+diff --git a/tests/test_combined_overall_progress_kept.py b/tests/test_combined_overall_progress_kept.py
+index 4d86024..353e17b 100644
+--- a/tests/test_combined_overall_progress_kept.py
++++ b/tests/test_combined_overall_progress_kept.py
+@@ -85,7 +85,7 @@ def test_query_does_not_emit_overall_progress(monkeypatch):
+     t._run_with_network_retry = lambda label, fn: (True, fn(), None)
+     t.downloader._download_pid_group = lambda pid, urls: []
+ 
+-    t._process_one_pid("55502", needs_query=True)
++    t._process_one_pid("55502", needs_query=True, ordinal=0)
+ 
+     kinds = []
+     while not real_q.empty():
+diff --git a/tests/test_combined_page_progress.py b/tests/test_combined_page_progress.py
+index 715bc24..36cca61 100644
+--- a/tests/test_combined_page_progress.py
++++ b/tests/test_combined_page_progress.py
+@@ -71,7 +71,7 @@ def test_process_one_pid_emits_page_progress_without_zero_total_progress():
+     t._run_with_network_retry = fake_retry
+     t.downloader._dispatch_download = lambda *args, **kwargs: -1
+ 
+-    failed = t._process_one_pid("55501", needs_query=True)
++    failed, ok = t._process_one_pid("55501", needs_query=True, ordinal=0)
+ 
+     events = _drain(q)
+     assert failed == []
+diff --git a/tests/test_combined_query_seeds_and_marks_db.py b/tests/test_combined_query_seeds_and_marks_db.py
+index f41a13f..2bcc68c 100644
+--- a/tests/test_combined_query_seeds_and_marks_db.py
++++ b/tests/test_combined_query_seeds_and_marks_db.py
+@@ -72,10 +72,10 @@ def test_clean_query_seeds_pending_then_marks_downloaded_and_closes_pid():
+ 
+     t.downloader._download_pid_group = fake_download
+ 
+-    failed = t._process_one_pid("55501", needs_query=True)
++    failed, ok = t._process_one_pid("55501", needs_query=True, ordinal=0)
+ 
+     assert failed == []
+-    assert t._last_pid_ok is True
++    assert ok is True
+     # Pending rows existed before the download ran.
+     assert seen_pending["counts"].get("pending", 0) == 2
+     # After a clean download they are flipped to downloaded.
+@@ -104,10 +104,10 @@ def test_failed_query_does_not_retire_pid_and_marks_not_ok():
+     downloaded = {"called": False}
+     t.downloader._download_pid_group = lambda pid, urls: downloaded.__setitem__("called", True) or []
+ 
+-    failed = t._process_one_pid("999", needs_query=True)
++    failed, ok = t._process_one_pid("999", needs_query=True, ordinal=0)
+ 
+     assert failed == []
+-    assert t._last_pid_ok is False
++    assert ok is False
+     assert downloaded["called"] is False
+     assert db.page_status_counts().get("pending", 0) == 0
+     # A failed query (ok=False) must release the cookie as not-ok.
+@@ -130,10 +130,10 @@ def test_partial_download_failure_keeps_pid_pending():
+     t.downloader._download_pid_group = lambda pid, dl_urls: [[urls[1], "boom"]]
+     t.downloader._maybe_flush_exist_pid = lambda pid: None
+ 
+-    failed = t._process_one_pid("44401", needs_query=True)
++    failed, ok = t._process_one_pid("44401", needs_query=True, ordinal=0)
+ 
+     assert failed  # propagated failure
+-    assert t._last_pid_ok is False
++    assert ok is False
+     # Pages were seeded pending, but NOT flipped to downloaded.
+     assert db.page_status_counts().get("downloaded", 0) == 0
+     assert db.page_status_counts().get("pending", 0) == 2
+@@ -172,7 +172,7 @@ def test_partial_download_failure_still_refreshes_cookie_first_success():
+     t.downloader._download_pid_group = lambda pid, dl_urls: [[urls[0], "disk full"]]
+     t.downloader._maybe_flush_exist_pid = lambda pid: None
+ 
+-    failed = t._process_one_pid("66601", needs_query=True)
++    failed, ok = t._process_one_pid("66601", needs_query=True, ordinal=0)
+ 
+     assert failed == [[urls[0], "disk full"]]
+     assert refreshed == ["c1"]
+diff --git a/tests/test_combined_stop_resume.py b/tests/test_combined_stop_resume.py
+index 973abf6..c60a9a5 100644
+--- a/tests/test_combined_stop_resume.py
++++ b/tests/test_combined_stop_resume.py
+@@ -75,13 +75,13 @@ def test_stop_mid_pid_keeps_pid_pending_for_resume():
+ 
+     t._run_with_network_retry = fake_retry
+ 
+-    t._process_one_pid("55501", needs_query=True)
++    failed, ok = t._process_one_pid("55501", needs_query=True, ordinal=0)
+ 
+     # Incomplete: nothing flipped to downloaded, PID not closed, and the
+     # genuine-success flag stays False so run() won't _mark_pid_processed it.
+     assert marked_done == [], "stopped PID must not be marked fully downloaded"
+     assert flushed == [], "stopped PID must not be flushed to the closed set"
+-    assert t._last_pid_ok is False
++    assert ok is False
+ 
+ 
+ def test_clean_full_download_still_marks_done():
+@@ -106,8 +106,8 @@ def test_clean_full_download_still_marks_done():
+ 
+     t._run_with_network_retry = fake_retry
+ 
+-    t._process_one_pid("777", needs_query=True)
++    failed, ok = t._process_one_pid("777", needs_query=True, ordinal=0)
+ 
+     assert marked_done == [urls]
+     assert flushed == ["777"]
+-    assert t._last_pid_ok is True
++    assert ok is True
+diff --git a/tests/test_execute_downloads_pool_author_barrier.py b/tests/test_execute_downloads_pool_author_barrier.py
+index 7c01b75..5265b1a 100644
+--- a/tests/test_execute_downloads_pool_author_barrier.py
++++ b/tests/test_execute_downloads_pool_author_barrier.py
+@@ -27,6 +27,7 @@ def _make_pool_thread(record):
+     t._pause_event.set()
+     t._scheduler = None
+     t._pid_cookie_selection = {}
++    t._pid_time_base = {}
+     t._current_account_local = threading.local()
+     t.timelock = threading.Lock()
+     t.download_time = datetime.datetime(2026, 1, 1)
+diff --git a/tests/test_scheduler_multiconsumer_and_timechanged.py b/tests/test_scheduler_multiconsumer_and_timechanged.py
+index f602752..0c0f078 100644
+--- a/tests/test_scheduler_multiconsumer_and_timechanged.py
++++ b/tests/test_scheduler_multiconsumer_and_timechanged.py
+@@ -146,6 +146,7 @@ def _make_thread(retry):
+     t._pause_event = threading.Event()
+     t._pause_event.set()
+     t._pid_cookie_selection = {}
++    t._pid_time_base = {}
+     t._current_account_local = threading.local()
+     t.timelock = threading.Lock()
+     t.download_time = datetime.datetime(2026, 1, 1)

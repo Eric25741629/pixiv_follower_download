@@ -6,6 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > read `.claude/skills/flet-0-84-pitfalls/SKILL.md`.** It documents every API
 > rename, threading hazard, and dialog-system change that bit during the
 > PyQt5 → Flet 0.84 migration.
+>
+> **Before touching `app/core/thread_combined.py`, any reuse of engine methods
+> outside their run(), SettingsStore write paths, or worker progress/stop
+> handling, read `.claude/skills/combined-compose-pitfalls/SKILL.md`** — the
+> distilled repeat-offender bugs (uninitialised composed-engine state, shared
+> queue multi-sender pollution, stop≠success, settings RMW races).
+>
+> **Code changes must be made in an isolated git worktree** (EnterWorktree /
+> `git worktree add`), never directly on the main working tree — it routinely
+> carries the user's uncommitted WIP, and editing in place mixes your diff
+> with theirs (unreviewable, uncommittable per-file). Merge back when green.
 
 ## Commands
 

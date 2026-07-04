@@ -338,12 +338,37 @@ Review:
 - [x] 測試同步更新（test_account_scheduler.py）+ 全綠
 - [x] CLAUDE.md 冷卻段落更新；pid_cooldown_avg 設 45
 
+## [2026-07-04] 復用/刪除縮減盤點（10 項，已逐一 grep 驗證）
+
+承接大檔拆分計畫的第二輪:目標不是搬家而是**合併真重複 + 刪死碼**,估 -350~450 行。
+全部低風險機械抽取,建議排進 A6/A7 批次順手做。逐項驗證結果:
+
+### 復用（真重複,抽一份共用）
+- [ ] R1 `_refresh_cookie_requirement` 25 行整段重複 — `step3_cookie_labels.py:87` ≡ `step4_filters.py:129`(已確認兩處同名方法)。留 step3 一份,step4 mixin 改繼承/委派同一實作。
+- [ ] R2 `_apply_live_settings_if_changed` 的 signature 比對 + like/ban/must/special_like_rules 解析 ~30 行 — `thread_download.py:273` ≡ `thread_url_fetch.py:148`(已確認)。抽 `pixiv_thread_base._parse_live_filter_fields(live)`,兩邊只留各自欄位差異。
+- [ ] R3 網路三例 re-raise 樣板 7 處 — `pixiv_api.py:466`、`step4_media.py:169/330/588`、`thread_url_fetch.py:821/863`、`thread_pid_scan.py:559`。**注意:`pixiv_thread_base._NETWORK_RETRY_EXCEPTIONS` tuple 已存在(:28)**,最懶修法是 7 處 `except (...三行...)` 直接改 `except _NETWORK_RETRY_EXCEPTIONS:`,不必新造 contextmanager。
+- [ ] R4 `flush_for_shutdown` 的「flush + 靜默關 DB」尾段 — 4 處都有此方法(`thread_pid_scan.py:85`、`thread_url_fetch.py:262`、`thread_download.py:1535`、`thread_combined.py:713`)。抽 `PauseableThread._close_metadata_db_quietly()`,各自保留前段 flush 差異。
+- [ ] R5 artworks 的 `ON CONFLICT(pid) DO UPDATE ... COALESCE` upsert SQL — `metadata_db_artwork.py:68` 與 `metadata_db_migration.py:47` 近乎相同(migration 版**少 revoked_at 一欄**,合併時要保留此差異或補欄位後確認行為等價)。抽成 `metadata_db_schema.py` 模組常數。
+- [ ] R6 pictures_id 候選路徑組裝(path + APPDATA fallback)— `step3_check_exist.py:25` ≡ `step3_persistence.py:223`(已確認)。留一個 `_pictures_id_candidates(path)`。
+- [ ] R7 `_safe_meta_count` 兩份 — `step3_init_state.py:20` ≡ `thread_download.py:54`(已確認,僅 2 份非 3 份)。收進 `pixiv_thread_utils.py` 純函式 Move+re-export。
+
+### 刪除（死碼/已規劃）
+- [ ] D1 `cookie_speed_divisor` + `apply_cookie_pool_speedup` — CLAUDE.md 標 deprecated;**已實測 app/ 與 tests/ 零呼叫者**(findings.md 的呼叫點是舊碼殘影),只剩 `cookie_utils.py:176/188` 定義 + `pixiv_thread_utils.py:439` re-export。連 re-export 一起刪,同步刪 CLAUDE.md deprecated 句。
+- [ ] D2 PHASE-B JSON exist_pid 分支(`load_exist_pid_set` + `_read_exist_pid_json`/`_read_legacy_exist_pid_set`/`_trash_legacy_exist_pid_files`/`_augment_exist_pid_from_db` + exist.json/existPID.txt fallback)— 最大一筆(估 -150~250 行)但**前置是完成 Phase B 切換**(`_build_step2/3` 改 `closed_artwork_set()`),屬既有計畫,不與本輪機械抽取混做。
+
+### 重構（複雜度,非重複;做完上面再說）
+- [ ] C1 `flet_app.main`(CC=32)— 閉包受限,CLAUDE.md 已明訂不搬,僅能繼續抽無狀態 helper;低優先。
+- [ ] C2 `combined_thread._process_one_pid_core`(CC=29)— query/seed/download 三段可抽 `_step_*` helper;**combined 剛做完 lane/parallel 且有未 commit 改動,等實機驗證穩定後再動**。
+
+### 執行鐵則
+沿用拆分計畫:一次一個 transformation、全測綠才續、ruff 零新增;R1-R7+D1 皆純機械可先做,D2/C2 有前置條件。
+
 ## [2026-07-04] 大檔拆分盤點（>1000 行必拆，600-999 觀察）
 
 實測行數重新盤點（承接 tasks/refactor-split-oversized-files.md 的手法：mixin 拆 + Move/re-export shim，一次一個 transformation、全測綠才續、實機驗證後才算完）。
 
 ### 必拆（>1000 行）— 2026-07-04 執行進度
-- [ ] `app/core/thread_download.py`（2018 → **1539**，仍 >1000）— A1-A5 已抽，A6/A7 待實機驗證：
+- [ ] `app/core/thread_download.py`（2018 → **1574**，2026-07-04 實測、含未 commit 改動，仍 >1000）— A1-A5 已抽，A6/A7 待實機驗證：
   - [x] A1 legacy 建構參數 → `step4_legacy_args.py`（`_Step4LegacyArgsMixin`）2018→1937
   - [x] A2 倒數/睡眠節流 → `step4_pacing.py`（`_Step4PacingMixin`）1937→1851
   - [x] A3 任務準備/過濾統計 → 併入 `step4_filters.py`（是純去重：6 方法早已在 mixin 內重複、被 shadow，byte-identical 確認後刪 shadow）1851→1739
@@ -351,7 +376,7 @@ Review:
   - [x] A5 DB-sync 群 → `step4_db_sync.py`（`_Step4DbSyncMixin`）1678→1539
   - [ ] 🔶 A6 執行區（pool/scheduler + combined 借用）→ `step4_execution.py`（**high，最後、需實機 combined 驗證後才做**）
   - [ ] A7 init 群 → `step4_init.py`（med，`defer_step4_scan` 分支要逐字保留）
-- [x] `app/core/thread_url_fetch.py`（1506 → **974** ✅ <1000）— B1-B4 完成：
+- [x] `app/core/thread_url_fetch.py`（1506 → **972** ✅ <1000，2026-07-04 實測）— B1-B4 完成：
   - [x] B1 cookie 標籤/用量 → `step3_cookie_labels.py`（`_Step3CookieLabelsMixin`）
   - [x] B2 check_exist 掃描群 → `step3_check_exist.py`（`_Step3CheckExistMixin`）
   - [x] B3 快取預過濾 + rescrape 視窗 → `step3_cache_prefilter.py`（`_Step3CachePrefilterMixin`）
@@ -374,3 +399,11 @@ Review:
 1. `python -m pytest -q -m "not integration"` 全綠才進下一步
 2. 純函式用 Move+re-export shim；共享 self 狀態的方法群用 mixin（零 caller 改動）
 3. 不平行盲拆；GUI/threading/DB 塊拆完要實機重啟 Flet 驗 combined 無回歸
+
+## 2026-07-04 邊查邊下部分下載續傳（不重複下載）
+- [x] DB helper `downloaded_page_indices(pid)`（metadata_db_pages.py，無新欄位，沿用 pages.status）
+- [x] `_flush_partial_done`：中止/部分失敗時把 `_completed_urls` 交集的已完成頁標 downloaded
+- [x] `_drop_already_downloaded`：query 路徑重跑時過濾已下載頁（全部已下載 → 直接關閉 PID）
+- [x] 順手修：`_record_pid_send` 對 `__new__` stub 防禦（send-rate WIP 弄壞 test_combined_live_apply）
+- [x] 測試 tests/test_combined_partial_resume.py（5 個），全套 1097 綠
+- Review：ugoira URL 解析不到 page_index → 保持整 PID 重下（安全預設）；download-only 路徑本來就走 v_pending_pages 免過濾
