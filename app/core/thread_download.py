@@ -1,8 +1,8 @@
 import contextlib
 import os
+import shutil
 import datetime
 import re
-import random as pyrandom
 import threading
 import concurrent.futures
 import requests
@@ -16,24 +16,25 @@ from app.core.pixiv_thread_utils import (
     atomic_write_text,
     count_text_lines,
     init_cookie_fields,
-    mirror_meta_dict_to_db,
     normalize_filter_tags,
     normalize_pid,
     output_err,
     to_int_lenient,
     write_all_url_file,
 )
-from app.core.metadata_db import emit_db_stats, mirror_exist_pid_set, open_metadata_db
 from app.core.pixiv_thread_base import (
     DOWNLOAD_DEADLINE_SEC,
     DownloadStopped,
     PauseableThread,
-    _normalize_special_like_rules,
 )
 from app.core.step4_filename import _FilenameMixin
 from app.core.step4_jxl_conversion import _JXLMixin
 from app.core.step4_filters import _Step4FiltersMixin
 from app.core.step4_media import _Step4MediaMixin
+from app.core.step4_legacy_args import _Step4LegacyArgsMixin
+from app.core.step4_pacing import _Step4PacingMixin
+from app.core.step4_folder_list import _Step4FolderListMixin
+from app.core.step4_db_sync import _Step4DbSyncMixin
 # Author-ordering primitives moved to step4_author_order (file-size refactor);
 # re-imported here so ``thread_download.compute_author_order`` (read by
 # thread_combined / thread_pid_scan) and the in-module references keep working.
@@ -43,6 +44,12 @@ from app.core.step4_author_order import (  # noqa: F401  (facade re-export)
     compute_author_order,
 )
 from app.core import diag_log
+
+# Boundary guard: below this much free space on the download drive the worker
+# stops instead of grinding out 0-byte / failed writes (2026-07-04 incident:
+# F: hit 0 bytes free and a 4-day combined run mass-failed 35k pages).
+LOW_DISK_MIN_FREE_BYTES = 100 * 1024 * 1024
+
 
 def _safe_meta_count(db) -> int:
     try:
@@ -63,7 +70,8 @@ def _safe_meta_count(db) -> int:
 
 
 class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
-                      _Step4FiltersMixin, _Step4MediaMixin):
+                      _Step4FiltersMixin, _Step4MediaMixin, _Step4LegacyArgsMixin,
+                      _Step4PacingMixin, _Step4FolderListMixin, _Step4DbSyncMixin):
     pid_max=0
     pid_now=0
     path=os.getenv('APPDATA')+r'/pixiv_download/'
@@ -745,91 +753,10 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
     # _record_filter_decision / _passes_pid_filter pipeline moved to
     # step4_filters._Step4FiltersMixin (file-size refactor). Inherited unchanged.
 
-    _LEGACY_POSITIONAL_SCHEMA = [
-        ("jxl_enable", bool),
-        ("jxl_cjxl_path", lambda v: str(v).strip() or None),
-        ("jxl_delete_original", bool),
-        ("jxl_effort", int),
-    ]
-    _LEGACY_SCALAR_KW_SCHEMA = [
-        ("jxl_enable", bool),
-        ("jxl_cjxl_path", lambda v: str(v).strip() or None),
-        ("jxl_delete_original", bool),
-        ("jxl_effort", int),
-        ("jxl_skip_gif", bool),
-        ("like_num", lambda v: int(v or 0)),
-        ("r18_like_num", lambda v: int(v or 0)),
-        ("ai_gen_dir", bool),
-        ("filename_template", lambda v: str(v or "").strip() or None),
-        ("tag_strip_brackets", bool),
-        ("tag_strip_special_chars", bool),
-        ("author_order", bool),
-        ("set_file_mtime", bool),
-        ("download_deadline_sec", lambda v: float(v) if v else None),
-    ]
-
-    @staticmethod
-    def _cast_or_skip(caster, raw):
-        """Run ``caster(raw)`` returning the value, or ``None`` on any failure / casted None."""
-        try:
-            value = caster(raw)
-        except Exception:
-            return None
-        return value
-
-    @staticmethod
-    def _apply_legacy_positional(args, overrides):
-        """Translate positional legacy args into the overrides dict."""
-        if not args:
-            return
-        for idx, (key, caster) in enumerate(download_thread._LEGACY_POSITIONAL_SCHEMA):
-            if idx >= len(args):
-                break
-            value = download_thread._cast_or_skip(caster, args[idx])
-            if value is not None:
-                overrides[key] = value
-
-    @staticmethod
-    def _apply_legacy_scalar_kwargs(kwargs, overrides):
-        """Translate scalar keyword legacy args into the overrides dict."""
-        for key, caster in download_thread._LEGACY_SCALAR_KW_SCHEMA:
-            if key not in kwargs:
-                continue
-            value = download_thread._cast_or_skip(caster, kwargs[key])
-            if value is not None:
-                overrides[key] = value
-
-    @staticmethod
-    def _apply_legacy_list_kwargs(kwargs, overrides):
-        """Pass-through list kwargs (ban_tag / must_tag) when shaped correctly."""
-        for list_key in ("ban_tag", "must_tag"):
-            value = kwargs.get(list_key)
-            if isinstance(value, list):
-                overrides[list_key] = value
-
-    @staticmethod
-    def _apply_legacy_special_like_rules(kwargs, overrides):
-        """Run special_like_rules through the normalizer when present."""
-        if "special_like_rules" not in kwargs:
-            return
-        with contextlib.suppress(Exception):
-            overrides["special_like_rules"] = _normalize_special_like_rules(
-                kwargs.get("special_like_rules", [])
-            )
-
-    @staticmethod
-    def _apply_legacy_constructor_args(legacy_args, legacy_kwargs):
-        """Resolve backward-compatible positional/keyword args to a dict of overrides.
-
-        Silently skips malformed entries so a caller passing junk cannot break __init__.
-        """
-        overrides = {}
-        kwargs = legacy_kwargs or {}
-        download_thread._apply_legacy_positional(legacy_args, overrides)
-        download_thread._apply_legacy_scalar_kwargs(kwargs, overrides)
-        download_thread._apply_legacy_list_kwargs(kwargs, overrides)
-        download_thread._apply_legacy_special_like_rules(kwargs, overrides)
-        return overrides
+    # Legacy constructor-arg coercion (_cast_or_skip, _apply_legacy_* and the
+    # _LEGACY_*_SCHEMA constants) moved to step4_legacy_args._Step4LegacyArgsMixin
+    # (file-size refactor). Inherited unchanged, still reachable as
+    # download_thread._apply_legacy_constructor_args / ._LEGACY_SCALAR_KW_SCHEMA.
 
     # The JXL background-conversion subsystem (_resolve_cjxl_path,
     # _build_jxl_command, _run_cjxl_*, _jxl_*, _convert_file_to_jxl,
@@ -847,95 +774,10 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
     # _render_default_filename / _build_download_filename moved to
     # step4_filename._FilenameMixin (file-size refactor). Inherited unchanged.
 
-    def _format_size_human(self, value):
-        try:
-            size = int(value or 0)
-        except Exception:
-            size = 0
-        sign = "-" if size < 0 else ""
-        n = abs(size)
-        if n < 1000:
-            return f"{sign}{n} B"
-        units = [
-            ("GB", 1000 ** 3),
-            ("MB", 1000 ** 2),
-            ("KB", 1000),
-        ]
-        for unit, factor in units:
-            if n >= factor:
-                return f"{sign}{float(n) / float(factor):.2f} {unit}"
-        return f"{sign}{n} B"
-
-    def _emit_countdown_start_log(self, pid, delay, label, color):
-        """Print the '[下載等待][label] 等待 N 秒' header at the start of a wait."""
-        cookie_used = self._is_cookie_used_for_pid(pid)
-        ratio_text = '1.0x' if cookie_used else '0.5x'
-        with contextlib.suppress(Exception):
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='{color}'>[下載等待][{label}] 等待 {delay} 秒 "
-                f"(PID {pid}, 倍率 {ratio_text}, cookie_used={cookie_used})</font></p>"
-            ))
-
-    def _countdown_tick(self, remaining, respect_group_stop):
-        """Run one 1-second tick. Returns True iff the loop should break."""
-        if self._stop_event.is_set():
-            return True
-        if respect_group_stop and self._stop_after_group:
-            return True
-        while not self._pause_event.is_set():
-            if self._stop_event.is_set():
-                return True
-            self._pause_event.wait(timeout=0.5)
-        if self._stop_event.is_set():
-            return True
-        with contextlib.suppress(Exception):
-            self._q.put(WorkerEvent("countdown", remaining))
-        return self._stop_event.wait(timeout=1.0)
-
-    def _run_download_countdown(self, pid, min_sec, max_sec, *, label, color, respect_group_stop):
-        if not self.single_mode_flag:
-            # Pool/multi mode skips the in-download wait + its 倒數 entirely.
-            # Logged so the trace shows WHY no countdown appears between pages.
-            diag_log.log(diag_log.WORKER,
-                         f"PID {pid} _run_download_countdown[{label}] skipped (pool mode)")
-            return
-        delay = self._calc_sleep_delay(min_sec, max_sec, pid=pid)
-        diag_log.log(diag_log.WORKER,
-                     f"PID {pid} _run_download_countdown[{label}] {delay}s (single mode)")
-        self._emit_countdown_start_log(pid, delay, label, color)
-        for remaining in range(int(delay), 0, -1):
-            if self._countdown_tick(remaining, respect_group_stop):
-                break
-        with contextlib.suppress(Exception):
-            self._q.put(WorkerEvent("countdown", 0))
-
-    def _sleep_between_downloads(self, pid):
-        # Inter-PID cooldown is owned by AccountScheduler.release() when active.
-        if self._scheduler is not None:
-            return
-        avg = int(getattr(self, "_legacy_pid_cooldown_avg", 35))
-        low = max(1, int(avg * 0.7))
-        high = max(low, int(avg * 1.3))
-        delay = pyrandom.randint(low, high)
-        self._run_download_countdown(
-            pid,
-            delay,
-            delay,
-            label="PID間",
-            color="green",
-            respect_group_stop=True,
-        )
-
-    def _sleep_within_pid(self, pid):
-        # Wait between pages within the same PID.
-        self._run_download_countdown(
-            pid,
-            self.intra_pid_wait_min,
-            self.intra_pid_wait_max,
-            label="同PID",
-            color="gray",
-            respect_group_stop=False,
-        )
+    # Pacing / countdown helpers (_format_size_human, _emit_countdown_start_log,
+    # _countdown_tick, _run_download_countdown, _sleep_between_downloads,
+    # _sleep_within_pid, _calc_sleep_delay) moved to
+    # step4_pacing._Step4PacingMixin (file-size refactor). Inherited unchanged.
 
     def _is_cookie_used_for_pid(self, pid):
         """Return whether this PID download used cookie-protected metadata."""
@@ -972,14 +814,6 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
                 return False
         except Exception:
             return False
-
-    def _calc_sleep_delay(self, min_sec, max_sec, pid=None):
-        """Calculate randomized sleep delay between min_sec and max_sec.
-
-        The scheduler-aware path no longer applies cookie-pool speedup; this
-        function is now used only for intra-PID polite delays.
-        """
-        return pyrandom.randint(int(min_sec), int(max_sec))
 
     def _extract_pid_from_download_url(self, url):
         try:
@@ -1032,123 +866,12 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         except Exception:
             return str(stored_url)
 
-    @staticmethod
-    def _new_step4_filter_stats():
-        return {
-            "input_count": 0,
-            "duplicate_count": 0,
-            "invalid_count": 0,
-            "skipped_exist_count": 0,
-            "skipped_like_count": 0,
-            "skipped_tag_count": 0,
-            "skipped_no_meta_count": 0,
-            "output_count": 0,
-        }
+    # _new_step4_filter_stats / _classify_url_for_filter / _bump_filter_reason /
+    # _prepare_download_tasks / _read_pictures_id_set / _requeue_no_meta_pids
+    # live on step4_filters._Step4FiltersMixin (file-size refactor); the
+    # duplicate copies that used to shadow them here were removed. Inherited
+    # unchanged.
 
-    def _classify_url_for_filter(self, raw, seen_url):
-        """Validate raw URL + extract PID. Returns (pid, normalized_url) or (None, reason)."""
-        if not isinstance(raw, str):
-            return None, "invalid"
-        u = raw.strip()
-        if not u:
-            return None, "invalid"
-        if u in seen_url:
-            return None, "duplicate"
-        seen_url.add(u)
-        pid = normalize_pid(self._extract_pid_from_download_url(u))
-        if not pid:
-            return None, "invalid"
-        return pid, u
-
-    @staticmethod
-    def _bump_filter_reason(stats, reason, pid, no_meta_pids):
-        """Increment the per-reason counter; tag no_meta PIDs for later requeue."""
-        if reason == "like":
-            stats["skipped_like_count"] += 1
-        elif reason == "tag":
-            stats["skipped_tag_count"] += 1
-        elif reason == "no_meta":
-            stats["skipped_no_meta_count"] += 1
-            no_meta_pids.add(pid)
-        else:
-            stats["invalid_count"] += 1
-
-    def _prepare_download_tasks(self, urls, allow_network=False):
-        pending = []
-        seen_url = set()
-        no_meta_pids = set()  # PIDs that fell through filter for lack of meta
-        stats = self._new_step4_filter_stats()
-        for raw in urls:
-            stats["input_count"] += 1
-            pid, payload = self._classify_url_for_filter(raw, seen_url)
-            if pid is None:
-                if payload == "duplicate":
-                    stats["duplicate_count"] += 1
-                else:
-                    stats["invalid_count"] += 1
-                continue
-            if pid in self.exist_pid:
-                stats["skipped_exist_count"] += 1
-                continue
-            passed, reason = self._passes_pid_filter(pid, allow_network=allow_network)
-            if not passed:
-                self._bump_filter_reason(stats, reason, pid, no_meta_pids)
-                continue
-            pending.append(payload)
-        stats["output_count"] = len(pending)
-        # On the network-enabled pass, queue PIDs that still failed for
-        # lack of meta back into pictures_id.txt so the next step 3 run
-        # picks them up. Also log a clear message so the user knows what
-        # to do next.
-        if allow_network and no_meta_pids:
-            self._requeue_no_meta_pids(no_meta_pids)
-        self._diag(
-            "step4_filter_pass",
-            allow_network=bool(allow_network),
-            stats=stats,
-            no_meta_pid_count=len(no_meta_pids),
-        )
-        return pending, stats
-
-    @staticmethod
-    def _read_pictures_id_set(pending_path):
-        """Read pictures_id.txt into a set of stripped non-empty lines (defensive)."""
-        if not os.path.isfile(pending_path):
-            return set()
-        out = set()
-        try:
-            with open(pending_path, encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    s = line.strip()
-                    if s:
-                        out.add(s)
-        except Exception:
-            pass
-        return out
-
-    def _requeue_no_meta_pids(self, pids: set) -> None:
-        """Append PIDs that step 4 couldn't resolve meta for back into
-        pictures_id.txt (step 3's pending queue) so the user's next step
-        3 run picks them up. Merges with whatever is already there."""
-        try:
-            pending_path = os.path.join(self.path, "pictures_id.txt")
-            existing = self._read_pictures_id_set(pending_path)
-            new = {str(p).strip() for p in pids if str(p).strip()}
-            added = len(new - existing)
-            if added <= 0:
-                return
-            merged = existing | new
-            from app.core.safe_io import atomic_write_text
-            ordered = sorted(merged, key=lambda s: int(s) if s.isdigit() else s)
-            atomic_write_text(pending_path, ordered, backup=False)
-            with contextlib.suppress(Exception):
-                self._q.put(WorkerEvent("output",
-                    f"<p><font color='orange'>[補meta] {added} 個缺 meta 的 PID "
-                    f"已加回 pictures_id.txt（共 {len(merged)} 筆待辦），"
-                    f"請再跑一次步驟 3 補抓資料</font></p>"
-                ))
-        except Exception:
-            pass
     def _group_urls_by_pid(self, urls):
         groups = {}
         order = []
@@ -1194,7 +917,37 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
             return self._reorder_pid_order_by_author(pid_order)
         return list(pid_order), [list(pid_order)]
 
+    _low_disk_notified = False
+
+    def _check_disk_space_or_stop(self) -> bool:
+        """Boundary guard: stop the run when the download drive is nearly full.
+
+        Returns False (and sets the stop event, notifying the user once) when
+        free space is below LOW_DISK_MIN_FREE_BYTES; True otherwise. Never
+        raises — an unreadable path must not break downloads.
+        """
+        try:
+            free = shutil.disk_usage(self.path).free
+        except Exception:
+            return True
+        if free >= LOW_DISK_MIN_FREE_BYTES:
+            return True
+        if not self._low_disk_notified:
+            self._low_disk_notified = True
+            with contextlib.suppress(Exception):
+                self._q.put(WorkerEvent(
+                    "output",
+                    f"<p><font color='red'>下載磁碟空間不足（剩餘 "
+                    f"{free // (1024 * 1024)} MB，低於 "
+                    f"{LOW_DISK_MIN_FREE_BYTES // (1024 * 1024)} MB），"
+                    f"已停止下載。請清出空間後再重新執行。</font></p>",
+                ))
+        self.stop()
+        return False
+
     def _download_pid_group(self, pid, urls):
+        if not self._check_disk_space_or_stop():
+            return []  # stop already set; pages stay pending for the next run
         # Pick up any mid-run 「儲存設定」 before this PID's pages: path/dir
         # flags, filename options, waits, cooldown, and JXL options.
         self._apply_live_settings_if_changed()
@@ -1227,9 +980,10 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
                         diag_log.log(diag_log.DOWNLOAD, f"PID {pid} p{idx} 失敗")
                     else:
                         diag_log.log(diag_log.DOWNLOAD, f"PID {pid} p{idx} 完成")
-                        if idx < len(urls) - 1:
-                            # 同一 PID 多頁時，頁面間做短暫休眠
-                            self._sleep_within_pid(pid)
+                    if idx < len(urls) - 1 and not self._stop_event.is_set():
+                        # 同一 PID 多頁時，頁面間做短暫休眠；已存在/略過(-1)
+                        # 也要節流，否則多頁作品會瞬間掃過。
+                        self._sleep_within_pid(pid)
                     if self._stop_event.is_set():
                         break
         finally:
@@ -1239,72 +993,10 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
                 sess.close()
         return failed
 
-    @staticmethod
-    def _parse_pid_from_pid_equals(file):
-        # Format: "...PID=12345_p0.jpg" → requires 4 < len < 12.
-        try:
-            candidate = file.split('PID=')[1].split('_')[0]
-        except IndexError:
-            return None
-        if 4 < len(candidate) < 12:
-            return candidate
-        return None
+    # PID-from-filename parsers, splitID, and get_filelist moved to
+    # step4_folder_list._Step4FolderListMixin (file-size refactor). Inherited
+    # unchanged.
 
-    @staticmethod
-    def _parse_pid_from_pid_prefix(file):
-        # Format: "...PID12345 ..." → requires 4 < len <= 13.
-        # Fallback: if too long/short but leading "p"-split is digit, keep dot-stripped form.
-        try:
-            candidate = file.split('PID')[1].split(' ')[0]
-        except IndexError:
-            return None
-        if 4 < len(candidate) <= 13:
-            return candidate
-        head = candidate.split('p')[0]
-        if head.isdigit():
-            return candidate.split('.')[0]
-        return None
-
-    @staticmethod
-    def _parse_pid_from_underscore(file):
-        # Format: "illust_12345_..." → requires 4 < len < 12.
-        try:
-            candidate = file.split('_')[1]
-        except IndexError:
-            return None
-        if 4 < len(candidate) < 12:
-            return candidate
-        return None
-
-    def splitID(self, Filelist):
-        parsers = (
-            self._parse_pid_from_pid_equals,
-            self._parse_pid_from_pid_prefix,
-            self._parse_pid_from_underscore,
-        )
-        seen = set()
-        for file in Filelist:
-            if not re.search(r'\.jpg|\.png|\.gif', file):
-                continue
-            if not re.search(r'PID|illust', file):
-                continue
-            for parser in parsers:
-                pid = parser(file)
-                if pid:
-                    seen.add(pid)
-                    break
-        return list(seen)
-    
-    def get_filelist(self,path):
-        file_list = []
-        try:
-            for root, _, files in os.walk(path):
-                for name in files:
-                    file_list.append(os.path.join(root, name))
-        except Exception:
-            pass
-        return file_list
-    
     def _emit_phase(self, text: str) -> None:
         with contextlib.suppress(Exception):
             self._q.put(WorkerEvent("phase", text))
@@ -1594,85 +1286,10 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         )
         return remaining_urls
 
-    def _init_metadata_db(self, json_meta):
-        """Open the SQLite metadata cache and migrate JSON contents on first use."""
-        base = getattr(self, "_db_base", None) or self.path
-        return open_metadata_db(base, json_meta, event_log=getattr(self, "_event_log", None))
-
-    def _emit_metadata_db_stats(self, stage="Step"):
-        """Print a one-liner with current SQLite cache size."""
-        emit_db_stats(getattr(self, "_metadata_db", None), self._q, stage=stage)
-
-    def _mirror_exist_pid_to_db(self):
-        """Best-effort copy of the in-memory exist_pid set into the SQLite cache."""
-        mirror_exist_pid_set(getattr(self, "_metadata_db", None), self.exist_pid)
-
-    def _sync_meta_to_db(self):
-        """Mirror the in-memory ``self.url_meta`` into the SQLite cache."""
-        mirror_meta_dict_to_db(getattr(self, "_metadata_db", None), self.url_meta)
-
-    @staticmethod
-    def _meta_to_db_kwargs(meta):
-        """Translate a self.url_meta entry to MetadataDB.upsert_meta kwargs.
-
-        Tolerates non-dict input (returns all-None fields) and accepts both
-        ``tag``/``tags`` for tag list aliases plus ``pagecount``/``page_count``
-        and ``updated_at``/``checked_at`` for timestamp aliases.
-        """
-        if not isinstance(meta, dict):
-            return {
-                "tags": None, "like_count": None, "page_count": None,
-                "img_url": None, "requires_cookie": None, "updated_at": None,
-            }
-        tags = meta.get("tag")
-        if tags is None:
-            tags = meta.get("tags")
-        return {
-            "tags": list(tags) if isinstance(tags, list) else None,
-            "like_count": meta.get("like"),
-            "page_count": meta.get("pagecount") or meta.get("page_count"),
-            "img_url": meta.get("img_url"),
-            "requires_cookie": meta.get("requires_cookie"),
-            "updated_at": meta.get("updated_at") or meta.get("checked_at"),
-        }
-
-    def _upsert_meta_in_db(self, pid_key, meta):
-        """Best-effort per-PID upsert into SQLite (no-op if DB is unavailable)."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None or not pid_key:
-            return
-        with contextlib.suppress(Exception):
-            db.upsert_meta(pid_key, **self._meta_to_db_kwargs(meta))
-
-    def _persist_url_meta(self):
-        """Sync self.url_meta to SQLite (DB is now the primary store)."""
-        lock = getattr(self, "_url_meta_lock", None)
-        if lock is not None:
-            lock.acquire()
-        try:
-            self._sync_meta_to_db()
-        finally:
-            if lock is not None:
-                lock.release()
-
-    def _mark_completed_urls_in_db(self):
-        """Mark URLs whose page is confirmed on disk as 'downloaded' in SQLite.
-
-        Only genuinely-completed URLs (see :meth:`_record_completed`) are
-        marked — a network-retry-exhausted or stop-interrupted URL is *not* in
-        ``self._completed_urls`` and therefore stays ``status='pending'`` so the
-        next run re-queues it. Silently skips if the DB is not wired or anything
-        goes wrong — this is purely an optimisation for subsequent runs."""
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            with self._completed_urls_lock:
-                completed = set(self._completed_urls)
-            done_urls = [u for u in self.allurl if u in completed]
-            db.mark_urls_done(done_urls)
-        except Exception:
-            pass
+    # SQLite metadata-DB sync helpers (_init_metadata_db, _emit_metadata_db_stats,
+    # _mirror_exist_pid_to_db, _sync_meta_to_db, _meta_to_db_kwargs,
+    # _upsert_meta_in_db, _persist_url_meta, _mark_completed_urls_in_db) moved to
+    # step4_db_sync._Step4DbSyncMixin (file-size refactor). Inherited unchanged.
 
     def _finalize_downloads(self, failed_nested):
         fail_records = self._classify_download_results(failed_nested)
@@ -1694,74 +1311,9 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         self._persist_url_meta()
         return remaining_urls
 
-    def _shadow_mark_failures(self, fail_records) -> None:
-        """Mirror err_url.txt writes into ``pages(status='failed')``.
-
-        ``fail_records`` is the list of ``[url, info]`` produced by
-        ``_classify_download_results``; we parse each URL into (pid, page)
-        and call ``mark_page_failed`` so Phase 6's auto-retry path can
-        pick them up.  Silent on any failure — shadow write is best-effort.
-        """
-        db = getattr(self, "_metadata_db", None)
-        if db is None:
-            return
-        try:
-            from app.core.pid_filesystem import parse_pid_and_page_from_url
-            for url_text, info_text in fail_records:
-                pid, pidx = parse_pid_and_page_from_url(str(url_text))
-                if pid is None or pidx is None:
-                    continue
-                db.mark_page_failed(
-                    pid, pidx,
-                    failure_reason=str(info_text),
-                    url=str(url_text),
-                )
-        except Exception:
-            pass
-
-    def _maybe_flush_exist_pid(self, pid: str) -> None:
-        """Add pid to exist_pid and mark it closed in DB immediately.
-
-        Uses :meth:`~MetadataDB.import_downloaded_set` which writes a
-        sentinel ``artworks`` row — visible to ``v_closed_artworks`` and
-        therefore to :meth:`~MetadataDB.is_downloaded`.
-        """
-        pid_key = normalize_pid(pid) or str(pid)
-        if pid_key:
-            self.exist_pid.add(pid_key)
-            db = getattr(self, "_metadata_db", None)
-            if db is not None:
-                with contextlib.suppress(Exception):
-                    db.import_downloaded_set([pid_key])
-
-    # 每 N 個 PID 組之後額外 flush url_meta；exist_pid + DB 已逐筆寫，
-    # 這裡只是把每組 cookie_used / requires_cookie 等 url_meta 變動推到 DB。
-    _STEP4_URL_META_FLUSH_EVERY = 10
-
-    def _maybe_flush_url_meta_periodically(self, done_count: int) -> None:
-        """Best-effort periodic url_meta DB sync. Idempotent under concurrent calls."""
-        try:
-            every = int(self._STEP4_URL_META_FLUSH_EVERY)
-        except Exception:
-            every = 10
-        if every <= 0 or done_count <= 0:
-            return
-        if done_count % every != 0:
-            return
-        with contextlib.suppress(Exception):
-            self._persist_url_meta()
-
-    def _sync_exist_pid_to_db(self):
-        """Bulk-sync the current exist_pid set into the canonical DB.
-
-        Replaces the old ``_refresh_and_write_exist_pid`` which additionally
-        scanned the download folder and wrote a JSON file.  Now that the DB
-        is the sole source of truth, we only need the sentinel import.
-        """
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            with contextlib.suppress(Exception):
-                db.import_downloaded_set(self.exist_pid)
+    # _shadow_mark_failures, _maybe_flush_exist_pid, _maybe_flush_url_meta_periodically
+    # (+ _STEP4_URL_META_FLUSH_EVERY) and _sync_exist_pid_to_db moved to
+    # step4_db_sync._Step4DbSyncMixin (file-size refactor). Inherited unchanged.
 
     def _emit_step4_summary_and_finalize(self, remaining_urls):
         if self.jxl_enable:

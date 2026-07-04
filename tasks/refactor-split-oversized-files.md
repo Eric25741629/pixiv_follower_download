@@ -29,10 +29,12 @@ owner_note: 此檔是給「下一個 session」直接接手用的。讀完就能
 
 | 檔案 | 原行數 | 現行數 | 整體風險 | 狀態 |
 |------|--------|--------|----------|------|
-| `app/core/pixiv_thread_utils.py` | 1011 | **750** | low | ✅ 已降到 <1000 |
-| `app/core/metadata_db.py` | 1448 | **981** | low | ✅ 已降到 <1000 |
-| `app/core/thread_download.py` | 3080 | **2598** | medium | 🟡 低風險塊已抽(filename+JXL);剩高風險塊待實機驗 |
-| `app/core/thread_url_fetch.py` | 2092 | 2092 | high | ⬜ 待拆 |
+| `app/core/pixiv_thread_utils.py` | 1011 | **597** | low | ✅ 已降到 <1000 |
+| `app/core/metadata_db.py` | 1448 | **545** | low | ✅ 已降到 <1000 |
+| `app/core/thread_download.py` | 3080 | **1539** | medium | 🟡 2026-07-04 再抽 A1-A5;仍 >1000,A6/A7 待實機驗證 |
+| `app/core/thread_url_fetch.py` | 2092 | **974** | high | ✅ 2026-07-04 抽 B1-B4 降到 <1000 |
+
+（2026-07-04 重新盤點:最新候選塊與 600-999 行觀察名單見 `tasks/todo.md`「[2026-07-04] 大檔拆分盤點」段。）
 
 已新增:`app/core/pid_utils.py`(104)、`app/core/cookie_utils.py`(215)、
 `metadata_db_schema.py`(92)、`metadata_db_cache.py`(48)、
@@ -171,3 +173,85 @@ Step 3 查詢引擎,跟 orchestration 綁很緊。建議順序:**先 `step3_filt
 - `load_exist_pid_set` 及其 helper:PHASE-B 要刪,**別花時間重構**。
 - closed-set 快取的 Python 集合組合 + 檔案簽章:**性能關鍵,別改語意**。
 - 真實資料規模:~1.1M closed PID / ~204k 檔,性能評估要照這個尺度(使用者記憶 `project_real_dataset_scale`)。
+
+---
+
+# 2026-07-04 第二輪拆分計畫（剩餘 2 檔 >1000 行）
+
+手法不變：共享 self 狀態的方法群 → mixin（原檔 class 宣告加基底，方法逐字搬走，零 caller 改動）；
+純 staticmethod / 模組函式 → Move + re-export。批次由低風險到高風險排序，每批 = 一個 commit + 全測綠；
+標 🔶 的批次做完要實機重啟 Flet 跑一輪 combined 才算過。
+
+## A. `thread_download.py`（2018 → 目標 <1000）
+
+保留在原檔：`__init__` 與建構流程、`run()`、`_download_pid_group`（timetag block 擁有者）、
+`gif_or_jpg` / `_dispatch_download` / `_resolve_download_url` 下載主路徑、live settings。
+
+| 批次 | 新檔 | 搬什麼（現行行號區間） | 約省 | 風險 |
+|------|------|------------------------|------|------|
+| A1 | `step4_legacy_args.py` | `_cast_or_skip`、`_apply_legacy_positional/_scalar_kwargs/_list_kwargs/_special_like_rules/_constructor_args`（~772-850，全 static） | ~80 | low |
+| A2 | `step4_pacing.py`（mixin） | `_emit_countdown_start_log`、`_countdown_tick`、`_run_download_countdown`、`_sleep_between_downloads`、`_sleep_within_pid`、`_calc_sleep_delay`、`_format_size_human`（~850-977） | ~120 | low |
+| A3 | 併入既有 `step4_filters.py` | `_new_step4_filter_stats`、`_classify_url_for_filter`、`_bump_filter_reason`、`_prepare_download_tasks`、`_read_pictures_id_set`、`_requeue_no_meta_pids`（~1031-1145） | ~115 | low |
+| A4 | `step4_folder_list.py`（mixin） | `_parse_pid_from_pid_equals/_pid_prefix/_underscore`、`splitID`、`get_filelist`（~1239-1330 一帶） | ~90 | low |
+| A5 | `step4_db_sync.py`（mixin） | `_init_metadata_db`、`_emit_metadata_db_stats`、`_mirror_exist_pid_to_db`、`_sync_meta_to_db`、`_meta_to_db_kwargs`、`_upsert_meta_in_db`、`_persist_url_meta`、`_mark_completed_urls_in_db`、`_shadow_mark_failures`、`_maybe_flush_exist_pid`、`_maybe_flush_url_meta_periodically`、`_sync_exist_pid_to_db` | ~200 | med |
+| A6 🔶 | `step4_execution.py`（mixin） | `_emit_step4_header`、`_handle_zero_pending`、`_emit_single_mode_header`、`_current/_set/_clear_current_download_account`（threading.local）、`_download_pid_with_scheduler`、`_execute_downloads_single/_pool`、`_execute_downloads`、`_classify_one_fail_item`、`_classify_download_results`、`_compute_remaining_urls`、`_finalize_downloads`、`_emit_step4_summary_and_finalize` | ~250 | **high**（pool/scheduler 併發 + combined 借用 `_download_pid_group` 周邊） |
+| A7（視需要） | `step4_init.py`（mixin） | `_init_step4_paths_and_state`、`_load_initial_exist_pid_set`、`_warn_if_meta_empty_with_like_filter`、`_read_all_url_file_into_state`、`_enqueue_retriable_failures`、`_requeue_failed_page`、`_emit_step4_init_diag` | ~180 | med（`defer_step4_scan` 分支要逐字保留） |
+
+A1-A5 落地即 ~2018-600 ≈ 1400；不足 1000 再做 A6/A7。
+
+## B. `thread_url_fetch.py`（1506 → 目標 <1000）
+
+保留在原檔：`__init__`、`run()`、`_run_processing_loop` / `_fetch_one_pid_via_scheduler`、
+`get_download_url` / `_resolve_meta_for_pid` 查詢主路徑、finalize 群（combined 直接呼叫
+`_flush_url_meta_snapshot` 等，留在原檔最安全）。
+
+| 批次 | 新檔 | 搬什麼 | 約省 | 風險 |
+|------|------|--------|------|------|
+| B1 | `step3_cookie_labels.py`（mixin） | `_set_requires_cookie_meta`、`_cookie_label_from_alias_selection/_pid_selection/_pool_first/_default`、`_cookie_label_for_pid`、`_refresh_cookie_requirement`、`_stamp_gif_cookie_usage_in_meta`、`_emit_gif_cookie_usage_signal`、`_mark_gif_cookie_usage`（~269-440） | ~170 | low |
+| B2 | `step3_check_exist.py`（mixin） | `_check_exist_candidate_paths`、`_load_check_exist_block_set`、`_load_step2_skip_set`、`_scan_pictures_id_lines/_file`、`_emit_check_exist_summary/_failure`、`check_exist`（~462-600）。**注意 combined `_build_work_lists` 直接呼叫 `check_exist`，mixin 繼承下呼叫點不變** | ~140 | low |
+| B3 | `step3_cache_prefilter.py`（mixin） | 快取預過濾群 `_lookup_url_meta_entry`、`_meta_has_usable_url_and_pages`、`_is_pid_cached_meta`、`_expand_img_url_to_pages`、`_build_cached_urls_from_meta`、`_refresh_cookie_requirement_for_cached`、`_record_cached_filter_decision`、`_prefilter_one_pid_with_cache`、`_prefilter_step3_with_cache`（~604-760）+ rescrape 視窗群 `_step3_cache_is_usable`、`_coerce_rescrape_days`、`_parse_pixiv_upload_date`、`_is_within_rescrape_window`、`_step3_cache_is_fresh`（~1332-1427） | ~250 | med（combined cache-hit 路徑走這裡；有 `test_combined_cache_hit_no_network.py` 護網） |
+
+B1-B3 ≈ 1506-560 ≈ 950 ✅
+
+## C. 順手的低風險加分項（非必要）
+
+- `event_log.py`（703）：`_dispatch_table` + `replay` + `recover_tail`（~402-668）→ `event_log_replay.py`，
+  純函式 Move + re-export（`recover_tail` 有 flet_app / headless_runner 兩個 caller，shim 穿透即可）。整輪最容易的一塊。
+
+## 執行順序建議
+
+A1 → A2 → A3 → A4 → B1 → B2 → B3 → A5 → C →（若 A 仍 >1000）A7 → A6 🔶（最後、單獨、實機驗證）。
+每批之後:`python -m pytest -q -m "not integration"` 全綠 + `ruff check app/`；A6 後加實機 combined 一輪。
+
+## 執行進度（2026-07-04 session）
+
+基線:全測 `1074 passed, 1 failed`（唯一 fail 是既有未 commit 的 WIP
+`tests/test_combined_live_apply.py::...refreshes_fetcher_and_downloader_before_work`,
+成因是 `thread_combined._send_rate_lock` 尚未接線,**與本次拆分無關**,每批後維持同一
+基線未惡化）。每批 = verbatim mixin move + 全測綠 + ruff 無新增錯。**尚未 commit**
+(依鐵則 7:thread_download 的高風險塊 A6 需先實機 combined 驗證才 commit)。
+
+| 批次 | 新檔 | 結果 |
+|------|------|------|
+| A1 | `step4_legacy_args.py`（`_Step4LegacyArgsMixin`） | ✅ 2018→1937 |
+| A2 | `step4_pacing.py`（`_Step4PacingMixin`） | ✅ 1937→1851 |
+| A3 | 併入 `step4_filters.py` | ✅ 1851→1739（發現 6 個方法早已在 mixin 內重複定義、被具體類別 shadow,逐字 diff 確認 byte-identical 後刪 shadow;純去重） |
+| A4 | `step4_folder_list.py`（`_Step4FolderListMixin`） | ✅ 1739→1678 |
+| B1 | `step3_cookie_labels.py`（`_Step3CookieLabelsMixin`） | ✅ 1382→1246（tuf 起點 1506,B 之前無異動;此列起點是 A 完成後重測的 tuf 行數） |
+| B2 | `step3_check_exist.py`（`_Step3CheckExistMixin`） | ✅ 1382→1246 |
+| B3 | `step3_cache_prefilter.py`（`_Step3CachePrefilterMixin`,cache prefilter + rescrape window 兩段） | ✅ →1037 |
+| B4（計畫外補刀,為壓到 <1000） | `step3_init_state.py`（`_Step3InitStateMixin` + `_safe_meta_count` 搬出並 re-import 回 tuf） | ✅ 1037→**974** ✅ |
+| A5 | `step4_db_sync.py`（`_Step4DbSyncMixin`,12 個 DB-sync 方法,繞過中間的 `_finalize_downloads`） | ✅ 1678→**1539** |
+
+**檔案現況**:
+- `thread_url_fetch.py` **974**（<1000 ✅ 達標,B 批完成）
+- `thread_download.py` **1539**（仍 >1000;A6/A7 未做）
+
+**A6/A7 為何停手**:即使把 A6(~250)+A7(~180) 全做完,thread_download 估 ~1109,仍
+可能 >1000——真正壓到 <1000 必須動到下載執行路徑(`_execute_downloads*` / `_download_pid_group`
+周邊),那正是 A6 的高風險併發碼,combined 借用其 timetag block。依鐵則 5 + 使用者記憶
+`feedback_verify_on_real_app`,**A6 前必須先請使用者重啟 Flet 跑一輪 combined 驗 A1-A5 無回歸**
+(綠測不算數)。實機 OK 後再單獨做 A7 → A6。
+
+C（event_log_replay）**跳過**:event_log.py 703 行在觀察名單、非必拆,且不服務兩個必拆檔的
+<1000 目標(ponytail YAGNI)。

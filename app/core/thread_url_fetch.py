@@ -1,9 +1,7 @@
 import contextlib
 import os
 import datetime
-import re
 import random as pyrandom
-import threading
 import requests
 from queue import Queue
 from pixiv_api import *
@@ -12,14 +10,12 @@ from app import i18n
 import pixiv_api
 from app.core.pixiv_thread_utils import (
     append_diagnostic_event,
-    cookie_usage_label,
     count_text_lines,
     init_cookie_fields,
     normalize_pid,
     normalize_pid_set,
     output_err,
     read_pid_lines,
-    safe_read_json,
     to_int_lenient,
 )
 from app.core.pixiv_thread_base import (
@@ -29,16 +25,15 @@ from app.core.pixiv_thread_base import (
 from app.core.step3_filters import _Step3FiltersMixin
 from app.core.step3_meta_migration import _Step3MigrationMixin
 from app.core.step3_persistence import _Step3PersistenceMixin
-
-def _safe_meta_count(db) -> int:
-    try:
-        return int(db.meta_count())
-    except Exception:
-        return 0
-
+from app.core.step3_cookie_labels import _Step3CookieLabelsMixin
+from app.core.step3_check_exist import _Step3CheckExistMixin
+from app.core.step3_cache_prefilter import _Step3CachePrefilterMixin
+from app.core.step3_init_state import _Step3InitStateMixin, _safe_meta_count
 
 class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
-                         _Step3MigrationMixin, _Step3PersistenceMixin):
+                         _Step3MigrationMixin, _Step3PersistenceMixin,
+                         _Step3CookieLabelsMixin, _Step3CheckExistMixin,
+                         _Step3CachePrefilterMixin, _Step3InitStateMixin):
     pid_max=0
     pid_now=0
     path=os.getenv('APPDATA')+r'/pixiv_download/'
@@ -193,66 +188,10 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         except Exception:
             self._pid_filter_decision = {}
 
-    def _init_step3_state(self):
-        """Initialize per-run mutable Step 3 state (queues, counters, paths)."""
-        self.tag_queue = Queue()
-        self.like_queue = Queue()
-        self._step3_filter_skip_counts = {"ban_tag": 0, "must_tag": 0, "like": 0}
-        self._step3_filter_skip_notice_emitted = False
-        self._step3_filter_skip_every = 200
-        self._step3_query_counts = {"network": 0, "cache": 0, "skip": 0}
-        self._step3_cookie_req_counts = {"need": 0, "free": 0, "unknown": 0}
-        self._step3_wait_applied_count = 0
-        self._step3_query_notice_every = 200
-        self.url_meta = {}
-        # PIDs whose url_meta row has already been mirrored to the SQLite cache
-        # this run. Mirrors the _flushed_urls delta guard in _write_all_url_snapshot:
-        # periodic/per-GIF flushes import only the un-flushed delta instead of the
-        # whole (only-growing) dict, collapsing the O(N^2) re-import into O(N).
-        # import_meta_dict is ON CONFLICT DO UPDATE / COALESCE, so the terminal
-        # full-dict backstops re-write nothing new and the end state is identical.
-        self._flushed_meta_pids = set()
-        self.url_meta_path = os.path.join(self.path, "all_url_meta.json")
-        self._pid_cache_hit = {}
-        self._log_step3_cache_detail = False
-        self._cookie_requirement_map = {}
-        self.revoked_pid_path = os.path.join(self.path, "revoked_pid.txt")
-        self._revoked_pid_set = set()
-        self._revoked_pid_new = set()
-        self._cookie_usage_counts = {"step3": {}, "step4": {}}
-        self._cookie_usage_seen = {"step3": set(), "step4": set()}
-        self._pending_pid_file_path = os.path.join(self.path, "pictures_id.txt")
-        self._pending_pid_lock = threading.Lock()
-        self._pending_pid_remaining = set()
-        # Per-PID filter-decision cache; cleared by _apply_live_settings_if_changed
-        # on a live settings change. Initialized here so the first mid-run change
-        # does not hit an AttributeError (only the download thread defines it too).
-        self._pid_filter_decision = {}
-
-    def _load_cookie_requirement_cache(self):
-        """Populate self._cookie_requirement_map from the saved trace JSON."""
-        try:
-            req_path = os.path.join(self.path, 'pixiv_cookie_requirement.json')
-            req_data = safe_read_json(req_path, {})
-            if isinstance(req_data, dict):
-                for pid, entry in req_data.items():
-                    if isinstance(entry, dict):
-                        self._cookie_requirement_map[str(pid)] = entry.get('requires_cookie')
-        except Exception:
-            self._cookie_requirement_map = {}
-
-    def _emit_step3_init_diag(self):
-        """Append a step3_init diagnostic record with the per-filter counts."""
-        self._diag(
-            "step3_init",
-            exist_pid_count=len(self.exist_pid),
-            url_meta_count=_safe_meta_count(getattr(self, "_metadata_db", None)),
-            like_min=int(self.like_num or 0),
-            special_like_rule_count=len(self.special_like_rules),
-            ban_tag_count=len(self._ban_tag_norm),
-            must_tag_count=len(self._must_tag_norm),
-            single_mode=bool(self.single_mode_flag),
-        )
+    # Per-run state init (_init_step3_state, _load_cookie_requirement_cache,
+    # _emit_step3_init_diag) and the _safe_meta_count helper moved to
+    # step3_init_state._Step3InitStateMixin (file-size refactor). Inherited
+    # unchanged; _safe_meta_count re-imported above for its other call site.
 
     def _diag(self, event, **fields):
         try:
@@ -265,19 +204,6 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
 
     def _to_int(self, value, default=None):
         return to_int_lenient(value, default)
-
-    def _set_requires_cookie_meta(self, pid, need_cookie):
-        pid_key = normalize_pid(pid) or str(pid)
-        try:
-            meta = dict(self._get_meta(pid_key))
-            meta["requires_cookie"] = need_cookie
-            pixiv_info = meta.get("pixiv_info")
-            if isinstance(pixiv_info, dict):
-                pixiv_info["requires_cookie"] = need_cookie
-                meta["pixiv_info"] = pixiv_info
-            self.url_meta[pid_key] = meta
-        except Exception:
-            pass
 
     def _calc_no_cookie_delay(self):
         """Random delay for a PID that doesn't require a cookie."""
@@ -321,124 +247,11 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         )
         self._sleep_with_countdown(delay)
 
-    def _cookie_label_from_alias_selection(self, pid_key):
-        """Try the per-PID alias map first (set by _select_cookie_for_pid)."""
-        try:
-            alias = str(self._pid_cookie_alias_selection.get(pid_key, "") or "").strip()
-            return alias or None
-        except Exception:
-            return None
-
-    def _cookie_label_from_pid_selection(self, pid_key):
-        """Resolve the label for the cookie remembered for this PID."""
-        try:
-            selected = str(self._pid_cookie_selection.get(pid_key, "") or "").strip()
-            if not selected:
-                return None
-            resolved = cookie_usage_label(selected, self.cookie_pool, self._cookie_alias_map)
-            return resolved or None
-        except Exception:
-            return None
-
-    def _cookie_label_from_pool_first(self):
-        """Fallback: label of the pool's first cookie."""
-        try:
-            if not self.cookie_pool:
-                return None
-            resolved = cookie_usage_label(
-                self.cookie_pool[0], self.cookie_pool, self._cookie_alias_map,
-            )
-            return resolved or None
-        except Exception:
-            return None
-
-    def _cookie_label_default(self, need_cookie):
-        """Final fallback when no cookie source is available."""
-        single_cookie = str(getattr(self, "cookies", "") or "").strip()
-        if need_cookie is False and not single_cookie:
-            return "免Cookie"
-        if single_cookie:
-            return "單一Cookie"
-        return "未提供Cookie"
-
-    def _cookie_label_for_pid(self, pid, need_cookie=None):
-        pid_key = normalize_pid(pid) or str(pid)
-        for resolver in (
-            lambda: self._cookie_label_from_alias_selection(pid_key),
-            lambda: self._cookie_label_from_pid_selection(pid_key),
-            lambda: self._cookie_label_from_pool_first(),
-        ):
-            label = resolver()
-            if label:
-                return label
-        return self._cookie_label_default(need_cookie)
-
-
-    def _refresh_cookie_requirement(self, pid, fallback=None):
-        pid_key = normalize_pid(pid)
-        if not pid_key:
-            return fallback
-        try:
-            if isinstance(getattr(self, '_cookie_requirement_map', None), dict) and pid_key in self._cookie_requirement_map:
-                return self._cookie_requirement_map.get(pid_key)
-        except Exception:
-            pass
-
-        latest = fallback
-        if latest is None:
-            try:
-                latest = pixiv_api.get_pixiv_cookie_requirement(pid_key)
-            except Exception:
-                latest = fallback
-        try:
-            if not isinstance(getattr(self, '_cookie_requirement_map', None), dict):
-                self._cookie_requirement_map = {}
-            self._cookie_requirement_map[pid_key] = latest
-        except Exception:
-            pass
-        return latest
-
-    def _stamp_gif_cookie_usage_in_meta(self, pid_key, source):
-        """Mark requires_cookie + cookie_used fields on the in-memory url_meta entry."""
-        try:
-            self._set_requires_cookie_meta(pid_key, True)
-            meta = dict(self._get_meta(pid_key))
-            meta["cookie_used"] = True
-            meta["cookie_used_source"] = str(source)
-            meta["cookie_used_updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.url_meta[pid_key] = meta
-        except Exception:
-            pass
-
-    def _emit_gif_cookie_usage_signal(self, pid_key, source):
-        """Best-effort emit via the legacy ._output signal (Qt5 compat)."""
-        signal_obj = self.__dict__.get("_output", None)
-        if signal_obj is None:
-            try:
-                signal_obj = getattr(self, "_output", None)
-            except Exception:
-                signal_obj = None
-        try:
-            if signal_obj is not None and hasattr(signal_obj, "emit"):
-                signal_obj.emit(
-                    f"<p><font color='blue'>[GIF][Cookie] PID {pid_key} "
-                    f"使用 cookies（來源：{source}），已更新 all_url_meta 暫存</font></p>"
-                )
-        except Exception:
-            pass
-
-    def _mark_gif_cookie_usage(self, pid, used, source="unknown"):
-        pid_key = normalize_pid(pid) or str(pid)
-        used_flag = bool(used)
-        try:
-            self._pid_cookie_used[pid_key] = used_flag
-        except Exception:
-            pass
-        if not used_flag:
-            return
-        self._stamp_gif_cookie_usage_in_meta(pid_key, source)
-        self._persist_url_meta_with_fallback(pid_key=pid_key)
-        self._emit_gif_cookie_usage_signal(pid_key, source)
+    # Cookie-label resolution, requires_cookie refresh, and GIF cookie-usage
+    # stamping (_set_requires_cookie_meta, _cookie_label_*, _cookie_label_for_pid,
+    # _refresh_cookie_requirement, _stamp/_emit/_mark_gif_cookie_usage) moved to
+    # step3_cookie_labels._Step3CookieLabelsMixin (file-size refactor). Inherited
+    # unchanged.
 
     def _on_pause_hook(self):
         self._flush_url_meta_snapshot()
@@ -459,273 +272,18 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
             except Exception:
                 pass
 
-    def _check_exist_candidate_paths(self):
-        """Return the list of pictures_id.txt paths to try, in priority order."""
-        candidates = [os.path.join(self.path, "pictures_id.txt")]
-        try:
-            appdata_path = os.path.join(os.getenv('APPDATA') + r'/pixiv_download/', 'pictures_id.txt')
-            if appdata_path not in candidates:
-                candidates.append(appdata_path)
-        except Exception:
-            pass
-        return candidates
+    # pictures_id loading + skip-file prefilter (_check_exist_candidate_paths,
+    # _load_check_exist_block_set, _load_step2_skip_set, _scan_pictures_id_lines,
+    # _scan_pictures_id_file, _emit_check_exist_summary/_failure, check_exist)
+    # moved to step3_check_exist._Step3CheckExistMixin (file-size refactor).
+    # Inherited unchanged.
 
-    def _load_check_exist_block_set(self):
-        """Build the PID set that should be excluded from Step 3 (no_to_check)."""
-        try:
-            if isinstance(self.no_to_check, list):
-                return normalize_pid_set(self.no_to_check)
-        except Exception:
-            pass
-        return set()
-
-    def _load_step2_skip_set(self):
-        """Load PIDs that Step 2 already filed as 'skip' (so we won't re-fetch)."""
-        skip_file = os.path.join(self.path, "step2_skip_pid.txt")
-        try:
-            if os.path.isfile(skip_file):
-                with open(skip_file, encoding="utf-8", errors="ignore") as f:
-                    return normalize_pid_set(
-                        [line.rstrip() for line in f if str(line).strip()]
-                    )
-        except Exception:
-            pass
-        return set()
-
-    def _scan_pictures_id_lines(self, file_iter, block_set, step2_skip_set):
-        """Walk an iterator of pictures_id lines and partition them.
-
-        Returns ``(pids, raw_count, excluded_by_block, excluded_by_step2_skip)``.
-        Pulled out so the caller can try strict-UTF-8 first, then fall back to
-        a lenient re-read on UnicodeDecodeError without duplicating the logic.
-        """
-        pictures_id = []
-        excluded_by_skip_file = 0
-        excluded_by_step2_skip = 0
-        raw_count = 0
-        for line in file_iter:
-            text = str(line).strip()
-            if not text:
-                continue
-            raw_count += 1
-            pid_key = normalize_pid(text)
-            if pid_key and pid_key in block_set:
-                excluded_by_skip_file += 1
-                if pid_key in step2_skip_set:
-                    excluded_by_step2_skip += 1
-                continue
-            pictures_id.append(text)
-        return pictures_id, raw_count, excluded_by_skip_file, excluded_by_step2_skip
-
-    def _scan_pictures_id_file(self, pic_path, block_set, step2_skip_set):
-        """Stream-parse pictures_id.txt with UTF-8 strict, then lenient fallback."""
-        try:
-            with open(pic_path, encoding='utf-8') as f:
-                return self._scan_pictures_id_lines(f, block_set, step2_skip_set)
-        except UnicodeDecodeError:
-            with open(pic_path, encoding='utf-8', errors='ignore') as f:
-                return self._scan_pictures_id_lines(f, block_set, step2_skip_set)
-
-    def _emit_check_exist_summary(self, pic_path, pictures_id, raw, blocked, step2_blocked):
-        """Surface the parse summary to the user and append to the diagnostic log."""
-        try:
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>pictures_id 來源: {pic_path}</font></p>"))
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[TaskFilter][Step3-Pre] pictures_id原始={raw}, "
-                f"skip_file排除={blocked}, 待去重={len(pictures_id)}</font></p>"
-            ))
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='gray'>[TaskFilter][Step3-Pre] 這次從 step2_skip_pid.txt "
-                f"排除 {step2_blocked} 筆（步驟2提前跳過，所以之前沒有存下來）</font></p>"
-            ))
-        except Exception:
-            pass
-        self._diag(
-            "step3_skip_file_prefilter",
-            source_path=str(pic_path),
-            raw_count=int(raw),
-            skipped_no_to_check=int(blocked),
-            skipped_step2_skip_file=int(step2_blocked),
-            post_skip_file_count=int(len(pictures_id)),
-        )
-
-    def _emit_check_exist_failure(self, candidates, last_err):
-        """Notify the user and shut down Step 3 when no candidate file was readable."""
-        detail = "" if last_err is None else f" ({last_err})"
-        try:
-            self._q.put(WorkerEvent("output",
-                "<p><font color='red'>找不到 pictures_id.txt: {}</font></p>".format(
-                    ' | '.join(candidates))))
-            self._q.put(WorkerEvent("output",
-                f"<p><font color='red'>讀取失敗: {detail}</font></p>"))
-        except Exception:
-            pass
-        self._q.put(WorkerEvent("finished", i18n.t("log.url.stopped")))
-        self._q.put(WorkerEvent("next", -1))
-
-    def check_exist(self):
-        block_set = self._load_check_exist_block_set()
-        step2_skip_set = self._load_step2_skip_set()
-        # DB-first: prefer pending_pids table when it has rows
-        db = getattr(self, "_metadata_db", None)
-        if db is not None:
-            try:
-                db_pids = db.get_pending_pids()
-                if db_pids:
-                    pictures_id, raw, blocked, step2_blocked = self._scan_pictures_id_lines(
-                        db_pids, block_set, step2_skip_set
-                    )
-                    self._emit_check_exist_summary(
-                        "DB:pending_pids", pictures_id, raw, blocked, step2_blocked
-                    )
-                    return pictures_id
-            except Exception:
-                pass
-        # Fallback: file
-        file_candidates = self._check_exist_candidate_paths()
-        last_err = None
-        for pic_path in file_candidates:
-            if not os.path.isfile(pic_path):
-                continue
-            try:
-                pictures_id, raw, blocked, step2_blocked = self._scan_pictures_id_file(
-                    pic_path, block_set, step2_skip_set
-                )
-                self._emit_check_exist_summary(
-                    pic_path, pictures_id, raw, blocked, step2_blocked
-                )
-                return pictures_id
-            except Exception as err:
-                last_err = err
-        self._emit_check_exist_failure(file_candidates, last_err)
-        return 0
-
-    def _lookup_url_meta_entry(self, pid_key):
-        """Read self.url_meta[pid_key] safely; returns ``None`` for any failure."""
-        try:
-            meta = self._get_meta(pid_key)
-        except Exception:
-            return None
-        if not meta:
-            return None
-        return meta
-
-    def _meta_has_usable_url_and_pages(self, meta):
-        img_url = str(meta.get("img_url", "") or "").strip()
-        if not img_url or img_url == "None":
-            return False
-        pagecount = self._to_int(meta.get("pagecount", 0), 0) or 0
-        return pagecount > 0
-
-    def _is_pid_cached_meta(self, pid):
-        pid_key = normalize_pid(pid) or str(pid)
-        meta = self._lookup_url_meta_entry(pid_key)
-        if meta is None:
-            return False, {}
-        if not self._meta_has_usable_url_and_pages(meta):
-            return False, meta
-        return True, meta
-
-    @staticmethod
-    def _expand_img_url_to_pages(img_url, page_total):
-        """Expand a meta img_url ('..._p.jpg', '..._p0.jpg', '..._ugoira0.zip') into
-        N per-page URLs. Returns [] when the URL has no extension separator."""
-        if not img_url or "." not in img_url:
-            return []
-        if page_total < 1:
-            page_total = 1
-        left, right = img_url.rsplit(".", 1)
-        # Normalise trailing "_pN" / "_ugoiraN" → "_p" / "_ugoira" so we can append idx.
-        left_norm = re.sub(r"_(p|ugoira)\d+$", r"_\1", left, flags=re.IGNORECASE)
-        if re.search(r"_(p|ugoira)$", left_norm, flags=re.IGNORECASE):
-            return [left_norm + str(idx) + "." + right for idx in range(page_total)]
-        # Fallback to legacy behavior (suffix on raw stem).
-        return [left + str(idx) + "." + right for idx in range(page_total)]
-
-    def _build_cached_urls_from_meta(self, pid, meta):
-        pid_key = normalize_pid(pid) or str(pid)
-        try:
-            img_url = str((meta or {}).get("img_url", "") or "").strip()
-            page_total = self._to_int((meta or {}).get("pagecount", 1), 1) or 1
-            return self._expand_img_url_to_pages(img_url, page_total)
-        except Exception:
-            try:
-                self._diag("step3_cached_url_build_failed", pid=str(pid_key))
-            except Exception:
-                pass
-            return []
-
-    def _refresh_cookie_requirement_for_cached(self, pid_key, meta):
-        """Re-check requires_cookie for a cache-hit PID and stamp it on url_meta."""
-        try:
-            need_cookie = self._refresh_cookie_requirement(
-                pid_key,
-                fallback=(meta.get("requires_cookie") if isinstance(meta, dict) else None),
-            )
-        except Exception:
-            need_cookie = None
-        try:
-            if isinstance(self.url_meta.get(pid_key), dict):
-                self._set_requires_cookie_meta(pid_key, need_cookie)
-        except Exception:
-            pass
-        return need_cookie
-
-    def _record_cached_filter_decision(self, pid_key, passed, reason):
-        """Stamp the artwork-filter outcome on the meta entry."""
-        try:
-            if isinstance(self.url_meta.get(pid_key), dict):
-                self.url_meta[pid_key]["filter_pass"] = bool(passed)
-                self.url_meta[pid_key]["filter_reason"] = str(reason)
-        except Exception:
-            pass
-
-    def _prefilter_one_pid_with_cache(self, pid_key, stats):
-        """Try to satisfy one PID from cache. Returns ``(cached_urls, needs_network)``."""
-        has_cache, meta = self._is_pid_cached_meta(pid_key)
-        if not has_cache:
-            self._pid_cache_hit[pid_key] = False
-            return [], True
-
-        self._pid_cache_hit[pid_key] = True
-        self._refresh_cookie_requirement_for_cached(pid_key, meta)
-
-        tag = meta.get("tag", []) if isinstance(meta, dict) else []
-        like = meta.get("like", 0) if isinstance(meta, dict) else 0
-        passed, reason = self._passes_artwork_filters(pid_key, tag, like)
-        self._record_cached_filter_decision(pid_key, passed, reason)
-        if not passed:
-            stats["cached_filtered"] += 1
-            return [], False
-
-        one_pid_urls = self._build_cached_urls_from_meta(pid_key, meta)
-        if not one_pid_urls:
-            self._pid_cache_hit[pid_key] = False
-            stats["cached_fallback_network"] += 1
-            return [], True
-
-        stats["cached_hit_pid"] += 1
-        stats["cached_generated_url"] += len(one_pid_urls)
-        return one_pid_urls, False
-
-    def _prefilter_step3_with_cache(self, pending_pids):
-        network_pids = []
-        cached_urls = []
-        stats = {
-            "cached_hit_pid": 0,
-            "cached_generated_url": 0,
-            "cached_filtered": 0,
-            "cached_fallback_network": 0,
-        }
-        for raw_pid in pending_pids:
-            pid_key = normalize_pid(raw_pid) or str(raw_pid)
-            urls, needs_network = self._prefilter_one_pid_with_cache(pid_key, stats)
-            if urls:
-                cached_urls.extend(urls)
-            if needs_network:
-                network_pids.append(pid_key)
-        return network_pids, cached_urls, stats
+    # Cache prefilter (_lookup_url_meta_entry, _meta_has_usable_url_and_pages,
+    # _is_pid_cached_meta, _expand_img_url_to_pages, _build_cached_urls_from_meta,
+    # _refresh_cookie_requirement_for_cached, _record_cached_filter_decision,
+    # _prefilter_one_pid_with_cache, _prefilter_step3_with_cache) moved to
+    # step3_cache_prefilter._Step3CachePrefilterMixin (file-size refactor).
+    # Inherited unchanged.
 
     def _prepare_pending_pid_tasks(self, raw_pictures_id):
         pending = []
@@ -1328,102 +886,10 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         return (tag, like, pagecount, img_url, need_cookie,
                 upload_date, create_date, user_id, user_name)
 
-    @staticmethod
-    def _step3_cache_is_usable(cached):
-        """A cache entry counts as usable when img_url is non-empty AND pagecount > 0."""
-        if not isinstance(cached, dict):
-            return False
-        if cached.get('img_url') in (None, 'None', ''):
-            return False
-        try:
-            return int(cached.get('pagecount', 0) or 0) > 0
-        except (TypeError, ValueError):
-            return False
-
-    @staticmethod
-    def _coerce_rescrape_days(raw):
-        """Coerce settings.json's ``rescrape_within_days`` into a non-negative int.
-
-        Negative / non-numeric / None all collapse to 0 (feature disabled).
-        """
-        try:
-            n = int(raw)
-        except (TypeError, ValueError):
-            return 0
-        return n if n > 0 else 0
-
-    @staticmethod
-    def _parse_pixiv_upload_date(value):
-        """Parse Pixiv's ISO-8601 uploadDate string into a tz-aware datetime.
-
-        Returns None for non-string / empty / unparseable input. Pixiv emits
-        e.g. ``'2024-01-15T12:30:00+09:00'``. ``fromisoformat`` accepts that
-        on Python >= 3.7, but rejects some valid ISO-8601 variants on Python
-        3.10 (e.g. ``Z`` suffix, ``+0900`` without colon). The strptime
-        fallback covers those cases without depending on a 3.11+ runtime.
-        Naive inputs are treated as UTC defensively.
-        """
-        if not isinstance(value, str) or not value.strip():
-            return None
-        s = value.strip()
-        try:
-            dt = datetime.datetime.fromisoformat(s)
-        except ValueError:
-            dt = None
-        if dt is None:
-            # Normalize trailing 'Z' (Zulu / UTC) and tolerate offsets without
-            # the colon, then retry via strptime.
-            normalized = s
-            if normalized.endswith('Z'):
-                normalized = normalized[:-1] + '+0000'
-            for fmt in (
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%S.%f%z",
-                "%Y-%m-%dT%H:%M:%S",
-            ):
-                try:
-                    dt = datetime.datetime.strptime(normalized, fmt)
-                    break
-                except ValueError:
-                    continue
-            if dt is None:
-                return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return dt
-
-    def _is_within_rescrape_window(self, cached):
-        """True iff the cached entry was uploaded within ``self._rescrape_within_days`` days.
-
-        Returns False (no rescrape) when:
-          - the feature is disabled (threshold <= 0)
-          - ``cached`` is not a dict
-          - ``upload_date`` is missing or unparseable
-          - the artwork is older than the threshold
-          - the parsed upload_date is in the future (clock skew safeguard)
-        """
-        threshold = getattr(self, '_rescrape_within_days', 0)
-        if threshold <= 0:
-            return False
-        if not isinstance(cached, dict):
-            return False
-        dt = self._parse_pixiv_upload_date(cached.get('upload_date'))
-        if dt is None:
-            return False
-        now = datetime.datetime.now(datetime.timezone.utc)
-        diff_days = (now - dt).total_seconds() / 86400.0
-        return 0.0 <= diff_days < float(threshold)
-
-    def _step3_cache_is_fresh(self, cached):
-        """Cache short-circuits the network fetch only when both conditions hold:
-           - the entry is well-formed (``_step3_cache_is_usable``); and
-           - the artwork is NOT within the rescrape window.
-        """
-        if not self._step3_cache_is_usable(cached):
-            return False
-        if self._is_within_rescrape_window(cached):
-            return False
-        return True
+    # Rescrape-window freshness (_step3_cache_is_usable, _coerce_rescrape_days,
+    # _parse_pixiv_upload_date, _is_within_rescrape_window, _step3_cache_is_fresh)
+    # moved to step3_cache_prefilter._Step3CachePrefilterMixin (file-size
+    # refactor). Inherited unchanged.
 
     def _step3_finish_pid(self, ret_value, query_source, need_cookie, should_wait, pid_key):
         """Apply the trailing wait + progress advance, then format the return tuple."""

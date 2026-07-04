@@ -337,3 +337,40 @@ Review:
 - [x] settings_view：滑桿 min 0 / inactive 軌道顏色可見 / 提示文字改新公式 / 欄位語意改單帳號
 - [x] 測試同步更新（test_account_scheduler.py）+ 全綠
 - [x] CLAUDE.md 冷卻段落更新；pid_cooldown_avg 設 45
+
+## [2026-07-04] 大檔拆分盤點（>1000 行必拆，600-999 觀察）
+
+實測行數重新盤點（承接 tasks/refactor-split-oversized-files.md 的手法：mixin 拆 + Move/re-export shim，一次一個 transformation、全測綠才續、實機驗證後才算完）。
+
+### 必拆（>1000 行）— 2026-07-04 執行進度
+- [ ] `app/core/thread_download.py`（2018 → **1539**，仍 >1000）— A1-A5 已抽，A6/A7 待實機驗證：
+  - [x] A1 legacy 建構參數 → `step4_legacy_args.py`（`_Step4LegacyArgsMixin`）2018→1937
+  - [x] A2 倒數/睡眠節流 → `step4_pacing.py`（`_Step4PacingMixin`）1937→1851
+  - [x] A3 任務準備/過濾統計 → 併入 `step4_filters.py`（是純去重：6 方法早已在 mixin 內重複、被 shadow，byte-identical 確認後刪 shadow）1851→1739
+  - [x] A4 檔名解析/get_filelist → `step4_folder_list.py`（`_Step4FolderListMixin`）1739→1678
+  - [x] A5 DB-sync 群 → `step4_db_sync.py`（`_Step4DbSyncMixin`）1678→1539
+  - [ ] 🔶 A6 執行區（pool/scheduler + combined 借用）→ `step4_execution.py`（**high，最後、需實機 combined 驗證後才做**）
+  - [ ] A7 init 群 → `step4_init.py`（med，`defer_step4_scan` 分支要逐字保留）
+- [x] `app/core/thread_url_fetch.py`（1506 → **974** ✅ <1000）— B1-B4 完成：
+  - [x] B1 cookie 標籤/用量 → `step3_cookie_labels.py`（`_Step3CookieLabelsMixin`）
+  - [x] B2 check_exist 掃描群 → `step3_check_exist.py`（`_Step3CheckExistMixin`）
+  - [x] B3 快取預過濾 + rescrape 視窗 → `step3_cache_prefilter.py`（`_Step3CachePrefilterMixin`）
+  - [x] B4（計畫外補刀）per-run 狀態 init → `step3_init_state.py`（`_Step3InitStateMixin`），壓到 974
+
+> 每批 verbatim mixin move + 全測綠（維持 `1074 passed, 1 failed` 基線，唯一 fail 是既有
+> combined WIP `_send_rate_lock` 未接線，與拆分無關）+ ruff 無新增錯。**尚未 commit**（鐵則 7：
+> A6 需先實機 combined 驗 A1-A5 無回歸才 commit）。
+
+### 觀察名單（600-999 行，暫不動；再長就拆）
+- `app/gui/flet_app.py`（925）— handle_* 閉包依賴 main(page) 區域狀態，CLAUDE.md 已明訂閉包不搬；只能抽無狀態 helper 到 bootstrap_helpers.py
+- `app/core/thread_combined.py`（719）— 剛做完 lane/parallel，穩定前不動
+- `app/core/event_log.py`（703）— `_dispatch_table`+`replay`/`recover_tail`（~402-668）可搬 `event_log_replay.py`（純函式，Move+re-export，最容易的一塊）
+- `app/gui/views/settings_view.py`（692）— __init__ 建 UI 300 行；已有 settings_handlers mixin，可再抽分區建構
+- `app/gui/run_actions.py`（670）— `_build_step*`/`_build_combined` 群可抽 `run_builders.py` mixin
+- `app/core/step4_media.py`（620）— 本身就是拆出來的 mixin，ugoira 與 jpg 兩塊若再長可對半
+- `app/gui/views/main_view.py`（605）— 已有 main_progress/main_mode_row mixin，暫可
+
+### 鐵則（沿用舊計畫）
+1. `python -m pytest -q -m "not integration"` 全綠才進下一步
+2. 純函式用 Move+re-export shim；共享 self 狀態的方法群用 mixin（零 caller 改動）
+3. 不平行盲拆；GUI/threading/DB 塊拆完要實機重啟 Flet 驗 combined 無回歸

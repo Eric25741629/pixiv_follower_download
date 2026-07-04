@@ -174,6 +174,105 @@ def test_download_pid_group_uses_account_proxy_session(monkeypatch):
     assert isinstance(failed, list)
 
 
+def test_download_pid_group_waits_between_existing_pages():
+    """同 PID 頁間等待 must apply even when a page is already on disk.
+
+    Regression: _download_pid_group only slept after ret == 0, so a multi-page
+    PID whose pages returned -1 (already exists / skipped) advanced instantly.
+    """
+    import datetime
+    import threading
+    from queue import Queue
+
+    t = download_thread.__new__(download_thread)
+    t._stop_event = threading.Event()
+    t._pause_event = threading.Event()
+    t._pause_event.set()
+    t._q = Queue()
+    t.q = Queue()
+    t._current_account_local = threading.local()
+    t.exist_pid = set()
+    t.pid_max = 0
+    t.pid_now = 0
+    t._stop_after_group = False
+    t._scheduler = None
+    t.download_time = datetime.datetime(1970, 1, 1)
+    t._timetag_block_local = threading.local()
+    t._apply_live_settings_if_changed = lambda: None
+    calls = []
+    t._sleep_within_pid = lambda pid: calls.append(pid)
+    t.gif_or_jpg = lambda u, session=None: -1
+
+    failed = t._download_pid_group(
+        "777",
+        [
+            "https://i.pximg.net/img-original/img/1/777_p0.png",
+            "https://i.pximg.net/img-original/img/1/777_p1.png",
+        ],
+    )
+
+    assert failed == []
+    assert calls == ["777"]
+
+
+def test_same_pid_countdown_runs_in_pool_mode_for_intra_pid_wait(monkeypatch):
+    """Pool mode runs separate PIDs concurrently, but pages inside one PID stay serial."""
+    import threading
+    from queue import Queue
+
+    t = download_thread.__new__(download_thread)
+    t.single_mode_flag = False
+    t._stop_event = threading.Event()
+    t._pause_event = threading.Event()
+    t._pause_event.set()
+    t._stop_after_group = False
+    t._q = Queue()
+    t._is_cookie_used_for_pid = lambda pid: False
+    t._calc_sleep_delay = lambda lo, hi, pid=None: 3
+    ticks = []
+    t._countdown_tick = lambda remaining, respect_group_stop: ticks.append(remaining) or False
+
+    t._run_download_countdown(
+        "777",
+        3,
+        5,
+        label="同PID",
+        color="gray",
+        respect_group_stop=False,
+    )
+
+    assert ticks == [3, 2, 1]
+
+
+def test_pid_between_countdown_runs_in_pool_mode_when_called():
+    """Multi-worker mode must not globally disable PID-between cooldown."""
+    import threading
+    from queue import Queue
+
+    t = download_thread.__new__(download_thread)
+    t.single_mode_flag = False
+    t._stop_event = threading.Event()
+    t._pause_event = threading.Event()
+    t._pause_event.set()
+    t._stop_after_group = False
+    t._q = Queue()
+    t._is_cookie_used_for_pid = lambda pid: False
+    t._calc_sleep_delay = lambda lo, hi, pid=None: 2
+    ticks = []
+    t._countdown_tick = lambda remaining, respect_group_stop: ticks.append(remaining) or False
+
+    t._run_download_countdown(
+        "777",
+        2,
+        2,
+        label="PID間",
+        color="green",
+        respect_group_stop=True,
+    )
+
+    assert ticks == [2, 1]
+
+
 def test_gif_download_propagates_proxy_error(monkeypatch):
     """ProxyError from the inner http.get must propagate so scheduler can disable."""
     import pytest
