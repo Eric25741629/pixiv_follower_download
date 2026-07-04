@@ -24,6 +24,7 @@ from app.core.pixiv_thread_base import (
     _resolve_like_threshold,
 )
 from app.core.pixiv_thread_utils import normalize_pid
+from app.core.step3_cookie_labels import _Step3CookieLabelsMixin
 from app.core.worker_event import WorkerEvent
 
 
@@ -126,30 +127,8 @@ class _Step4FiltersMixin:
                 )
             ))
 
-    def _refresh_cookie_requirement(self, pid, fallback=None):
-        pid_key = normalize_pid(pid)
-        if not pid_key:
-            return fallback
-        try:
-            if isinstance(getattr(self, '_cookie_requirement_map', None), dict) and pid_key in self._cookie_requirement_map:
-                return self._cookie_requirement_map.get(pid_key)
-        except Exception:
-            pass
-
-        latest = fallback
-        # First-time resolution only: if fallback already exists, don't re-query trace.
-        if latest is None:
-            try:
-                latest = pixiv_api.get_pixiv_cookie_requirement(pid_key)
-            except Exception:
-                latest = fallback
-        try:
-            if not isinstance(getattr(self, '_cookie_requirement_map', None), dict):
-                self._cookie_requirement_map = {}
-            self._cookie_requirement_map[pid_key] = latest
-        except Exception:
-            pass
-        return latest
+    # Verbatim duplicate of the Step 3 implementation — share one copy.
+    _refresh_cookie_requirement = _Step3CookieLabelsMixin._refresh_cookie_requirement
 
     def _fetch_filter_meta_via_scheduler(self, pid_key, url, need_cookie):
         """Network fallback through the AccountScheduler — bound proxy + cooldown applies."""

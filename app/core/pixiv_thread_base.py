@@ -174,6 +174,29 @@ class PauseableThread(threading.Thread):
         self._scheduler = scheduler  # AccountScheduler | None
         self._cookie_usage_lock = threading.Lock()
 
+    def _apply_live_filter_fields(self, dl):
+        """Shared live-refresh of like/ban/must filter fields + derived norms.
+
+        ``dl`` is the settings "download" section dict. ``special_like_rules``
+        is NOT handled here — Step 3 normalizes it, Step 4 stores it raw.
+        """
+        try:
+            like = int(dl.get("like_num", 0) or 0)
+        except (TypeError, ValueError):
+            like = 0
+        self.like_num = like if like > 0 else 0
+        self.ban_tag = list(dl.get("ban_tag", []) or [])
+        self.must_tag = list(dl.get("must_tag", []) or [])
+        self._ban_tag_norm = self._normalize_filter_tags(self.ban_tag)
+        self._must_tag_norm = self._normalize_filter_tags(self.must_tag)
+
+    def _close_metadata_db_quietly(self, owner=None):
+        """Best-effort close of ``owner._metadata_db`` (default: self) for shutdown paths."""
+        db = getattr(owner or self, "_metadata_db", None)
+        if db is not None:
+            with contextlib.suppress(Exception):
+                db.close()
+
     def pause(self):
         self._pause_event.clear()
         self._q.put(WorkerEvent("output", f"<p><font color='red'>{i18n.t('log.paused')}</font></p>"))

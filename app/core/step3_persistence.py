@@ -220,13 +220,8 @@ class _Step3PersistenceMixin:
             return [], [], []
 
     def _resolve_pictures_id_file_path(self):
-        candidates = [os.path.join(self.path, "pictures_id.txt")]
-        try:
-            appdata_path = os.path.join(os.getenv('APPDATA') + r'/pixiv_download/', 'pictures_id.txt')
-            if appdata_path not in candidates:
-                candidates.append(appdata_path)
-        except Exception:
-            pass
+        # Candidate assembly shared with _Step3CheckExistMixin (same host class).
+        candidates = self._check_exist_candidate_paths()
         for p in candidates:
             try:
                 if os.path.isfile(p):

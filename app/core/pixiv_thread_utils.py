@@ -404,6 +404,14 @@ def read_pid_lines(file_path):
         return []
 
 
+def safe_meta_count(db) -> int:
+    """`db.meta_count()` with a 0 fallback (db may be None or broken)."""
+    try:
+        return int(db.meta_count())
+    except Exception:
+        return 0
+
+
 # JSON read + history-backup recovery helpers moved to json_recovery.py
 # (file-size refactor). Re-exported so existing
 # ``from app.core.pixiv_thread_utils import safe_read_json`` /
@@ -424,8 +432,7 @@ from app.core.json_recovery import (  # noqa: F401  (public re-export)
 # Cookie pool parsing / dedupe / aliasing / usage-label moved to cookie_utils.py
 # (file-size refactor). Re-exported so existing
 # ``from app.core.pixiv_thread_utils import normalize_cookie_entries`` (and the
-# rest of the cookie helpers, incl. the deprecated speed_divisor/speedup) callers
-# keep working unchanged.
+# rest of the cookie helpers) callers keep working unchanged.
 from app.core.cookie_utils import (  # noqa: F401  (public re-export)
     _strip_cookie_prefix,
     _parse_cookie_entry,
@@ -436,8 +443,6 @@ from app.core.cookie_utils import (  # noqa: F401  (public re-export)
     normalize_cookie_pool,
     cookie_usage_label,
     format_cookie_usage_summary,
-    cookie_speed_divisor,
-    apply_cookie_pool_speedup,
     init_cookie_fields,
 )
 
