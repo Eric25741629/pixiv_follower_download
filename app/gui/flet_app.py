@@ -799,7 +799,8 @@ def main(page: ft.Page) -> None:
     # Restore the modal loading dialog AFTER page.add — set_loading() relies
     # on page.show_dialog() which needs the page's session to be live and
     # attached. If a session GC fired while a worker was being stopped
-    # (which holds the "正在停止，等待清理完成..." dialog for up to 60 s)
+    # (which holds the "正在停止，等待清理完成..." dialog until the worker
+    # thread — including its JXL conversion backlog — has fully terminated)
     # we need to put it back on the new page; otherwise the buttons stay
     # disabled-looking and the user thinks the app is frozen.
     if bool(_PERSISTENT_UI_STATE.get("loading_open", False)):

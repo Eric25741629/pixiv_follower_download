@@ -1044,8 +1044,9 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
         if self.jxl_enable:
             # Wait for any backlog the background worker still has — counters
             # used in the summary below are written only by that worker, so
-            # we must drain before reading.  On user-stop, drain discards
-            # pending items so the summary fires promptly.
+            # we must drain before reading.  On user-stop the drain still
+            # converts everything (the stop spinner shows the remaining
+            # count) — already-downloaded files must all reach JXL.
             if any(t.is_alive() for t in self._jxl_worker_threads):
                 self._emit_output("<p><font color='gray'>等待背景 JXL 轉檔完成...</font></p>")
             self._drain_jxl_queue()

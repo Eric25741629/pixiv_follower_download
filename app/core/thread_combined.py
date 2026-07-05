@@ -959,6 +959,16 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                     backup=False,
                 )
                 self.downloader._shadow_mark_failures(fail_records)
+        # JXL side: combined never runs Step 4's finalize, so wait for the
+        # background conversion backlog here — a stop must not end the run
+        # (nor release the stop spinner) until every queued file is
+        # converted. _drain_jxl_queue keeps the stop spinner text updated
+        # with the remaining count.
+        with contextlib.suppress(Exception):
+            if getattr(self.downloader, "jxl_enable", False):
+                if any(t.is_alive() for t in self.downloader._jxl_worker_threads):
+                    self._emit("<p><font color='gray'>等待背景 JXL 轉檔完成...</font></p>")
+                self.downloader._drain_jxl_queue()
         self._emit(f"<p><font color='green'>{i18n.t('log.combined.done')}</font></p>")
         self._q.put(WorkerEvent("finished", i18n.t("log.combined.done")))
         self._q.put(WorkerEvent("next", -1))  # terminal: Run All stops here

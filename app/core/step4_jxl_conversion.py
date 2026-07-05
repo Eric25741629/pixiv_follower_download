@@ -20,7 +20,8 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from queue import Empty, Queue
+import time
+from queue import Queue
 
 from app.core.worker_event import WorkerEvent
 from app import i18n
@@ -326,10 +327,12 @@ class _JXLMixin:
         """Process queued source paths.  One shared queue feeds every worker,
         so each pops the next available file.  Exits cleanly when it pops a
         ``None`` sentinel pushed by ``_drain_jxl_queue`` (one sentinel per
-        worker).  Uses a 1-second polling timeout so the thread can exit if
-        the main thread crashes before pushing the sentinel."""
+        worker).  Deliberately ignores ``_stop_event``: a user stop must
+        still convert every already-downloaded file, so the loop runs until
+        the sentinel arrives (workers are daemons, so process exit is never
+        blocked)."""
         import queue as _queue_mod
-        while not self._stop_event.is_set():
+        while True:
             try:
                 src_path = self._jxl_queue.get(timeout=1.0)
             except _queue_mod.Empty:
@@ -354,33 +357,31 @@ class _JXLMixin:
         with contextlib.suppress(Exception):
             self._jxl_queue.put(str(src_path))
 
-    def _discard_pending_jxl_items(self):
-        """Drain queued items without running cjxl (used on user stop so the
-        user is not left waiting on a long backlog).  Does not interrupt
-        the in-flight conversion."""
-        while True:
-            try:
-                self._jxl_queue.get_nowait()
-            except (Empty, Exception):
-                return
-            with contextlib.suppress(Exception):
-                self._jxl_queue.task_done()
-
     def _drain_jxl_queue(self):
-        """Wait for queued conversions to finish, then shut the worker pool down.
+        """Wait for EVERY queued conversion to finish, then shut the pool down.
 
-        On normal completion, blocks until every enqueued file has been
-        processed so the JXL summary is accurate.  On a user-initiated stop,
-        discards pending items first (keeps in-flight conversions only) so
-        the user is not left waiting minutes for a long backlog.  Pushes one
-        ``None`` sentinel per live worker and joins each."""
+        Blocks until every enqueued file has been processed — including on a
+        user-initiated stop (already-downloaded files must all be converted
+        before the run is allowed to end; the stop spinner stays up and shows
+        the remaining count).  Pushes one ``None`` sentinel per live worker
+        and joins each."""
         workers = [t for t in self._jxl_worker_threads if t.is_alive()]
         if not workers:
             return
-        if self._stop_event.is_set():
-            self._discard_pending_jxl_items()
-        with contextlib.suppress(Exception):
-            self._jxl_queue.join()
+        stopping = self._stop_event.is_set()
+        last_remaining = -1
+        while True:
+            remaining = self._jxl_queue.unfinished_tasks
+            if remaining <= 0:
+                break
+            if stopping and remaining != last_remaining:
+                last_remaining = remaining
+                with contextlib.suppress(Exception):
+                    self._q.put(WorkerEvent(
+                        "loading",
+                        (True, f"下載完成，JXL 轉檔中（剩餘 {remaining} 張）..."),
+                    ))
+            time.sleep(0.5)
         with contextlib.suppress(Exception):
             for _ in workers:
                 self._jxl_queue.put(None)
