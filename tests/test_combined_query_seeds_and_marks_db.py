@@ -168,6 +168,9 @@ def test_partial_download_failure_still_refreshes_cookie_first_success():
         on_disable=lambda account: disabled.append(account.cookie),
     )
     t._scheduler = scheduler
+    # 真 scheduler 會打開匿名探測閘門；這裡測的是 release/refresh 語義，
+    # 探測一律回退（否則單元測試會真的打 pixiv 網路）。
+    t._probe_pid_anonymously = lambda pid: None
     t._run_with_network_retry = _retry_router((True, urls, None))
     t.downloader._download_pid_group = lambda pid, dl_urls: [[urls[0], "disk full"]]
     t.downloader._maybe_flush_exist_pid = lambda pid: None

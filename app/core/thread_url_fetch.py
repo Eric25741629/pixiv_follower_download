@@ -800,9 +800,25 @@ class get_img_url_thread(PauseableThread, _Step3FiltersMixin,
         ``ProxyError``/``ConnectTimeout``/``ConnectionError`` propagate so the
         scheduler-aware caller can disable the cookie via release(ok=False).
         Other exceptions are surfaced to the user and re-raised.
+
+        combined 模式的匿名探測可先把原始 Pixiv_info 結果放進
+        ``self._probe_info_results``（依 pid 鍵），此處直接消費、不再打網路；
+        ``self._probe_requires_cookie`` 中的 pid 表示探測已確認匿名看不到，
+        帶 cookie 查詢時跳過 Pixiv_info 內建的匿名先試段。兩個屬性只由
+        combined_thread 設置——獨立步驟三沒有它們，行為不變。
         """
+        stash = getattr(self, "_probe_info_results", None)
+        if stash is not None:
+            probe = stash.pop(pid_key, None)
+            if probe is not None:
+                return probe
         try:
             if pid_cookie:
+                # 只在探測確認過「匿名看不到」時才傳 skip_no_cookie，讓
+                # 既有（不認識這個 kwarg 的）測試替身呼叫保持原樣。
+                if pid_key in (getattr(self, "_probe_requires_cookie", None) or ()):
+                    return Pixiv_info(url, Agent=Agent, cookie=pid_cookie,
+                                      session=session, skip_no_cookie=True)
                 return Pixiv_info(url, Agent=Agent, cookie=pid_cookie, session=session)
             return Pixiv_info(url, Agent=Agent, session=session)
         except _NETWORK_RETRY_EXCEPTIONS:

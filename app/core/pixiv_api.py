@@ -423,7 +423,8 @@ def _decide_pixiv_info_result(no_cookie_result, no_cookie_valid, cookie, fetch_w
 
 def Pixiv_info(url,
     Agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36 Edg/98.0.1108.50'
-    ,cookie=None,ip=None, *, session: "requests.Session | None" = None):                                                #回傳標籤
+    ,cookie=None,ip=None, *, session: "requests.Session | None" = None,
+    skip_no_cookie=False):                                                #回傳標籤
         url = _clean_request_text(url)
         Agent = _clean_request_text(Agent)
         cookie = _clean_request_text(cookie) if cookie is not None else None
@@ -495,6 +496,16 @@ def Pixiv_info(url,
                 return ["error"], False, res.status_code
             parsed, valid = _parse_payload(payload)
             return parsed, valid, res.status_code
+
+        if skip_no_cookie and cookie:
+            # 呼叫端（combined 匿名探測）已確認匿名看不到這個作品：直接帶
+            # cookie 查，不再重發一次注定失敗的匿名請求。
+            cookie_result, cookie_valid, status_cookie = _fetch(use_cookie=True)
+            _record_pixiv_info_trace(
+                id, ajax_url, True if cookie_valid else None,
+                None, status_cookie, cookie_result,
+            )
+            return cookie_result
 
         no_cookie_result, no_cookie_valid, status_no_cookie = _fetch(use_cookie=False)
         final_result, requires_cookie, status_cookie = _decide_pixiv_info_result(

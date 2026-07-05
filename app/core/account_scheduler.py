@@ -275,8 +275,10 @@ class AccountScheduler:
         rests a bit longer than a 1-page one without sidelining the account
         for pages × avg (image GETs are far cheaper, detection-wise, than
         ajax queries)."""
+        # work_units=0 is legal: combined 的匿名探測已代付查詢請求時，帳號這次
+        # pickup 只做了分頁下載，冷卻只計 pages × PAGE_COOLDOWN_SEC。
         per_account = (
-            max(1.0, self._get_cooldown_avg()) * max(1, int(work_units))
+            max(1.0, self._get_cooldown_avg()) * max(0, int(work_units))
             + PAGE_COOLDOWN_SEC * max(0, int(pages))
         )
         account.cooldown_until = time.monotonic() + per_account

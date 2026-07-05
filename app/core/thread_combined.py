@@ -29,6 +29,10 @@ COMBINED_WORKERS_CAP = 16
 # 避免 meta 請求與第一張圖片下載零間隔背靠背連發。
 QUERY_TO_DOWNLOAD_PAUSE_RANGE = (1.0, 3.0)
 
+# acquire 前匿名探測（本機 IP、無 cookie、不佔帳號）的併發上限。
+# 使用者裁定：探測通道不另做速率限制，只設 8 併發上限。
+PROBE_MAX_CONCURRENCY = 8
+
 
 def resolve_worker_count(setting, active_accounts, pending_count, cap=COMBINED_WORKERS_CAP):
     """Effective concurrency for combined mode.
@@ -166,6 +170,13 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             live=live,
         )
 
+        # 匿名探測管線：acquire 前先用本機 IP 免 cookie 問一次 meta。
+        # 結果放進 fetcher 的 stash 供 _step3_fetch_artwork_info 消費；
+        # _probe_requires_cookie 記錄「匿名看不到」的 PID（帳號查詢跳過匿名段）。
+        self._probe_semaphore = threading.BoundedSemaphore(PROBE_MAX_CONCURRENCY)
+        self.fetcher._probe_info_results = {}
+        self.fetcher._probe_requires_cookie = set()
+
         # Share one set of control events + one DB connection.
         self.fetcher._pause_event = self._pause_event
         self.fetcher._stop_event = self._stop_event
@@ -247,6 +258,123 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             ctx["page"] = 0
         return self.downloader._download_pid_group(pid, urls)
 
+    def _probe_pid_anonymously(self, pid_key):
+        """acquire 前的匿名探測（本機 IP、無 cookie、不佔帳號）。
+
+        最多 ``PROBE_MAX_CONCURRENCY`` 併發，無其他節流（使用者裁定）。回傳：
+
+        - ``"stashed"`` — 原始 Pixiv_info 結果（含 404）已放入
+          ``fetcher._probe_info_results``，之後的查詢直接消費、不再打網路。
+        - ``"needs_cookie"`` — 匿名看不到（R18/受限）；帳號查詢時帶 cookie
+          並跳過 Pixiv_info 內建的匿名先試段。
+        - ``None`` — 探測不適用（快取新鮮/停止）或失敗（暫時性錯誤），
+          回退原本的帳號查詢路徑。
+        """
+        if self._scheduler is None:
+            # 沒有帳號調度（headless stub/測試、無 cookie 場景）就沒有
+            # 「省帳號」可言——不探測，也保證單元測試不觸網。
+            return None
+        self._pause_event.wait()
+        if self._stop_event.is_set():
+            return None
+        with contextlib.suppress(Exception):
+            cached = self.fetcher._get_meta(pid_key) or None
+            if self.fetcher._step3_cache_is_fresh(cached):
+                return None  # 查詢會吃快取、不打網路——探測反而多發一個請求
+        try:
+            with self._probe_semaphore:
+                if self._stop_event.is_set():
+                    return None
+                with diag_log.span(diag_log.WORKER, f"PID {pid_key} probe(anonymous)"):
+                    info = pixiv_api.Pixiv_info(
+                        "https://www.pixiv.net/artworks/" + pid_key, Agent=self.Agent,
+                    )
+        except Exception:
+            return None  # 探測失敗不影響主流程（含本機網路錯誤），回退帳號查詢
+        if not isinstance(info, list) or info == ["error"]:
+            return None
+        if info == [404]:
+            self.fetcher._probe_info_results[pid_key] = info
+            return "stashed"
+        try:
+            img_url = info[3]
+        except Exception:
+            return None
+        valid = bool(img_url) and str(img_url) != "None"
+        with contextlib.suppress(Exception):
+            # 讓 _refresh_cookie_requirement 直接讀到最新判定（顯示/統計用）。
+            self.fetcher._cookie_requirement_map[pid_key] = (not valid)
+        if valid:
+            self.fetcher._probe_info_results[pid_key] = info
+            return "stashed"
+        self.fetcher._probe_requires_cookie.add(pid_key)
+        return "needs_cookie"
+
+    def _run_query_accountless(self, pid, drop_overall_inline):
+        """探測命中後的無帳號查詢：get_download_url 會消費 stash、不打網路。
+
+        ``cookie_override=""`` 讓 fetcher 不挑池內 cookie（空字串 → 不計
+        cookie 使用統計；stash 未命中時退化成一次匿名網路查詢，語義一致）。
+        回傳 normalize 後的 url list，或 ``None`` 表示應回退帳號查詢路徑
+        （異常/停止——停止時絕不能把 PID 當成功 settle）。
+        """
+        if self._stop_event.is_set():
+            return None
+        if drop_overall_inline:
+            prev_fetcher_q = self.fetcher._q
+            self.fetcher._q = _DropOverallProgressQueue(prev_fetcher_q)
+        try:
+            with diag_log.span(diag_log.WORKER, f"PID {pid} query(prefetched)"):
+                one = self.fetcher.get_download_url(
+                    self.path, self.Agent, 1, pid, cookie_override="",
+                )
+        except Exception:
+            return None
+        finally:
+            if drop_overall_inline:
+                self.fetcher._q = prev_fetcher_q
+        if self._stop_event.is_set():
+            # get_download_url 的早停回傳是 []，與「查無結果」無法區分；
+            # 一律回退（下一輪 acquire 會回 None 讓呼叫端中止），PID 保持
+            # pending。寧可下次重跑，也不要停止時誤 settle。
+            return None
+        return self.fetcher._normalize_loop_result(one)
+
+    def _try_prefetch_query(self, pid, *, page_progress, drop_overall_inline, slot):
+        """acquire 前的探測＋無帳號查詢。回傳 ``(status, urls)``：
+
+        - ``("settled", None)`` — PID 已在無帳號下 settle（被過濾/404/全部
+          已在磁碟），呼叫端直接回 ``([], True)``，完全不佔帳號。
+        - ``("urls", kept)`` — 查詢已完成（無帳號），帶著待下載頁進帳號段
+          （該次 pickup 以 ``work_units=0`` 計冷卻）。
+        - ``("fallback", None)`` — 探測不可用/需要 cookie/失敗/停止，走
+          原本的帳號查詢路徑。
+        """
+        pid_key = normalize_pid(pid) or str(pid)
+        if slot is not None:
+            self._emit_lane(slot, pid=str(pid), alias="", state="查詢",
+                            page=0, total=0, wait=0)
+        if self._probe_pid_anonymously(pid_key) != "stashed":
+            return "fallback", None
+        one = self._run_query_accountless(pid, drop_overall_inline)
+        if one is None:
+            return "fallback", None
+        urls = [u for u in one if isinstance(u, str) and u.startswith("http")]
+        kept = self._drop_already_downloaded(pid, urls) if urls else []
+        if urls and not kept:
+            # 每一頁都已在磁碟：補上帳號路徑 kept-empty 分支相同的收尾記帳。
+            self.downloader._maybe_flush_exist_pid(pid)
+            self._persist_pid_meta(pid)
+        if kept:
+            return "urls", kept
+        diag_log.log(diag_log.WORKER, f"PID {pid} 匿名探測後無需帳號，已 settle")
+        if page_progress:
+            self._clear_page_progress()
+        if slot is not None:
+            self._emit_lane(slot, pid="", alias="", state="等待",
+                            page=0, total=0, wait=0)
+        return "settled", None
+
     def _process_one_pid_core(self, pid, needs_query, *, emit_phase,
                               page_progress, drop_overall_inline, apply_live,
                               slot=None):
@@ -273,6 +401,19 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 phase_key = "log.phase.querying" if needs_query else "log.phase.downloading"
                 self._q.put(WorkerEvent("phase", i18n.t(phase_key, pid=pid)))
         diag_log.log(diag_log.WORKER, f"PID {pid} 開始 (needs_query={needs_query})")
+        # acquire 前的匿名探測管線：能免帳號 settle 的 PID（被過濾/404/已在
+        # 磁碟）直接結束；查到待下載頁的帶著 urls 進帳號段（work_units=0）；
+        # 其餘（需要 cookie/探測失敗）回退原本的帳號查詢。
+        prefetched_urls = None
+        if needs_query:
+            status, kept = self._try_prefetch_query(
+                pid, page_progress=page_progress,
+                drop_overall_inline=drop_overall_inline, slot=slot,
+            )
+            if status == "settled":
+                return [], True
+            if status == "urls":
+                prefetched_urls = kept
         # Lane shows "等待 cookie" during the acquire wait — that wait IS the
         # per-account cooldown, so the user sees each lane pause between PIDs.
         # wait=0 clears any stale countdown left by the previous PID's wait.
@@ -291,9 +432,11 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         self._record_pid_send()
         diag_log.log(diag_log.WORKER, f"PID {pid} 取得帳號 alias={getattr(acc, 'alias', '?')}")
         # Lane now shows which cookie this worker holds + whether it is querying.
+        # 探測已代付查詢時，這次 pickup 直接進下載，不再顯示 查詢。
         if slot is not None:
+            _will_query = needs_query and prefetched_urls is None
             self._emit_lane(slot, pid=str(pid), alias=getattr(acc, "alias", ""),
-                            state="查詢" if needs_query else "下載", page=0, total=0)
+                            state="查詢" if _will_query else "下載", page=0, total=0)
         sess = pixiv_api.make_session(acc.proxy_url)
         failed = []
         ok = True
@@ -302,7 +445,10 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
         neutral = False
         page_count = 0  # pages actually downloaded this pickup (for cooldown scaling)
         try:
-            if needs_query:
+            if prefetched_urls is not None:
+                # 匿名探測已完成查詢與 resume 過濾：這次 pickup 帳號只負責下載。
+                urls = list(prefetched_urls)
+            elif needs_query:
                 # The fetcher's get_download_url emits one ("progress",(1,
                 # fetcher.pid_max)) per PID via _step3_advance_progress, and
                 # fetcher.pid_max is 0 in combined mode (run() never ran). That
@@ -334,11 +480,12 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 urls = self._download_only_urls(pid)
 
             urls = [u for u in urls if isinstance(u, str) and u.startswith("http")]
-            if needs_query and urls:
+            if needs_query and urls and prefetched_urls is None:
                 # Resume filter: a previous partial/stopped run persisted its
                 # completed pages per-page (_flush_partial_done); drop them so
                 # the re-queried PID downloads only what is still pending
                 # instead of duplicating those pages under a new timetag.
+                # (探測路徑已在 _try_prefetch_query 做過同樣的過濾。)
                 kept = self._drop_already_downloaded(pid, urls)
                 if not kept:
                     # Every page already on disk from an earlier run: finish
@@ -349,10 +496,11 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
                 urls = kept
             page_count = len(urls)
             if urls:
-                if needs_query:
+                if needs_query and prefetched_urls is None:
                     # 查詢→下載緩衝：同一帳號查完 meta 後先歇 1-3 秒再開始抓圖
                     # （stop 可中斷；stop 後下載迴圈本身也會立即退出並走
-                    # download_ok=False 的既有停止路徑）。
+                    # download_ok=False 的既有停止路徑）。探測代付查詢時帳號
+                    # 這次 pickup 的第一個請求就是下載本身，冷卻已隔開，不再緩衝。
                     self._wait_interruptible(
                         random.uniform(*QUERY_TO_DOWNLOAD_PAUSE_RANGE))
                 # Seed the pending pages before download so a partial failure /
@@ -446,9 +594,12 @@ class combined_thread(PauseableThread, _CombinedWorkListsMixin):
             # network-exhausted account (account_ok False) still disables as before.
             # Cooldown = one full avg for the pickup + a flat 5 s per page
             # downloaded (PAGE_COOLDOWN_SEC), so a multi-page PID rests a bit
-            # longer without sidelining the cookie for pages × avg.
+            # longer without sidelining the cookie for pages × avg. 探測已
+            # 代付查詢的 pickup 帳號沒發 ajax 查詢，work_units=0（只計分頁）。
             self._release_account_after_work(
-                acc, ok=ok and account_ok, neutral=neutral, pages=page_count,
+                acc, ok=ok and account_ok, neutral=neutral,
+                work_units=0 if prefetched_urls is not None else 1,
+                pages=page_count,
             )
             with contextlib.suppress(Exception):
                 sess.close()
