@@ -483,7 +483,7 @@ class download_thread(PauseableThread, _FilenameMixin, _JXLMixin,
     # The JXL background-conversion subsystem (_resolve_cjxl_path,
     # _build_jxl_command, _run_cjxl_*, _jxl_*, _convert_file_to_jxl,
     # _start_jxl_worker_if_needed, _jxl_worker_loop, _enqueue_jxl,
-    # _discard_pending_jxl_items, _drain_jxl_queue + _JXL_SUPPORTED_EXTS)
+    # _drain_jxl_queue + _JXL_SUPPORTED_EXTS)
     # moved to step4_jxl_conversion._JXLMixin (file-size refactor).
     # download_thread inherits the mixin, so they stay reachable as
     # self._enqueue_jxl / self._drain_jxl_queue etc.
