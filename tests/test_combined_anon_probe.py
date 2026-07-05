@@ -260,7 +260,7 @@ def test_needs_cookie_falls_back_to_account_query(monkeypatch):
     failed = t._process_one_pid("123", needs_query=True)
 
     assert failed == []
-    assert any("下載" not in l for l in labels)  # 帳號查詢有跑
+    assert any("下載" not in label for label in labels)  # 帳號查詢有跑
     assert released == {"work_units": 1, "pages": 1}
 
 
