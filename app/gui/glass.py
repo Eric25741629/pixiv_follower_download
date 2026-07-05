@@ -350,21 +350,19 @@ def state_colors(theme: GlassTheme) -> dict[str, tuple[str, str]]:
 def aurora_background(theme: GlassTheme, content: ft.Control) -> ft.Container:
     """漸層底 + 兩顆光暈 orb 的 Stack。content 疊在最上層。
 
-    orb 漂移：orb Container 設 animate_position(7000, EASE_IN_OUT)，由
-    flet_app 的既有背景 loop（page.run_task 計時器）每 7s 翻轉 top/left
-    幾 px 實現往復。第一版為靜態，動畫在 Task 6 啟用。
+    orb 是靜態的。舊版的 animate_position(7000) + 每 7s 翻轉位置讓 orb
+    永遠處於補間中，玻璃面板的 backdrop blur 因此每一幀都要重算，
+    實測閒置 GPU 約 7%；拿掉漂移後為 0%。裝飾動畫不值這個代價。
     """
     orb1 = ft.Container(
         width=420, height=420, border_radius=999,
         gradient=ft.RadialGradient(colors=[theme.orb1_color, "#00000000"]),
         top=-140, right=-100,
-        animate_position=ft.Animation(7000, ft.AnimationCurve.EASE_IN_OUT),
     )
     orb2 = ft.Container(
         width=340, height=340, border_radius=999,
         gradient=ft.RadialGradient(colors=[theme.orb2_color, "#00000000"]),
         bottom=-110, left=-80,
-        animate_position=ft.Animation(7000, ft.AnimationCurve.EASE_IN_OUT),
     )
     return ft.Container(
         expand=True,
