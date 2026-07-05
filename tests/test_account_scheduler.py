@@ -62,6 +62,16 @@ def test_release_pages_add_flat_surcharge_not_full_avg():
     assert before + expected - 0.05 <= acc.cooldown_until <= before + expected + 0.05
 
 
+def test_release_cooldown_capped():
+    # A very multi-page PID can't push per-account cooldown past COOLDOWN_CAP_SEC.
+    from app.core.account_scheduler import COOLDOWN_CAP_SEC
+    acc = AccountState(cookie="c1", alias="A1")
+    before = time.monotonic()
+    sched, _, _ = _make_scheduler([acc], avg=45.0)
+    sched.release(acc, ok=True, pages=100)  # 45 + 500 = 545s, way over cap
+    assert acc.cooldown_until <= before + COOLDOWN_CAP_SEC + 0.05
+
+
 def test_release_ok_false_disables_account():
     acc = AccountState(cookie="c1", alias="A1")
     sched, _, _ = _make_scheduler([acc])
