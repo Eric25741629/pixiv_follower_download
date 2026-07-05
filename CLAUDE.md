@@ -77,7 +77,7 @@ The canonical code lives under `app/` in three layers:
   - `update_selenium.py` — Selenium-based cookie refresh.
 
   **Mixin split (file-size refactor).** Several oversized worker/DB modules were split into cohesive sibling modules using the mixin pattern — the public class still lives in (and is imported from) its original module, which declares `class X(BaseFirst, _MixinA, _MixinB, ...)`; moved methods access state via `self.` through inheritance. Edit the sibling, not a copy. Map:
-  - `thread_download.py` → `step4_author_order.py` (pure reorder funcs, re-exported), `step4_filters.py` (`_Step4FiltersMixin`), `step4_media.py` (`_Step4MediaMixin`); also the pre-existing `_FilenameMixin` / `_JXLMixin`.
+  - `thread_download.py` → `step4_author_order.py` (pure reorder funcs, re-exported), `step4_filters.py` (`_Step4FiltersMixin`), `step4_media.py` (`_Step4MediaMixin`), `step4_legacy_args.py` (`_Step4LegacyArgsMixin`), `step4_pacing.py` (`_Step4PacingMixin`), `step4_folder_list.py` (`_Step4FolderListMixin`), `step4_db_sync.py` (`_Step4DbSyncMixin`), `step4_init.py` (`_Step4InitMixin`: 建構期 helpers；`defer_step4_scan` 分支本體仍在 `__init__`); also the pre-existing `_FilenameMixin` / `_JXLMixin`.
   - `thread_url_fetch.py` → `step3_filters.py` (`_Step3FiltersMixin`), `step3_meta_migration.py` (`_Step3MigrationMixin`), `step3_persistence.py` (`_Step3PersistenceMixin`).
   - `thread_pid_scan.py` → `step2_bookmark_scan.py` (`_Step2BookmarkMixin`), `step2_incremental_io.py` (`_Step2IncrementalIOMixin`).
   - `metadata_db.py` → `metadata_db_pages.py` (`_PagesMixin`), `metadata_db_closed_set.py` (`_ClosedSetMixin`); also the pre-existing `_ArtworkMixin` / `_MigrationMixin`.
