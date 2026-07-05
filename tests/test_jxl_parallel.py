@@ -7,7 +7,7 @@ monkeypatch ``_convert_file_to_jxl`` with a fake so no real ``cjxl.exe`` runs.
 from pathlib import Path
 import sys
 import threading
-from queue import Queue
+from queue import Empty, Queue
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -76,32 +76,45 @@ def test_drain_processes_all_and_workers_exit():
     assert all(not w.is_alive() for w in t._jxl_worker_threads)
 
 
-# ── 3. Stop discards backlog ────────────────────────────────────────────────
+# ── 3. Stop still converts the full backlog ─────────────────────────────────
 
-def test_stop_discards_backlog():
-    """After stop, drain discards the pending backlog (fewer conversions)."""
+def test_stop_converts_full_backlog_and_updates_spinner():
+    """After stop, drain converts EVERYTHING (no discard) and updates the
+    stop spinner text with the remaining count via 'loading' events."""
     t = _stub(workers=2)
+    t._q = Queue()
     calls = []
     lock = threading.Lock()
     release = threading.Event()
 
     def fake_convert(src_path):
+        # Hold conversions so the drain loop observes a non-empty backlog
+        # (and emits at least one spinner update) before letting them finish.
+        release.wait(timeout=5)
         with lock:
             calls.append(src_path)
-        # Hold the in-flight conversions so the backlog is still queued when
-        # we set stop + drain (which discards the queued remainder).
-        release.wait(timeout=5)
 
     t._convert_file_to_jxl = fake_convert
     for i in range(50):
         t._enqueue_jxl(f"file_{i}.jpg")
 
     t._stop_event.set()
-    release.set()
+    threading.Timer(1.0, release.set).start()
     t._drain_jxl_queue()
 
-    # Backlog dropped: far fewer than the 50 enqueued were converted.
-    assert len(calls) < 50
+    # Nothing dropped: every enqueued file was converted despite the stop.
+    assert len(calls) == 50
+    events = []
+    while True:
+        try:
+            events.append(t._q.get_nowait())
+        except Empty:
+            break
+    loading = [ev for ev in events if ev.type == "loading"]
+    assert loading, "stop drain should update the spinner text"
+    busy, msg = loading[0].data
+    assert busy is True
+    assert "JXL" in msg
 
 
 # ── 4. Counters aggregate correctly across workers ──────────────────────────

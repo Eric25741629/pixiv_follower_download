@@ -545,9 +545,12 @@ class MainView(_MainProgressMixin, _MainModeRowMixin):
 
     def _wait_for_stop(self, t) -> None:
         # Wait for the worker thread to actually terminate so finalize-on-stop
-        # (atomic_write_text/json calls) is done before we release the UI.
+        # (atomic_write_text/json calls, JXL conversion backlog) is done
+        # before we release the UI.  No timeout: the spinner must stay up
+        # until every queued JXL conversion has finished (the worker updates
+        # the spinner text with the remaining count while it drains).
         try:
-            t.join(timeout=60)
+            t.join()
         finally:
             self._event_q.put(WorkerEvent("loading", (False, "")))
 
