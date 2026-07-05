@@ -381,7 +381,7 @@ D2(PHASE-B 前置)、C1/C2(複雜度)未動,照原計畫等前置條件。
   - [x] A4 檔名解析/get_filelist → `step4_folder_list.py`（`_Step4FolderListMixin`）1739→1678
   - [x] A5 DB-sync 群 → `step4_db_sync.py`（`_Step4DbSyncMixin`）1678→1539
   - [ ] 🔶 A6 執行區（pool/scheduler + combined 借用）→ `step4_execution.py`（**high，最後、需實機 combined 驗證後才做**）
-  - [ ] A7 init 群 → `step4_init.py`（med，`defer_step4_scan` 分支要逐字保留）
+  - [x] A7 init 群 → `step4_init.py`（`_Step4InitMixin`，12 方法 verbatim move；`defer_step4_scan` 分支留在 `__init__` 未動）1577→1295（2026-07-05，全測 1109 綠 + ruff 兩檔零違規）
 - [x] `app/core/thread_url_fetch.py`（1506 → **972** ✅ <1000，2026-07-04 實測）— B1-B4 完成：
   - [x] B1 cookie 標籤/用量 → `step3_cookie_labels.py`（`_Step3CookieLabelsMixin`）
   - [x] B2 check_exist 掃描群 → `step3_check_exist.py`（`_Step3CheckExistMixin`）
