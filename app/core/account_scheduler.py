@@ -29,6 +29,10 @@ _THROUGHPUT_JITTER = 0.10  # ±10% on inter-request gap (anti-detection)
 # pickup adds this, NOT a full pid_cooldown_avg — image GETs are much cheaper
 # than ajax queries. ponytail: constant, not a setting; promote if it needs a dial.
 PAGE_COOLDOWN_SEC = 5.0
+# Hard ceiling on a single pickup's per-account cooldown: a very multi-page PID
+# (avg + 5 s/page) can't sideline its account past this. ponytail: constant,
+# not a setting; promote if it needs a dial.
+COOLDOWN_CAP_SEC = 120.0
 
 
 class AccountScheduler:
@@ -281,6 +285,7 @@ class AccountScheduler:
             max(1.0, self._get_cooldown_avg()) * max(0, int(work_units))
             + PAGE_COOLDOWN_SEC * max(0, int(pages))
         )
+        per_account = min(per_account, COOLDOWN_CAP_SEC)
         account.cooldown_until = time.monotonic() + per_account
         return self._on_success
 
