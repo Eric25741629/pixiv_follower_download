@@ -113,6 +113,12 @@ DEFAULTS = {
         # default so legitimately large/slow images are not aborted; the per-recv
         # read timeout (30s) separately bounds a fully-silent socket.
         "download_deadline_sec": 120,
+        # UI repaint coalescing when the window is not in the foreground. The
+        # event queue is still drained every 50 ms; only the flushing
+        # page.update() is throttled to at most once per this many ms. Set to
+        # 50 to effectively disable the throttle (repaint every poll). Stored
+        # in ms because _coerce_like only infers int/bool/list, not float.
+        "background_update_interval_ms": 1000,
     },
     "jxl": {
         "enable": False,
