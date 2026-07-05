@@ -698,6 +698,28 @@ def main(page: ft.Page) -> None:
         main_view.set_phase(text)
         _PERSISTENT_UI_STATE["phase"] = text
 
+    # Window foreground state drives the dispatcher's background repaint
+    # throttle. Desktop only — web has no reliable tab-visibility signal, so
+    # is_foreground() returns True there (unthrottled). Updated by
+    # on_window_event below (FOCUS/BLUR/MINIMIZE/RESTORE/HIDE/SHOW).
+    _window_state = {"focused": True, "minimized": False, "hidden": False}
+
+    def _is_foreground() -> bool:
+        if bool(getattr(page, "web", False)):
+            return True
+        return (
+            _window_state["focused"]
+            and not _window_state["minimized"]
+            and not _window_state["hidden"]
+        )
+
+    try:
+        _bg_interval_ms = int(
+            _settings_store().get_section("performance").get("background_update_interval_ms", 1000)
+        )
+    except Exception:
+        _bg_interval_ms = 1000
+
     disp = EventDispatcher(page, event_q, {
         "output":        handle_output,
         "progress":      handle_progress,
@@ -713,7 +735,7 @@ def main(page: ft.Page) -> None:
         "phase":         handle_phase,
         "pause_state":   handle_pause_state,
         "timechanged":   handle_timechanged,
-    })
+    }, is_foreground=_is_foreground, bg_update_interval_sec=_bg_interval_ms / 1000.0)
 
     # ── aurora background + floating layout ──────────────────────────────
     root = ft.Row(
@@ -886,6 +908,23 @@ def main(page: ft.Page) -> None:
         _log.info("window event: %s", ev_type)
         if ev_type == ft.WindowEventType.CLOSE:
             await _shutdown_and_destroy("window_close")
+            return
+        # Track visibility/focus so the dispatcher can throttle repaints when
+        # the window is backgrounded. FOCUS/BLUR covers "switched to another
+        # app but still visible"; MINIMIZE/HIDE cover fully-out-of-view. Any
+        # transition back to foreground is picked up on the next 50 ms poll.
+        if ev_type == ft.WindowEventType.BLUR:
+            _window_state["focused"] = False
+        elif ev_type == ft.WindowEventType.FOCUS:
+            _window_state["focused"] = True
+        elif ev_type == ft.WindowEventType.MINIMIZE:
+            _window_state["minimized"] = True
+        elif ev_type == ft.WindowEventType.RESTORE:
+            _window_state["minimized"] = False
+        elif ev_type == ft.WindowEventType.HIDE:
+            _window_state["hidden"] = True
+        elif ev_type == ft.WindowEventType.SHOW:
+            _window_state["hidden"] = False
 
     async def on_disconnect(e) -> None:
         # Flet's docs say on_disconnect only fires on web tab close. In
