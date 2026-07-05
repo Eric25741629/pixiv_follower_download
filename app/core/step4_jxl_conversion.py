@@ -285,6 +285,12 @@ class _JXLMixin:
     def _jxl_record_outcome(self, src_path, dst_path, ok, reason):
         """Update counters, emit log lines and optionally delete the source."""
         if ok and os.path.isfile(dst_path):
+            # Carry the source's atime/mtime onto the .jxl: the download stamped
+            # them to the timetag (set_file_mtime), and cjxl's fresh output file
+            # would otherwise reset them to conversion time.
+            with contextlib.suppress(Exception):
+                st = os.stat(src_path)
+                os.utime(dst_path, (st.st_atime, st.st_mtime))
             with self._jxl_stats_guard():
                 self._jxl_ok_count += 1
             src_size, dst_size, saved = self._jxl_tally_sizes(src_path, dst_path)

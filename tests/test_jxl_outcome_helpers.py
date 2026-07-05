@@ -143,3 +143,23 @@ def test_jxl_emit_failure_log_default_message_when_reason_blank(tmp_path):
     t._jxl_emit_failure_log("bad.jpg", "")
     evt = t._q.get_nowait()
     assert "cjxl conversion failed" in evt.data
+
+
+# ── _jxl_record_outcome: mtime preservation ────────────────────────────────
+
+def test_jxl_record_outcome_copies_src_mtime_to_dst(tmp_path):
+    """The .jxl must inherit the source's timetag-stamped mtime, not keep the
+    conversion-time mtime cjxl gave it (set_file_mtime would otherwise be lost
+    for every converted file)."""
+    import os
+    t = _stub(tmp_path)
+    t.jxl_delete_original = True
+    src = tmp_path / "img.jpg"
+    dst = tmp_path / "img.jxl"
+    src.write_bytes(b"a" * 10)
+    dst.write_bytes(b"b" * 5)
+    stamp = 946684800.0  # 2000-01-01, clearly not "now"
+    os.utime(src, (stamp, stamp))
+    t._jxl_record_outcome(str(src), str(dst), True, "")
+    assert os.path.getmtime(dst) == stamp
+    assert not src.exists()  # delete_original still honoured (after the copy)

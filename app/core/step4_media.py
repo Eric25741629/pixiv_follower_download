@@ -347,26 +347,70 @@ class _Step4MediaMixin:
         '(KHTML, like Gecko) Chrome/99.0.4844.82 Safari/537.36'
     )
 
+    _PID_TIMETAG_SIDECAR = "pid_timetags.json"
+    _PID_TIMETAG_FMT = "%Y%m%d_%H%M%S"
+
+    def _pid_timetag_sidecar_path(self):
+        base = str(getattr(self, "_db_base", "") or "").strip()
+        return os.path.join(base, self._PID_TIMETAG_SIDECAR) if base else None
+
+    def _load_pid_timetag_sidecar(self):
+        """{pid: datetime} recorded by a previous run's assignment (may be {})."""
+        path = self._pid_timetag_sidecar_path()
+        if not path or not os.path.isfile(path):
+            return {}
+        out = {}
+        with contextlib.suppress(Exception):
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+            for pid, tag in raw.items():
+                with contextlib.suppress(ValueError, TypeError):
+                    out[str(pid)] = datetime.datetime.strptime(tag, self._PID_TIMETAG_FMT)
+        return out
+
     def assign_pid_timetags(self, pid_order):
         """Pre-allocate one timetag per PID, by queue position, BEFORE downloads.
 
-        Each PID gets ``base + (its index) seconds``; every page of the PID then
-        shares that one stamp via the O(1) lookup in ``_begin_pid_timetag_block``
-        — no lock, no global-counter race while concurrent PIDs download. The
-        global ``download_time`` is advanced past the whole block and persisted
-        ONCE here (``_emit_timechanged``), so a crash mid-run can never reuse
-        stamps. A partial run leaves the unused tail seconds as harmless gaps:
-        the timetag is only a sort key; filename uniqueness is carried by
-        ``PID{pid}{page_suffix}``.
+        Each NEW PID gets the next free second off the global cursor; every page
+        of the PID then shares that one stamp via the O(1) lookup in
+        ``_begin_pid_timetag_block`` — no lock, no global-counter race while
+        concurrent PIDs download. The global ``download_time`` is advanced past
+        the fresh block and persisted ONCE here (``_emit_timechanged``), so a
+        crash mid-run can never reuse stamps. A partial run leaves the unused
+        tail seconds as harmless gaps: the timetag is only a sort key; filename
+        uniqueness is carried by ``PID{pid}{page_suffix}``.
+
+        The assignment is persisted to a sidecar (``pid_timetags.json`` next to
+        the metadata DB) and RELOADED on the next run: a PID whose earlier run
+        downloaded some pages and was interrupted keeps its original stamp, so
+        the retried pages join their on-disk siblings instead of getting a fresh
+        prefix (the 122820069 p0/p1 split). Only the current queue's PIDs are
+        kept on save, so completed PIDs fall out automatically.
         """
+        saved = self._load_pid_timetag_sidecar()
         base = self.download_time
-        self._pid_timetag = {
-            str(pid): base + datetime.timedelta(seconds=i)
-            for i, pid in enumerate(pid_order)
-        }
-        if pid_order:
-            self.download_time = base + datetime.timedelta(seconds=len(pid_order))
+        mapping = {}
+        fresh = 0
+        for pid in pid_order:
+            key = str(pid)
+            prev = saved.get(key)
+            if prev is not None:
+                mapping[key] = prev
+            else:
+                mapping[key] = base + datetime.timedelta(seconds=fresh)
+                fresh += 1
+        self._pid_timetag = mapping
+        if fresh:
+            self.download_time = base + datetime.timedelta(seconds=fresh)
             self._emit_timechanged()
+        path = self._pid_timetag_sidecar_path()
+        if path and mapping:
+            with contextlib.suppress(Exception):
+                atomic_write_json(
+                    path,
+                    {k: v.strftime(self._PID_TIMETAG_FMT) for k, v in mapping.items()},
+                    backup=False,
+                )
 
     def _begin_pid_timetag_block(self, pid=None):
         """Reserve this thread's shared timetag for the calling PID's pages.
