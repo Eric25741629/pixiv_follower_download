@@ -1,6 +1,6 @@
 # pixiv-batch-download
-
-> Pixiv 批次下載器 — 以 **Flet（Material 3）** 重構，支援桌面、網頁，以及無 GUI 的 **CLI / 排程** 模式。
+Pixiv 快速下載器
+> Pixiv 快速下載器 — 以 **Flet（Material 3）** 重構，支援桌面、網頁，以及無 GUI 的 **CLI / 排程** 模式。
 >
 > *Pixiv batch downloader rebuilt with Flet (Material 3): desktop, web, and a headless CLI + scheduler.*
 
